@@ -8,6 +8,8 @@
 //   4. structure (no reader-facing text): category, tags, subject companies and the fact frame the
 //      topics and the event grouping need; it runs beside the scoring.
 // Material with only a title or a feed summary has its article page fetched before it is judged.
+import type { FinanceInsight } from "@aihot/contracts/editorial";
+import { FinanceSchema } from "./review.ts";
 import { z } from "zod";
 import { CATEGORY_KEYS } from "@aihot/contracts/taxonomy";
 import { CATEGORIES } from "@aihot/industry/taxonomy";
@@ -128,6 +130,7 @@ const StructureSchema = z.object({
 });
 
 const UnderstandSchema = z.object({
+  finance: FinanceSchema.nullable().optional(),
   itemType: z.enum(ITEM_TYPES),
   authorRole: z.enum(["principal", "observer", "relayer"]).catch("relayer"),
   tags: z.array(z.string()).max(12).catch([]),
@@ -165,6 +168,7 @@ export interface AnalysisRun {
     summaryZh: string;
     reasonZh: string | null;
     tags: string[] | null;
+    finance?: FinanceInsight | null;
     itemType?: string;
     authorRole?: string;
     identityGuard?: IdentityGuard;
@@ -292,7 +296,7 @@ async function runUnderstand(a: AnalyzeInputArticle, opts: StepOpts): Promise<An
   return {
     kind: "understand", model: res.model, titleZh: copy.titleZh, summaryZh: copy.summaryZh, reasonZh: d.editorialJudgment.trim() || null,
     tags: normalizeTags(d.tags, { fallbackCategory: CATEGORY_BY_ITEM_TYPE[d.itemType] }), itemType: d.itemType, authorRole: d.authorRole,
-    identityGuard: copy.identityGuard, receiptIds: [res.receiptId], reused: res.reused,
+    finance: d.finance ?? null, identityGuard: copy.identityGuard, receiptIds: [res.receiptId], reused: res.reused,
   };
 }
 
@@ -398,6 +402,7 @@ export function normalizeAnalysis(run: AnalysisRun) {
     titleZh,
     summaryZh,
     reasonZh: run.writing?.reasonZh ?? null,
+    finance: run.writing?.finance ?? null,
     fact: run.structure?.fact ?? null,
   };
 }
@@ -432,7 +437,7 @@ export async function analyzeArticle(articleId: string, opts: StepOpts = {}): Pr
     scores: out.scores, scoreModel: out.scoreModel, threshold: out.threshold, ...(out.scoreRefused ? { scoreRefused: true } : {}),
     ...(w ? { writer: w.kind, writerModel: w.model, itemType: w.itemType ?? null, authorRole: w.authorRole ?? null } : {}),
     ...(w?.identityGuard?.outcome === "fallback" ? { identityGuard: w.identityGuard } : {}),
-    fact: out.fact,
+    fact: out.fact, finance: out.finance,
   };
   const committed = await sql.begin(async (tx) => {
     const [current] = await tx<{ revision: number }[]>`SELECT revision FROM articles WHERE id = ${articleId} FOR UPDATE`;
