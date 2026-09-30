@@ -1,6 +1,7 @@
 // Item detail and Markdown export, both behind the same visibility and licence rules.
 import type { ItemDetail, SiteItemDetail, OutlineEntry, StoryRef } from "@aihot/contracts/site";
 import TurndownService from "turndown";
+import { config } from "../config.ts";
 import { sql } from "../db.ts";
 import { proxyBodyImages } from "../media/imgproxy.ts";
 import { textToHtml } from "../content/sanitize.ts";
@@ -132,7 +133,7 @@ export async function loadItemDetail(id: string, now = new Date()): Promise<Deta
     language: row.language,
     body,
     outline,
-    relatedStories: related,
+    relatedStories: config.editorialReviewRequired ? [] : related,
     indexable: row.indexable,
     markdownAvailable: markdownAvailable(row),
     group,
@@ -163,6 +164,10 @@ export async function exportMarkdown(id: string): Promise<{ filename: string; bo
   lines.push(`- 发布时间：${(row.published_at ?? row.discovered_at).toISOString()}`);
   lines.push(`- ${SITE.name}：${itemUrl(row.id)}`);
   lines.push(`- 原文：${row.url}`, "");
+  if (row.finance) {
+    const f = row.finance;
+    lines.push("## 财务为什么关注", "", f.relevance, "", "## 使用条件", "", f.conditions, "", "## 可以怎样尝试", "", f.nextStep, "", "## 限制与依据", "", f.limitations, "");
+  }
   if (row.summary) lines.push("## 摘要", "", row.summary, "");
   if (row.selected && row.reason) lines.push("## 推荐理由", "", row.reason, "");
   if (row.channel === "x" && row.x_post?.text) {
