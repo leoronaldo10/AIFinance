@@ -1,23 +1,27 @@
 name: Prepare or deploy native preview
 on:
+  # A push to the separately protected release branch verifies access only, never deploys.
+  push:
+    branches: [release/aifinance-preview]
   workflow_dispatch:
     inputs:
       revision:
-        description: Reviewed full 40-character commit SHA (existing release for rollback)
-        required: true
+        description: Full reviewed SHA (leave empty only for verify)
+        required: false
         type: string
       operation:
-        description: Build is the safe default; deploy/rollback require separately provisioned SSH access
+        description: Build by default; verify only checks restricted SSH access
         type: choice
         default: build
-        options: [build, deploy, rollback]
+        options: [build, verify, deploy, rollback]
 permissions:
   contents: read
 concurrency:
   group: aifinance-native-preview
   cancel-in-progress: false
 jobs:
-  release:
+  build:
+    if: inputs.operation == 'build' || inputs.operation == 'deploy'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -30,20 +34,22 @@ jobs:
       INDEXNOW_SUBMIT_ENABLED: "false"
     steps:
       - name: Validate explicit revision
-        run: |
-          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
-          [[ "$OPERATION" = build || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
+        run: '[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.revision }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Only reviewed release history may deploy
+        if: inputs.operation == 'deploy'
+        run: |
+          [[ "$GITHUB_REF" = refs/heads/release/aifinance-preview ]] || exit 2
+          git merge-base --is-ancestor "$REVISION" refs/remotes/origin/release/aifinance-preview
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        if: inputs.operation != 'rollback'
         with:
           node-version: 24
           package-manager-cache: false
-      - name: Build and test (no database or outside application calls)
-        if: inputs.operation != 'rollback'
+      - name: Build and test without SSH secrets
         run: |
           npm ci --no-audit --no-fund
           npm run typecheck
@@ -52,36 +58,58 @@ jobs:
           npm run build -w @aihot/web
           node --test apps/web/tests/*.test.ts
           bash deploy/native/package.sh "$REVISION" "$RUNNER_TEMP/release"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: inputs.operation != 'rollback'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: aifinance-${{ inputs.revision }}
           path: ${{ runner.temp }}/release/
           retention-days: 7
           if-no-files-found: error
-      - name: Deploy or roll back only AIFinance
-        if: inputs.operation != 'build'
+
+  access:
+    needs: [build]
+    if: >-
+      always() && github.ref == 'refs/heads/release/aifinance-preview' &&
+      (github.event_name == 'push' || (inputs.operation == 'deploy' && needs.build.result == 'success') ||
+      inputs.operation == 'verify' || inputs.operation == 'rollback')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # MUST be created/restricted by an administrator BEFORE adding any secret.
+    # Only selected branch release/aifinance-preview; no PR refs, tags or wildcards.
+    environment: aifinance-preview
+    steps:
+      # Fresh runner: never check out or run the requested revision with the SSH key available.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.operation == 'deploy'
+        with:
+          name: aifinance-${{ inputs.revision }}
+          path: ${{ runner.temp }}/release
+      - name: Invoke the restricted SSH entry
         env:
+          REVISION: ${{ inputs.revision }}
+          OPERATION: ${{ github.event_name == 'push' && 'verify' || inputs.operation }}
           SSH_HOST: ${{ secrets.AIFINANCE_SSH_HOST }}
           SSH_PORT: ${{ secrets.AIFINANCE_SSH_PORT }}
-          SSH_USER: ${{ secrets.AIFINANCE_SSH_USER }}
           SSH_KEY: ${{ secrets.AIFINANCE_SSH_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.AIFINANCE_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
+          [[ "$OPERATION" = verify || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
+          [[ "$OPERATION" = verify || "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
           [[ "$SSH_PORT" -gt 0 && "$SSH_PORT" -le 65535 && -n "$SSH_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || exit 2
           scratch=$(mktemp -d)
           trap 'rm -rf "$scratch"' EXIT
           umask 077
           printf '%s\n' "$SSH_KEY" > "$scratch/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$scratch/known_hosts"
-          options=(-i "$scratch/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$scratch/known_hosts" -o ConnectTimeout=15)
-          checksum=''
-          if [[ "$OPERATION" = deploy ]]; then
-            checksum=$(cut -d ' ' -f1 "$RUNNER_TEMP/release/$REVISION.tar.gz.sha256")
+          options=(-T -p "$SSH_PORT" -i "$scratch/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$scratch/known_hosts" -o ConnectTimeout=15)
+          if [[ "$OPERATION" = verify ]]; then
+            ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" verify
+          elif [[ "$OPERATION" = deploy ]]; then
+            checksum=$(sha256sum "$RUNNER_TEMP/release/$REVISION.tar.gz" | cut -d ' ' -f1)
             [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || exit 2
-            scp -P "$SSH_PORT" "${options[@]}" "$RUNNER_TEMP/release/$REVISION.tar.gz" "$SSH_USER@$SSH_HOST:/opt/aifinance/incoming/$REVISION.tar.gz"
+            ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "upload $REVISION $checksum" < "$RUNNER_TEMP/release/$REVISION.tar.gz"
+            ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "deploy $REVISION $checksum"
+          else
+            ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "rollback $REVISION"
           fi
-          # All remote command arguments have been restricted to fixed words or hex strings.
-          ssh -p "$SSH_PORT" "${options[@]}" "$SSH_USER@$SSH_HOST" "bash /opt/aifinance/bin/release.sh $OPERATION $REVISION $checksum"

@@ -38,7 +38,7 @@ def main():
     if role not in ("api", "web"):
         raise SystemExit("Only api and web roles are permitted")
     env = environment(Path("/etc/aifinance-preview.env").read_text())
-    release = Path("/opt/aifinance/current").resolve(strict=True)
+    release = Path("/opt/aifinance/state/current").resolve(strict=True)
     sha = (release / "RELEASE_SHA").read_text().strip()
     if not re.fullmatch(r"[a-f0-9]{40}", sha) or release != Path("/opt/aifinance/releases") / sha:
         raise SystemExit("Invalid release path")

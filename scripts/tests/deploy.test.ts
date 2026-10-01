@@ -10,7 +10,7 @@ const repo = path.resolve(import.meta.dirname, "../..");
 const old = "a".repeat(40), next = "b".repeat(40);
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "aifinance-release-"));
-  for (const dir of ["releases", "incoming", "shared", "bin"]) mkdirSync(path.join(root, dir));
+  for (const dir of ["releases", "incoming", "shared", "bin", "state"]) mkdirSync(path.join(root, dir));
   writeFileSync(path.join(root, "shared/native-ready"), "test fixture");
   writeFileSync(path.join(root, "shared/schema.sha256"), "schema-1\n");
   const make = (sha: string, schema = "schema-1\n") => {
@@ -22,13 +22,13 @@ function fixture() {
     writeFileSync(path.join(dir, "schema.sha256"), schema);
     return dir;
   };
-  make(old); symlinkSync(path.join(root, "releases", old), path.join(root, "current"));
+  make(old); symlinkSync(path.join(root, "releases", old), path.join(root, "state/current"));
   const stub = (name: string, body: string) => writeFileSync(path.join(root, "bin", name), "#!/usr/bin/env bash\n" + body, { mode: 0o755 });
   stub("systemctl", 'if [[ "$1" = show ]]; then echo loaded; fi\n');
   stub("sudo", 'printf "%s\\n" "$*" >> "$AIFINANCE_ROOT/restarts"\n');
   stub("node", 'exit 0\n');
   stub("sleep", 'exit 0\n');
-  stub("curl", `sha=$(basename "$(readlink -f "$AIFINANCE_ROOT/current")")
+  stub("curl", `sha=$(basename "$(readlink -f "$AIFINANCE_ROOT/state/current")")
 if [[ -e "$AIFINANCE_ROOT/fail-new" && "$sha" = ${next} ]]; then exit 22; fi
 printf '{"ok":true,"release":"%s"}\\n' "$sha"
 `);
@@ -51,10 +51,10 @@ test("deploy validates archive and switches only AIFinance services; explicit co
   try {
     const result = f.run("deploy", next, f.pack());
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(readlinkSync(`${f.root}/current`), `${f.root}/releases/${next}`);
+    assert.equal(readlinkSync(`${f.root}/state/current`), `${f.root}/releases/${next}`);
     assert.match(readFileSync(`${f.root}/restarts`, "utf8"), /^-n \/usr\/bin\/systemctl restart aifinance-preview-api.service aifinance-preview-web.service\n$/);
     assert.equal(f.run("rollback", old).status, 0);
-    assert.equal(readlinkSync(`${f.root}/current`), `${f.root}/releases/${old}`);
+    assert.equal(readlinkSync(`${f.root}/state/current`), `${f.root}/releases/${old}`);
   } finally { f.clean(); }
 });
 
@@ -65,7 +65,7 @@ test("failed health check restores previous code and reports failure", () => {
     const result = f.run("rollback", next);
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /Previous code restored/);
-    assert.equal(readlinkSync(`${f.root}/current`), `${f.root}/releases/${old}`);
+    assert.equal(readlinkSync(`${f.root}/state/current`), `${f.root}/releases/${old}`);
   } finally { f.clean(); }
 });
 
@@ -76,7 +76,7 @@ test("schema mismatch and invalid revisions fail before any service restart", ()
     assert.notEqual(f.run("rollback", next).status, 0);
     assert.notEqual(f.run("rollback", "../../other-service").status, 0);
     assert.equal(existsSync(`${f.root}/restarts`), false);
-    assert.equal(readlinkSync(`${f.root}/current`), `${f.root}/releases/${old}`);
+    assert.equal(readlinkSync(`${f.root}/state/current`), `${f.root}/releases/${old}`);
   } finally { f.clean(); }
 });
 

@@ -2,6 +2,7 @@
 # Install a reviewed copy outside releases. Run as a dedicated deploy account, never root.
 # That account may restart ONLY the two named services via separately approved sudo rules.
 set -euo pipefail
+umask 0022
 root=${AIFINANCE_ROOT:-/opt/aifinance}
 action=${1:?deploy or rollback}
 sha=${2:?full commit SHA}
@@ -9,19 +10,19 @@ sha=${2:?full commit SHA}
 [[ $sha =~ ^[0-9a-f]{40}$ && $root = /* ]] || exit 2
 [[ $EUID != 0 ]] || { echo 'Run as dedicated deploy user, not root' >&2; exit 1; }
 for cmd in flock curl python3 sudo systemctl; do command -v "$cmd" >/dev/null; done
-[[ -d $root/releases && -d $root/incoming && -f $root/shared/schema.sha256 && -f $root/shared/native-ready ]] || {
+[[ -d $root/state && -d $root/releases && -d $root/incoming && -f $root/shared/schema.sha256 && -f $root/shared/native-ready ]] || {
   echo 'Provisioning, schema approval and native isolation sign-off required' >&2; exit 1;
 }
-exec 9>"$root/release.lock"
+exec 9>"$root/state/release.lock"
 flock -n 9 || { echo 'Another AIFinance deployment is active' >&2; exit 1; }
 # Only these services may be touched. No daemon-reload, enable, kill, nginx or database commands.
 units=(aifinance-preview-api.service aifinance-preview-web.service)
 for unit in "${units[@]}"; do
   [[ $(systemctl show "$unit" -p LoadState --value) = loaded ]] || exit 1
 done
-if [[ -e $root/current && ! -L $root/current ]]; then echo 'current must be a release symlink' >&2; exit 1; fi
+if [[ -e $root/state/current && ! -L $root/state/current ]]; then echo 'current must be a release symlink' >&2; exit 1; fi
 old=''
-if [[ -L $root/current ]]; then old=$(readlink -f "$root/current"); fi
+if [[ -L $root/state/current ]]; then old=$(readlink -f "$root/state/current"); fi
 if [[ -n $old && $old != "$root/releases/"* ]]; then echo 'Unexpected current target' >&2; exit 1; fi
 release="$root/releases/$sha"
 if [[ $action = deploy ]]; then
@@ -67,17 +68,17 @@ if [[ -n $old && -d $old ]]; then
   }
 fi
 /usr/local/bin/node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 24 || minor < 11) process.exit(1)'
-# Exercise bundled native libraries on the target ABI before switching anything.
-(cd "$release" && /usr/local/bin/node --input-type=module -e "await import('sharp'); await import('@resvg/resvg-js')")
+# Never execute uploaded JavaScript as the deploy account. Native dependencies are loaded by
+# the confined app service; startup/health failure rolls the code back.
 switch_to() {
-  ln -s "$1" "$root/.current-next"
-  mv -Tf "$root/.current-next" "$root/current"
+  ln -s "$1" "$root/state/.current-next"
+  mv -Tf "$root/state/.current-next" "$root/state/current"
 }
 restart() { sudo -n /usr/bin/systemctl restart "${units[@]}"; }
 healthy() {
   for attempt in {1..20}; do
     if systemctl is-active --quiet "${units[0]}" && systemctl is-active --quiet "${units[1]}" &&
-       curl --noproxy '*' --max-time 3 -fsS http://127.0.0.1:3101/api/health | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") is True and d.get("release")==sys.argv[1] else 1)' "$(basename "$(readlink -f "$root/current")")" &&
+       curl --noproxy '*' --max-time 3 -fsS http://127.0.0.1:3101/api/health | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") is True and d.get("release")==sys.argv[1] else 1)' "$(basename "$(readlink -f "$root/state/current")")" &&
        curl --noproxy '*' --max-time 3 -fsS -o /dev/null http://127.0.0.1:3100/; then return 0; fi
     sleep 2
   done
