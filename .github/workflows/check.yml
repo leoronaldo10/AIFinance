@@ -116,4 +116,4 @@ jobs:
         run: >-
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges
           -v "$PWD:/repo:ro" -w /repo python:3.6.8-stretch
-          python -B scripts/tests/python36-check.py
+          sh -c 'python -B scripts/tests/python36-check.py && python -B scripts/tests/inspect-check.py'

@@ -15,13 +15,13 @@ HEX64 = r'[0-9a-f]{64}'
 
 
 def parse(command):
-    if command == 'verify':
-        return ['verify']
+    if command in ('verify', 'inspect'):
+        return [command]
     if re.fullmatch(r'(upload|deploy) ' + HEX40 + ' ' + HEX64, command):
         return command.split(' ')
     if re.fullmatch(r'rollback ' + HEX40, command):
         return command.split(' ')
-    raise ValueError('Command denied; only verify/upload/deploy/rollback are supported')
+    raise ValueError('Command denied; only verify/inspect/upload/deploy/rollback are supported')
 
 
 def upload(root, sha, digest, stream):
@@ -62,8 +62,11 @@ def main():
     if args[0] == 'verify':
         print('AIFINANCE_ACCESS_OK: restricted account; no deployment performed')
         return
+    if args[0] == 'inspect':
+        os.execve('/usr/bin/python3', ['/usr/bin/python3', '-I', str(ROOT / 'bin/inspect-native.py')], dict(os.environ))
+        return
     if not (ROOT / 'shared/native-ready').is_file():
-        raise ValueError('Native runtime not approved; only verify is currently available')
+        raise ValueError('Native runtime not approved; only verify and inspect are currently available')
     if args[0] == 'upload':
         def expired(*_):
             raise ValueError('Upload timed out')
