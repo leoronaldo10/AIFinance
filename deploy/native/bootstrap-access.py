@@ -19,6 +19,12 @@ HOME = Path('/var/lib/aifinance-deploy')
 SUDO = Path('/etc/sudoers.d/aifinance-preview')
 SUDO_RULE = 'aifinance-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart aifinance-preview-api.service aifinance-preview-web.service\n'
 SCRIPTS = ('ssh-gateway.py', 'release.sh', 'run-preview.py')
+# Exact reviewed locale names; LC_* is the sole legacy pattern we already supported.
+# No generic glob matching: it could admit loader/shell/interpreter controls.
+ACCEPT_ENV = frozenset(('LANG', 'LANGUAGE', 'XMODIFIERS', 'LC_*', 'LC_CTYPE',
+    'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE', 'LC_MONETARY', 'LC_MESSAGES',
+    'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT',
+    'LC_IDENTIFICATION', 'LC_ALL'))
 
 
 def public_key(text):
@@ -76,7 +82,7 @@ def preflight(source):
     if not any(x.startswith('authorizedkeysfile ') and '.ssh/authorized_keys' in x.split()[1:] for x in lines):
         raise ValueError('sshd does not use the expected authorized_keys path')
     for line in lines:
-        if line.startswith('acceptenv ') and any(v not in ('LANG', 'LC_*') for v in line.split()[1:]):
+        if line.startswith('acceptenv ') and any(v not in ACCEPT_ENV for v in line.split()[1:]):
             raise ValueError('Nonstandard AcceptEnv policy; inspect manually')
 
 

@@ -42,6 +42,7 @@ class AccessCompatibility(unittest.TestCase):
             return real_run([sys.executable, '-c', 'print("not-found")'], **kwargs)
         def output(args, **kwargs):
             self.assertIn('-T', args)
+            self.assertEqual(args[-2:], ['-C', 'user=aifinance-deploy,host=localhost,addr=127.0.0.1'])
             with patch.object(subprocess, 'run', real_run):
                 return real_output([sys.executable, '-c', 'print(' + repr(settings) + ')'], **kwargs)
         def root_stat(p, *args, **kwargs):
@@ -53,10 +54,47 @@ class AccessCompatibility(unittest.TestCase):
             with patch.object(boot.pwd, 'getpwnam', side_effect=KeyError), patch.object(boot.grp, 'getgrnam', side_effect=KeyError), patch.object(boot.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), patch.object(boot.subprocess, 'run', side_effect=run), patch.object(boot.subprocess, 'check_output', side_effect=output), patch.object(Path, 'stat', root_stat):
                 boot.preflight(ROOT / 'deploy/native')
                 self.assertEqual(len(calls), 2)
+                base = 'permituserenvironment no\nforcecommand none\nauthorizedkeysfile .ssh/authorized_keys\n'
+                actual = ('LANG LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES '
+                          'LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION '
+                          'LC_ALL LANGUAGE XMODIFIERS').split()
+                settings = base + '\n'.join('acceptenv ' + name for name in actual)
+                boot.preflight(ROOT / 'deploy/native')
+                for bad in ('PYTHONPATH', 'PYTHONHOME', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_*',
+                            'BASH_ENV', 'ENV', 'PATH', '*', 'L*', '*PATH', 'PYTHON*', '?NV',
+                            'LANG*', 'XMODIFIERS*', 'LC_UNKNOWN', 'LOCPATH', 'GCONV_PATH'):
+                    settings = base + 'acceptenv LANG ' + bad
+                    with self.subTest(acceptenv=bad), self.assertRaises(ValueError):
+                        boot.preflight(ROOT / 'deploy/native')
+                settings = base.replace('permituserenvironment no', 'permituserenvironment yes') + 'acceptenv LANG'
+                with self.assertRaises(ValueError):
+                    boot.preflight(ROOT / 'deploy/native')
+                settings = base.replace('forcecommand none', 'forcecommand internal-sftp') + 'acceptenv LANG'
+                with self.assertRaises(ValueError):
+                    boot.preflight(ROOT / 'deploy/native')
+                previous_calls = len(calls)
                 boot.ROOT.mkdir()
                 with self.assertRaises(ValueError):
                     boot.preflight(ROOT / 'deploy/native')
-                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(calls), previous_calls)
+
+    def test_gateway_drops_client_locale_before_release(self):
+        gate = module('gateway_locale', 'ssh-gateway.py')
+        with tempfile.TemporaryDirectory() as d:
+            gate.ROOT = Path(d)
+            (gate.ROOT / 'shared').mkdir()
+            (gate.ROOT / 'shared/native-ready').touch()
+            client = {'SSH_ORIGINAL_COMMAND': 'rollback ' + 'a' * 40,
+                      'LANG': 'invalid-locale', 'LC_ALL': 'invalid-locale',
+                      'LANGUAGE': 'caller-choice', 'XMODIFIERS': '@im=caller-choice'}
+            previous = os.umask(0o022)
+            try:
+                with patch.dict(os.environ, client, clear=True), patch.object(gate.os, 'execve') as execute:
+                    gate.main()
+                    self.assertEqual(execute.call_args[0][2], {
+                        'PATH': '/usr/bin:/bin', 'HOME': '/var/lib/aifinance-deploy', 'LANG': 'C.UTF-8'})
+            finally:
+                os.umask(previous)
 
     def test_bootstrap_check_only_cannot_provision(self):
         boot = module('bootstrap_check', 'bootstrap-access.py')

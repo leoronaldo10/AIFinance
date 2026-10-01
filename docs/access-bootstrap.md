@@ -2,6 +2,8 @@
 
 接入脚本兼容 ECS 的 `/usr/bin/python3` 3.6.8 及以上；使用标准库，不安装额外 Python 包，不替换系统 Python。Node 24.11+ 是后续应用运行要求，与此接入预检分开。
 
+AcceptEnv 预检允许明确列出的标准 locale 名称、LANGUAGE、XMODIFIERS，以及原有的字面模式 LC_*；拒绝其他变量和更宽通配符。locale 影响语言、编码或排序，XMODIFIERS 用于 Xlib 输入法；本入口不调用 Xlib，命令按 ASCII 格式匹配、上传按字节校验。Python 使用 -I，gateway 在解析命令前清空继承环境，仅重建固定 PATH/HOME/LANG，release 不继承客户端 locale/XMODIFIERS。不能因此放行 LD_*、BASH_ENV 等：它们可能在 gateway 清理前影响加载器或 shell。仍以 `sshd -T -C user=aifinance-deploy,host=localhost,addr=127.0.0.1` 的有效配置判断，不以默认 -T 结果替代；针对实际连接来源的 Match 规则仍需核验。本修复不修改 sshd 配置。
+
 本步骤只建立专用持续访问。**不安装 Node/PostgreSQL、不安装或启动 systemd 服务、不迁移、不部署、不改全局 sshd/firewall，不操作其他业务进程。** 配置成功以后，GitHub runner 可以在用户电脑关闭时执行已授权操作；首次仍需用户在可信终端完成密钥与账号初始化。
 
 ## 必须先确认的范围
