@@ -16,7 +16,7 @@ if (config.environmentName === "production" && !(config.adminPassword && config.
 const app = await buildApp();
 await app.listen({ port: config.apiPort, host: process.env.API_HOST || "127.0.0.1" });
 startHeartbeat(`api:${config.apiPort}`);
-startWorkerWatchdog();
+if (!config.previewMode) startWorkerWatchdog();
 
 let stopping = false;
 const shutdown = async () => {

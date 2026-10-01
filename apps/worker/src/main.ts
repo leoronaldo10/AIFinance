@@ -1,5 +1,5 @@
 // Worker process: queues and schedules for collection, processing, events, reports, monitors and ops.
-import { assertProductionSecrets } from "@aihot/backend/config";
+import { assertProductionSecrets, config } from "@aihot/backend/config";
 import { FEATURES } from "@aihot/industry/features";
 import { closeDb, sql } from "@aihot/backend/db";
 import { getBoss, stopBoss } from "@aihot/backend/jobs/queue";
@@ -11,6 +11,8 @@ import { registerPublicationJobs } from "@aihot/backend/jobs/publication";
 import { registerSchedules } from "./schedules.ts";
 import { ensureContentTargets } from "@aihot/backend/notify/deliver";
 import { startHeartbeat } from "@aihot/backend/operations/heartbeat";
+
+if (config.previewMode) throw new Error("The worker must not run in isolated preview");
 
 assertProductionSecrets([["auth", "IMG_PROXY_SIGN_SECRET"]]);
 

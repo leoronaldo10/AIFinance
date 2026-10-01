@@ -10,7 +10,7 @@ import { sql } from "../db.ts";
 
 const API = "https://open.feishu.cn/open-apis";
 
-export const feishuInternalEnabled = () => process.env.FEISHU_INTERNAL_ENABLED === "true";
+export const feishuInternalEnabled = () => !config.previewMode && process.env.FEISHU_INTERNAL_ENABLED === "true";
 
 let tokenCache: { token: string; expires: number } | null = null;
 

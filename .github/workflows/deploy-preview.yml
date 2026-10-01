@@ -1,0 +1,87 @@
+name: Prepare or deploy native preview
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Reviewed full 40-character commit SHA (existing release for rollback)
+        required: true
+        type: string
+      operation:
+        description: Build is the safe default; deploy/rollback require separately provisioned SSH access
+        type: choice
+        default: build
+        options: [build, deploy, rollback]
+permissions:
+  contents: read
+concurrency:
+  group: aifinance-native-preview
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REVISION: ${{ inputs.revision }}
+      OPERATION: ${{ inputs.operation }}
+      COLLECT_ENABLED: "false"
+      MODEL_CALLS_ENABLED: "false"
+      FEISHU_CONTENT_PUSH_ENABLED: "false"
+      FEISHU_INTERNAL_ENABLED: "false"
+      INDEXNOW_SUBMIT_ENABLED: "false"
+    steps:
+      - name: Validate explicit revision
+        run: |
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          [[ "$OPERATION" = build || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: inputs.operation != 'rollback'
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build and test (no database or outside application calls)
+        if: inputs.operation != 'rollback'
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run test:preview
+          npm run test:deploy
+          npm run build -w @aihot/web
+          node --test apps/web/tests/*.test.ts
+          bash deploy/native/package.sh "$REVISION" "$RUNNER_TEMP/release"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: inputs.operation != 'rollback'
+        with:
+          name: aifinance-${{ inputs.revision }}
+          path: ${{ runner.temp }}/release/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Deploy or roll back only AIFinance
+        if: inputs.operation != 'build'
+        env:
+          SSH_HOST: ${{ secrets.AIFINANCE_SSH_HOST }}
+          SSH_PORT: ${{ secrets.AIFINANCE_SSH_PORT }}
+          SSH_USER: ${{ secrets.AIFINANCE_SSH_USER }}
+          SSH_KEY: ${{ secrets.AIFINANCE_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.AIFINANCE_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
+          [[ "$SSH_PORT" -gt 0 && "$SSH_PORT" -le 65535 && -n "$SSH_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || exit 2
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          umask 077
+          printf '%s\n' "$SSH_KEY" > "$scratch/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$scratch/known_hosts"
+          options=(-i "$scratch/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$scratch/known_hosts" -o ConnectTimeout=15)
+          checksum=''
+          if [[ "$OPERATION" = deploy ]]; then
+            checksum=$(cut -d ' ' -f1 "$RUNNER_TEMP/release/$REVISION.tar.gz.sha256")
+            [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || exit 2
+            scp -P "$SSH_PORT" "${options[@]}" "$RUNNER_TEMP/release/$REVISION.tar.gz" "$SSH_USER@$SSH_HOST:/opt/aifinance/incoming/$REVISION.tar.gz"
+          fi
+          # All remote command arguments have been restricted to fixed words or hex strings.
+          ssh -p "$SSH_PORT" "${options[@]}" "$SSH_USER@$SSH_HOST" "bash /opt/aifinance/bin/release.sh $OPERATION $REVISION $checksum"

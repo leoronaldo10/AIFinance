@@ -1,0 +1,81 @@
+# Standalone: never combine with docker-compose.yml. No production env_file or worker.
+name: aifinance-preview
+
+x-app: &app
+  image: ${PREVIEW_IMAGE:?Set PREVIEW_IMAGE to the reviewed prebuilt image}
+  restart: unless-stopped
+  networks: [isolated]
+  volumes: [preview-data:/data]
+  environment: &preview-env
+    NODE_ENV: production
+    PREVIEW_MODE: "true"
+    COLLECT_ENABLED: "false"
+    MODEL_CALLS_ENABLED: "false"
+    FEISHU_CONTENT_PUSH_ENABLED: "false"
+    FEISHU_INTERNAL_ENABLED: "false"
+    INDEXNOW_SUBMIT_ENABLED: "false"
+    DATABASE_URL: postgres://preview:${POSTGRES_PASSWORD:?Generate .env.preview first}@db:5432/aifinance_preview
+    DATABASE_POOL_MAX: "3"
+    AIHOT_DATA_DIR: /data
+    API_BASE_URL: http://api:3001
+    SITE_URL: ${SITE_URL:?Set the preview URL}
+    SESSION_SECRET: ${SESSION_SECRET:?Generate .env.preview first}
+    IMG_PROXY_SIGN_SECRET: ${IMG_PROXY_SIGN_SECRET:?Generate .env.preview first}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Generate .env.preview first}
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    networks: [isolated]
+    mem_limit: 384m
+    environment:
+      POSTGRES_USER: preview
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate .env.preview first}
+      POSTGRES_DB: aifinance_preview
+    volumes: [preview-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U preview -d aifinance_preview"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  setup:
+    <<: *app
+    restart: "no"
+    mem_limit: 384m
+    command: [sh, -c, "node scripts/migrate.ts && node scripts/seed.ts --topics-only"]
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    <<: *app
+    mem_limit: 384m
+    command: [node, apps/api/src/main.ts]
+    environment:
+      <<: *preview-env
+      API_HOST: 0.0.0.0
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+  web:
+    <<: *app
+    volumes: []
+    mem_limit: 512m
+    command: [node, apps/web/server.ts]
+    environment:
+      NODE_ENV: production
+      PREVIEW_MODE: "true"
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "3000"
+      API_BASE_URL: http://api:3001
+      SITE_URL: ${SITE_URL:?Set the preview URL}
+      TRUST_PROXY: "false"
+    ports: ["127.0.0.1:${PREVIEW_PORT:-3100}:3000"]
+    depends_on: [api]
+
+networks:
+  isolated:
+    internal: true
+volumes:
+  preview-db: {}
+  preview-data: {}
