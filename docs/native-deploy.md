@@ -10,7 +10,7 @@
 
 - 出站 SSH 可达性、账号、主机指纹、凭据交付及服务器安全组。不得默认固定云端出口 IP，不得承诺会话保存密钥。不要通过开放全部来源或关闭主机指纹校验解决连通性。
 - 独立 `aifinance-deploy` 与运行账号 `aifinance`、路径权限和最小 sudo 权限。不能直接使用 root SSH 或依赖 `/root/.local/bin`。这些模板不创建账号、不写 authorized_keys、不改 sudoers。
-- `/usr/local/bin/node` 可被服务账号执行，版本为 Node 24.11+ 的 24.x；系统 Python 3、curl、flock、tar 可用。不要替换现有机器的默认 Node 或机器人的运行环境。
+- `/usr/local/bin/node` 可被服务账号执行，版本为 Node 24.11+ 的 24.x；系统 Python 3.6.8+、curl、flock、tar 可用（接入阶段不需 Node/PostgreSQL）。不要替换现有机器的默认 Node 或机器人的运行环境。
 - 独立的本地 PostgreSQL 与 `aifinance_preview` 数据库、独立数据库角色和新凭据；不复用生产数据库和凭据。现存数据与备份/恢复流程尚未确认。
 - HTTPS 域名与宿主机反向代理。服务仅占用 loopback 3100/3101，先确认端口空闲；不占用 8000，不重启 Nginx/机器人/其他服务。
 - 核实 systemd 的 `IPAddressDeny=any` / `IPAddressAllow=localhost` 在此内核与 cgroup/BPF 上真正生效；不支持时必须停止，不得仅看 unit 解析成功就认定隔离。限制允许 loopback，不能隔离宿主机其他服务；应用仍保留 SSRF 防护，配置仅允许专用 loopback DB。原生模板不等价于完全沙箱。

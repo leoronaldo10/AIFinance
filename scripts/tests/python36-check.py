@@ -1,0 +1,151 @@
+"""Run in official Python 3.6.8 with networking disabled; never provision real accounts."""
+import ast
+import base64
+import hashlib
+import importlib.util
+import io
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import types
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def module(name, filename):
+    spec = importlib.util.spec_from_file_location(name, str(ROOT / 'deploy/native' / filename))
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+class AccessCompatibility(unittest.TestCase):
+    def test_all_native_python_syntax(self):
+        for source in (ROOT / 'deploy/native').glob('*.py'):
+            ast.parse(source.read_text())
+
+    def test_bootstrap_preflight_real_subprocess_keyword_compatibility(self):
+        boot = module('bootstrap_preflight', 'bootstrap-access.py')
+        real_run, real_output, real_stat = subprocess.run, subprocess.check_output, Path.stat
+        calls = []
+        settings = 'permituserenvironment no\nforcecommand none\nauthorizedkeysfile .ssh/authorized_keys\nacceptenv LANG LC_*'
+        def run(args, **kwargs):
+            calls.append(args)
+            self.assertEqual(args[0], '/usr/bin/systemctl')
+            return real_run([sys.executable, '-c', 'print("not-found")'], **kwargs)
+        def output(args, **kwargs):
+            self.assertIn('-T', args)
+            with patch.object(subprocess, 'run', real_run):
+                return real_output([sys.executable, '-c', 'print(' + repr(settings) + ')'], **kwargs)
+        def root_stat(p, *args, **kwargs):
+            data = list(real_stat(p, *args, **kwargs))
+            data[4] = 0
+            return os.stat_result(data)
+        with tempfile.TemporaryDirectory() as d:
+            boot.ROOT, boot.HOME, boot.SUDO = [Path(d) / n for n in ('root', 'home', 'sudo')]
+            with patch.object(boot.pwd, 'getpwnam', side_effect=KeyError), patch.object(boot.grp, 'getgrnam', side_effect=KeyError), patch.object(boot.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), patch.object(boot.subprocess, 'run', side_effect=run), patch.object(boot.subprocess, 'check_output', side_effect=output), patch.object(Path, 'stat', root_stat):
+                boot.preflight(ROOT / 'deploy/native')
+                self.assertEqual(len(calls), 2)
+                boot.ROOT.mkdir()
+                with self.assertRaises(ValueError):
+                    boot.preflight(ROOT / 'deploy/native')
+                self.assertEqual(len(calls), 2)
+
+    def test_bootstrap_check_only_cannot_provision(self):
+        boot = module('bootstrap_check', 'bootstrap-access.py')
+        raw = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + bytes(32)
+        key = 'ssh-ed25519 ' + base64.b64encode(raw).decode()
+        with tempfile.TemporaryDirectory() as d:
+            public = Path(d) / 'fixture.pub'
+            public.write_text(key)
+            with patch.object(sys, 'argv', ['bootstrap', '--public-key', str(public)]), patch.object(boot.os, 'geteuid', return_value=0), patch.object(boot, 'preflight') as preflight, patch.object(boot, 'provision', side_effect=AssertionError('must not provision')), patch.object(boot.subprocess, 'run') as run, patch.object(boot.shutil, 'which', return_value='/usr/sbin/visudo'):
+                previous = os.umask(0o022)
+                try:
+                    boot.main()
+                finally:
+                    os.umask(previous)
+                self.assertEqual(preflight.call_count, 1)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args[0][0][0:3], ['/usr/sbin/visudo', '-c', '-f'])
+        self.assertTrue(boot.authorized_key(boot.public_key(key)).startswith('restrict,command='))
+        with self.assertRaises(ValueError):
+            boot.public_key(key + '\n' + key)
+
+    def test_gateway_paths_upload_and_limits(self):
+        gate = module('gateway36', 'ssh-gateway.py')
+        self.assertEqual(gate.parse('verify'), ['verify'])
+        for bad in ('sh', 'verify;id', 'internal-sftp', 'verify\n'):
+            with self.assertRaises(ValueError):
+                gate.parse(bad)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'incoming').mkdir()
+            sha, data = 'a' * 40, b'archive'
+            digest = hashlib.sha256(data).hexdigest()
+            gate.upload(root, sha, digest, io.BytesIO(data))
+            self.assertEqual((root / 'incoming' / (sha + '.tar.gz')).read_bytes(), data)
+            with self.assertRaises(ValueError):
+                gate.upload(root, sha, digest, io.BytesIO(data))
+            gate.LIMIT = 4
+            with self.assertRaises(ValueError):
+                gate.upload(root, 'b' * 40, digest, io.BytesIO(data))
+            self.assertEqual(list((root / 'incoming').glob('.upload-*')), [])
+
+    def test_launcher_environment_and_exec_boundary(self):
+        app = module('launcher36', 'run-preview.py')
+        text = 'DATABASE_URL=postgres://preview:local@127.0.0.1:5432/aifinance_preview\nSITE_URL=https://preview.example.com\nADMIN_PASSWORD=' + 'a' * 16 + '\nSESSION_SECRET=' + 'b' * 32 + '\nIMG_PROXY_SIGN_SECRET=' + 'c' * 32
+        self.assertEqual(app.environment(text)['MODEL_CALLS_ENABLED'], 'false')
+        with self.assertRaises(ValueError):
+            app.environment(text + '\nLLM_API_KEY=not-real')
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            release = base / 'releases' / ('a' * 40)
+            release.mkdir(parents=True)
+            (release / 'RELEASE_SHA').write_text('a' * 40)
+            (base / 'state').mkdir()
+            (base / 'state/current').symlink_to(release)
+            (base / 'env').write_text(text)
+            def location(value):
+                return base / 'env' if value == '/etc/aifinance-preview.env' else base / value.replace('/opt/aifinance/', '')
+            previous = os.getcwd()
+            try:
+                with patch.object(app, 'Path', side_effect=location), patch.object(sys, 'argv', ['launcher', 'web']), patch.object(app.os, 'execve') as execute:
+                    app.main()
+                    env = execute.call_args[0][2]
+                    self.assertNotIn('SESSION_SECRET', env)
+                    self.assertNotIn('DATABASE_URL', env)
+                    self.assertEqual(env['AIHOT_RELEASE'], 'a' * 40)
+                    self.assertEqual(execute.call_args[0][0], '/usr/local/bin/node')
+            finally:
+                os.chdir(previous)
+
+    def test_release_embedded_python_extract_and_reject(self):
+        script = (ROOT / 'deploy/native/release.sh').read_text()
+        embedded = script.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        ast.parse(embedded)
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            archive = base / 'release.tar.gz'
+            stage = base / 'stage'
+            stage.mkdir()
+            for name, expected in [('safe.txt', 0), ('../escape', 1)]:
+                with tarfile.open(str(archive), 'w:gz') as tf:
+                    info = tarfile.TarInfo(name)
+                    info.size = 4
+                    tf.addfile(info, io.BytesIO(b'test'))
+                result = subprocess.run([sys.executable, '-c', embedded, str(archive), str(stage)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertFalse((base / 'escape').exists())
+            self.assertEqual((stage / 'safe.txt').read_bytes(), b'test')
+
+
+if __name__ == '__main__':
+    print('Runtime:', sys.version, flush=True)
+    unittest.main()

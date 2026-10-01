@@ -58,7 +58,7 @@ def preflight(source):
         else:
             raise ValueError('Existing group; will not modify it')
     for role in ('api', 'web'):
-        result = subprocess.run(['/usr/bin/systemctl', 'show', 'aifinance-preview-' + role + '.service', '-p', 'LoadState', '--value'], capture_output=True, text=True)
+        result = subprocess.run(['/usr/bin/systemctl', 'show', 'aifinance-preview-' + role + '.service', '-p', 'LoadState', '--value'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if result.returncode != 0 or result.stdout.strip() != 'not-found':
             raise ValueError('Existing or unverifiable AIFinance service; no changes made')
     for tool in ('useradd', 'visudo', 'sshd', 'nologin'):
@@ -69,7 +69,7 @@ def preflight(source):
         if not p.is_file() or p.is_symlink() or p.stat().st_uid != 0 or p.stat().st_mode & 0o022:
             raise ValueError('Reviewed access scripts must be regular local files')
     # Fail closed if sshd could accept caller-controlled interpreter variables or an alternate entry.
-    settings = subprocess.check_output([shutil.which('sshd'), '-T', '-C', 'user=aifinance-deploy,host=localhost,addr=127.0.0.1'], text=True)
+    settings = subprocess.check_output([shutil.which('sshd'), '-T', '-C', 'user=aifinance-deploy,host=localhost,addr=127.0.0.1'], universal_newlines=True)
     lines = settings.splitlines()
     if 'permituserenvironment no' not in lines or 'forcecommand none' not in lines:
         raise ValueError('Unexpected sshd per-user environment/command policy; inspect manually')
