@@ -1,0 +1,57 @@
+name: One-shot ECS TCP22 diagnostic
+on:
+  push:
+    branches: [diag/ecs-tcp22-20261001]
+permissions: {}
+concurrency:
+  group: ecs-tcp22-diagnostic
+  cancel-in-progress: false
+jobs:
+  tcp22:
+    if: github.repository == 'leoronaldo10/AIFinance' && github.ref == 'refs/heads/diag/ecs-tcp22-20261001'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      # No checkout, third-party actions, SSH client, credentials, deployment or artifacts.
+      - name: Check configuration and attempt one TCP connection
+        env:
+          ECS_DIAGNOSTIC_HOST: ${{ secrets.ECS_DIAGNOSTIC_HOST }}
+        shell: python
+        run: |
+          import ipaddress
+          import os
+          import socket
+          import sys
+          import time
+
+          host = os.environ.get("ECS_DIAGNOSTIC_HOST", "").strip()
+          if not host:
+              print("CONFIGURATION_MISSING: ECS_DIAGNOSTIC_HOST; no connection attempted")
+              sys.exit(78)
+          try:
+              address = ipaddress.ip_address(host)
+              if address.version != 4 or not address.is_global:
+                  raise ValueError()
+          except ValueError:
+              print("CONFIGURATION_INVALID: expected a public IPv4 address; no connection attempted")
+              sys.exit(78)
+          print("::add-mask::" + host, flush=True)
+          started = time.monotonic()
+          result = ""
+          exit_code = 1
+          try:
+              with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                  connection.settimeout(5)
+                  connection.connect((host, 22))
+                  # Do not send authentication data or read/print any SSH banner.
+                  result = "TCP_CONNECTED: connection only; SSH protocol and authentication not tested"
+                  exit_code = 0
+          except TimeoutError:
+              result = "TCP_TIMEOUT: no authentication attempted"
+          except ConnectionRefusedError:
+              result = "TCP_REFUSED: origin of refusal undetermined; no authentication attempted"
+          except OSError as error:
+              result = "TCP_ERROR: errno=" + str(error.errno) + "; no authentication attempted"
+          print(result)
+          print("Elapsed seconds: %.3f" % (time.monotonic() - started))
+          sys.exit(exit_code)
