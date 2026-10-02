@@ -1,21 +1,28 @@
 # TEMPLATE ONLY: install/enable requires separately authorized provisioning.
 [Unit]
 Description=AIFinance isolated preview web
-After=network.target
+BindsTo=aifinance-preview-egress.service
+After=network.target aifinance-preview-egress.service
 
 [Service]
 Type=simple
 User=aifinance
 Group=aifinance
+# v239 supports +: only this fixed trusted check runs as root, never app code.
+ExecStartPre=+/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py verify
 ExecStart=/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py web
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/aifinance/shared/data
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Defense in depth only: ineffective on this systemd 239/cgroup v1 target.
+# The required nft UID guard above is the actual startup network gate.
 IPAddressDeny=any
 IPAddressAllow=localhost
 # Provisional low-load budget; verify actual enforcement and peak usage before native-ready.
@@ -24,6 +31,7 @@ MemoryLimit=256M
 TasksMax=64
 CPUQuota=50%
 LimitNOFILE=4096
+LimitCORE=0
 UMask=0077
 
 [Install]

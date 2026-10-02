@@ -1,3 +1,5 @@
+> 当前阶段（2026-10-02）：目标已完成 Node24.21.0 与四个 PG17.11 RPM 的实际安装。本文保留早期 check-only 设计说明；当前剩余执行计划见 [第一次个人预览](native-first-preview.md)，不要重复安装，也不要将下方历史未知项视为当前永久阻断。
+
 # 原生运行时准备：只读检查草案
 
 `deploy/native/prepare-native.py` 是 **check-only 的准备草案，不是已完成的安装器**。这是本轮草案的实现边界，并非原生部署永久不可行；独立 Node 的真实 check/apply 已在 [`first-install.py`](../deploy/native/first-install.py) 实现，见[最小首次安装阶段](native-first-install.md)；PG 事务未知仅阻塞 PG 阶段。获授权后应按下文三个阶段继续。当前所有检查都返回 `ready_for_apply=false` 和 `ready_for_deploy=false`；`--apply` 始终在任何写入前拒绝。即使本地制品校验全部通过，也不会安装软件、创建账号、写 unit/env、初始化数据库、迁移、启动服务或生成验收标记。
@@ -16,15 +18,25 @@
 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LANG=C LC_ALL=C /bin/bash --noprofile --norc /root/inspect-prerequisites.sh
 ```
 
-此文件没有其他脚本依赖，不接受参数；每个命令 12 秒超时、标准输出 8 KiB 上限，不输出原始 stderr。临时 DNF log/persist 目录会清理，不刷新缓存或修改仓库。非零、缺项、截断都表示 UNKNOWN，不能当作不存在。返回一份输出即可，勿附 env、密钥或服务日志。采样覆盖以下字段：
+已有完整主机采样时，只补 DNF 缺口，不重复系统/内存/端口信息。使用审阅后的 v2 文件的新路径，不覆盖旧已发布文件：
+
+```sh
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LANG=C LC_ALL=C /bin/bash --noprofile --norc /root/inspect-prerequisites-v2.sh --dnf-only
+```
+
+文件没有其他脚本依赖，使用系统 `/usr/bin/python3`（兼容 3.6）过滤 DNF 输出；仅接受无参数的完整诊断或固定 `--dnf-only`。每个命令 12 秒超时、标准输出 8 KiB 上限；DNF stderr 同样有 8 KiB 上限，只返回固定错误类别，不回显原文。DNF stdout 只保留 repository ID、固定 PG 包版本/架构/仓库 ID、PG 模块 stream/状态，丢弃仓库名称、URL、描述及其他任意文本。临时 DNF log/persist 目录为私有目录，完成清理。非零、缺项、截断都表示 UNKNOWN，不能当作不存在。返回一份输出即可，勿附 env、密钥或服务日志。采样覆盖以下字段：
 
 | 字段 | 固定只读来源与判断 |
 |---|---|
 | OS / kernel / ABI | `/etc/os-release` 的 ID/VERSION_ID、`uname -r`、glibc 版本；系统 libstdc++ 的 GLIBCXX 版本字符串（排序后末5项），仅作 ABI 线索。候选 Node/原生模块所需 GLIBC/GLIBCXX 要从**已固定并核验制品**的 ELF 版本要求另行对比；制品尚缺时明确填 unknown |
 | 已装包 | root `rpm -q` 固定集合：glibc、libstdc++、nodejs、postgresql/server/contrib/libs、postgresql16 与 postgresql17 对应四包；输出固定包名的已装版本或查询状态。未找到某固定名字不等于没有别的安装方式 |
-| PG 模块、候选包、仓库 | root `dnf -C --noplugins --config=/dev/null` 的固定 module list、repolist 和 repoquery；repoquery 覆盖系统 PG 与 PGDG16/17，输出每项最新候选的 name/version-release/arch、repository ID，关闭模块过滤以避免漏掉未启用流；PGDG ID 保留。只用已有缓存；受保护的 reposdir/varsdir，日志/persistdir 指向临时私有目录，完成删除临时文件 |
+| PG 模块、候选包、仓库 | root `dnf -C --noplugins` 的固定 repolist、list --available、module list 和 repoquery；另以 rpm -q 记录 dnf/python3-dnf/libdnf 版本。保留发行版 dnf.conf、reposdir、varsdir、releasever、module_platform_id 和缓存路径，不改成 /dev/null。只关闭本次查询的可选 DNS 密钥检查；日志/persistdir 指向临时私有目录。repoquery 覆盖系统 PG 与 PGDG16/17 四包，保留各项最新 name/version-release/arch、repository ID，关闭模块过滤。list 使用正常模块过滤作交叉核对；两者都只查已有缓存。禁用插件、临时 persistdir 缺少系统 module-failsafe 状态，意味着这些结果不能替代安装事务解析 |
 | cgroup / kernel 过滤能力 | `findmnt` 的 cgroup 类型与挂载、`/proc/cgroups` 的 memory controller 存在状态；只读 kernel config 中 CONFIG_MEMCG、CONFIG_BPF、CONFIG_BPF_SYSCALL、CONFIG_CGROUP_BPF，配置不可读就填 unknown。版本/配置存在不证明 app unit 上过滤有效 |
 | 资源、监听、服务 | MemTotal/MemAvailable/SwapTotal/SwapFree、`/opt` 磁盘空闲；8000/3100/3101/55432 的监听地址类别；固定 preview 三个 unit 的 LoadState/ActiveState/MemoryLimit/MemoryCurrent。目录所有者/验收标记元数据由既有 `inspect` 补充；不要读取 env 或标记内私密信息 |
+
+旧诊断的三个 DNF 命令同时 exit 1、stdout 为空，**不能据此认定无缓存或无 PG 候选**。[上游 DNF 4.7.0](https://github.com/rpm-software-management/dnf/blob/4.7.0/dnf/cli/cli.py#L842-L846) 在加载显式 `--config` 前要求 `os.path.isfile`；`/dev/null` 是字符设备，会产生“config file does not exist”并在子命令之前退出。这是与现场现象吻合的确定上游机制，目标发行版是否同一路径尚未取得原 stderr 证据；不把它写成已核实目标根因。修正版去掉该覆盖和多余硬编码默认路径，并分类报告 `config_path_not_regular`、`config_error`、`cache_unavailable`、`releasever_unknown`、`module_platform_unknown`、`unsupported_command_or_option` 等错误。未知错误也不回显敏感内容。
+
+[DNF 官方 cache-only 说明](https://dnf.readthedocs.io/en/stable/command_ref.html#options) 表明 `-C` 使用系统缓存且不刷新，即便缓存过期。此查询不安装、下载包、增加/切换仓库、启用模块或更改服务器配置；包管理器本身可能仍使用常规锁或派生缓存，不能把它表述为底层文件系统绝对零写入。DNF 内部缓存实现的实际行为未在目标机测试。
 
 这一步仅使用已获授权的 root **只读采样**，不包含升级、仓库变更、网络配置、启动服务或开放端口。`dnf -C` 无缓存时不得自动重试联网；将缺失项合并成第二阶段的一次有界审批请求。若 root 诊断直接证明现成包和隔离条件足够，跳过不必要的仓库刷新，直接准备精确事务审阅。
 
@@ -92,7 +104,7 @@ python3 -B deploy/native/prepare-native.py \
 以下是后续实现和验收的边界，**本脚本没有执行它们**：
 
 - Node 安装在 `/opt/aifinance/runtime/node/bin/node`，精确 pin 为 Node 24.11+ 的 24.x；由 root 保护。不得链接/覆盖系统默认 Node，也不得引用 `/root/.local/bin`
-- PostgreSQL 使用经事务审查通过的 16 或 17，拟配独立非登录 OS 账号 `aifinance-pg`、独立空目录 `/var/lib/aifinance-preview/postgresql` 和 `aifinance-preview-db.service`；不能复用旧集群或默认数据库服务。这些是待审阅契约，当前没有 DB unit、initdb 或迁移实现；账号、路径和二进制版本须随最终 unit 一起确认
+- PostgreSQL 使用经事务审查通过的 16 或 17，最终方案复用已由官方RPM创建的 `postgres` UID/GID26、独立空目录 `/var/lib/pgsql/aifinance-preview` 和 `aifinance-preview-db.service`；不能复用旧集群或默认数据库服务。当前DB unit/initdb及首次迁移实现已在本地待审文件中，见新的首次预览计划；尚未获准或在目标执行
 - 只监听 `127.0.0.1:55432`，数据库和非超级用户应用角色均为 `aifinance_preview`，使用全新的独立凭据和 SCRAM 认证；不允许 public/trust HBA 条目。应用角色不具有超级用户、创建角色/库或复制权限；不把管理连接串交给应用
 - 预览数据库必须实际安装并测试 `pg_trgm`；存在 control 文件只证明候选文件存在。建议首次小负载试验用 `shared_buffers=64MB`、`max_connections=16`，仍需验证连接池及迁移峰值
 - 新凭据只能在管理员受保护的本地流程里建立；不要发到聊天、仓库、Repository Secrets 或日志。环境文件只给需要它的 API 账号读取；web 不接收数据库或管理密钥
@@ -118,6 +130,7 @@ python3 -B deploy/native/prepare-native.py \
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/tests/prepare-native-check.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/tests/inspect-prerequisites-check.py
 ```
 
 测试覆盖非写入检查、所有输入通过仍拒绝 apply、检查先于制品验证、哈希/目录/URL/混合版本边界、固定子进程及干净环境、端口冲突、资源不足与状态未知。它们使用模拟进程/元数据和工作区临时文件，**不证明服务器兼容性、PG 安装成功、出站隔离或上线完成**。

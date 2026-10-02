@@ -37,6 +37,25 @@ class Inspect(unittest.TestCase):
         finally:
             os.umask(before)
 
+    def test_upload_before_ready_is_data_only_and_deployment_still_refused(self):
+        m = module('gateway_stage', 'ssh-gateway.py')
+        content = b'fixed-public-fixture'
+        sha, digest = 'a' * 40, hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            m.ROOT = Path(d); (m.ROOT / 'incoming').mkdir(); (m.ROOT / 'shared').mkdir()
+            before = os.umask(0o022)
+            try:
+                with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': 'upload ' + sha + ' ' + digest}, clear=True), patch.object(m.sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(content)})()), patch.object(m.os, 'execve') as execute, patch('sys.stdout', new_callable=io.StringIO):
+                    m.main()
+                    execute.assert_not_called()
+                    self.assertEqual((m.ROOT / 'incoming' / (sha + '.tar.gz')).read_bytes(), content)
+                for operation in ('deploy ' + sha + ' ' + digest, 'rollback ' + sha):
+                    with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': operation}, clear=True), patch.object(m.os, 'execve') as execute:
+                        with self.assertRaises(ValueError): m.main()
+                        execute.assert_not_called()
+            finally:
+                os.umask(before)
+
     def test_parsers_drop_urls_credentials_and_unapproved_fields(self):
         m = module('parse_inspect', 'inspect-native.py')
         secret = 'never-output-secret'
@@ -87,7 +106,7 @@ class Inspect(unittest.TestCase):
         seen = []
         def record(args, deadline, temp):
             if args[0] == '/usr/bin/dnf':
-                self.assertIn('--config=/dev/null', args)
+                self.assertNotIn('--config=/dev/null', args)
                 self.assertIn('--noplugins', args)
                 self.assertIn('--setopt=reposdir=/etc/yum.repos.d', args)
                 self.assertIn('--setopt=varsdir=/etc/dnf/vars,/etc/yum/vars', args)

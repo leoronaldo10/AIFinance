@@ -1,0 +1,41 @@
+# TEMPLATE ONLY: database initialization/unit start require separate approval.
+[Unit]
+Description=AIFinance isolated preview PostgreSQL 17
+After=network.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/pgsql-17/bin/postgres -D /var/lib/pgsql/aifinance-preview -c config_file=/etc/aifinance-preview-db/postgresql.conf
+# First-install failures must stop for inspection, never retry automatically.
+Restart=no
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=60
+RuntimeDirectory=aifinance-preview-db
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pgsql/aifinance-preview /run/aifinance-preview-db
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+# Target systemd 239 uses cgroup v1; verify the kernel limit after approval.
+MemoryAccounting=yes
+MemoryLimit=256M
+TasksMax=64
+CPUQuota=50%
+LimitNOFILE=4096
+# Do not journal credential-bearing statements, including unexpected PANIC output.
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

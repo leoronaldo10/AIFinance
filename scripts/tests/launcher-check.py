@@ -71,7 +71,7 @@ class LauncherTests(unittest.TestCase):
                 if value == '/opt/aifinance/state/current': return release
                 if value == '/opt/aifinance/releases': return root / 'releases'
                 return Path(value)
-            for role, heap in (('api', '128'), ('web', '128')):
+            for role, heap in (('api', '128'), ('web', '128'), ('migrate', '128'), ('seed-topics', '128')):
                 with patch.object(launcher, 'Path', side_effect=mapped), patch.object(sys, 'argv', ['run-preview.py', role]), \
                         patch.object(launcher.os, 'chdir') as chdir, patch.object(launcher.os, 'execve') as execute:
                     launcher.main()
@@ -81,7 +81,9 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual(env['AIHOT_RELEASE'], sha)
                     chdir.assert_called_once_with(release)
                     for key in ('DATABASE_URL', 'ADMIN_PASSWORD', 'SESSION_SECRET', 'IMG_PROXY_SIGN_SECRET'):
-                        self.assertEqual(key in env, role == 'api')
+                        self.assertEqual(key in env, role != 'web')
+                    if role == 'migrate': self.assertEqual(args[-1], 'scripts/migrate.ts')
+                    if role == 'seed-topics': self.assertEqual(args[-2:], ['scripts/seed.ts', '--topics-only'])
 
     def test_worker_role_is_never_launched(self):
         with patch.object(sys, 'argv', ['run-preview.py', 'worker']), patch.object(launcher.os, 'execve') as execute:

@@ -13,7 +13,7 @@ on:
         description: Build by default; verify only checks restricted SSH access
         type: choice
         default: build
-        options: [build, verify, inspect, deploy, rollback]
+        options: [build, verify, inspect, stage, deploy, rollback]
 permissions:
   contents: read
 concurrency:
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: inputs.operation == 'build' || inputs.operation == 'deploy'
+    if: inputs.operation == 'build' || inputs.operation == 'stage' || inputs.operation == 'deploy'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -41,7 +41,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Only reviewed release history may deploy
-        if: inputs.operation == 'deploy'
+        if: inputs.operation == 'stage' || inputs.operation == 'deploy'
         run: |
           [[ "$GITHUB_REF" = refs/heads/release/aifinance-preview ]] || exit 2
           git merge-base --is-ancestor "$REVISION" refs/remotes/origin/release/aifinance-preview
@@ -69,7 +69,7 @@ jobs:
     needs: [build]
     if: >-
       always() && github.ref == 'refs/heads/release/aifinance-preview' &&
-      (github.event_name == 'push' || (inputs.operation == 'deploy' && needs.build.result == 'success') ||
+      (github.event_name == 'push' || ((inputs.operation == 'stage' || inputs.operation == 'deploy') && needs.build.result == 'success') ||
       inputs.operation == 'verify' || inputs.operation == 'inspect' || inputs.operation == 'rollback')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -79,7 +79,7 @@ jobs:
     steps:
       # Fresh runner: never check out or run the requested revision with the SSH key available.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        if: inputs.operation == 'deploy'
+        if: inputs.operation == 'stage' || inputs.operation == 'deploy'
         with:
           name: aifinance-${{ inputs.revision }}
           path: ${{ runner.temp }}/release
@@ -93,7 +93,7 @@ jobs:
           SSH_KNOWN_HOSTS: ${{ secrets.AIFINANCE_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
+          [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$OPERATION" = stage || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
           [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
           [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
           [[ "$SSH_PORT" -gt 0 && "$SSH_PORT" -le 65535 && -n "$SSH_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || exit 2
@@ -107,11 +107,15 @@ jobs:
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" verify
           elif [[ "$OPERATION" = inspect ]]; then
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" inspect
-          elif [[ "$OPERATION" = deploy ]]; then
+          elif [[ "$OPERATION" = stage || "$OPERATION" = deploy ]]; then
             checksum=$(sha256sum "$RUNNER_TEMP/release/$REVISION.tar.gz" | cut -d ' ' -f1)
             [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || exit 2
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "upload $REVISION $checksum" < "$RUNNER_TEMP/release/$REVISION.tar.gz"
-            ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "deploy $REVISION $checksum"
+            if [[ "$OPERATION" = deploy ]]; then
+              ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "deploy $REVISION $checksum"
+            else
+              printf "STAGED_ONLY revision=%s sha256=%s\n" "$REVISION" "$checksum"
+            fi
           else
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "rollback $REVISION"
           fi

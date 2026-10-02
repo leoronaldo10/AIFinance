@@ -150,7 +150,7 @@ def parse_units(text):
         for field in ('LoadState', 'ActiveState', 'SubState', 'Result'):
             if re.fullmatch('[a-z-]{1,32}', values.get(field, '')):
                 row[field] = values[field]
-        for field in ('MemoryCurrent', 'MemoryMax'):
+        for field in ('MemoryCurrent', 'MemoryLimit', 'MemoryMax'):
             value = values.get(field, '')
             if re.fullmatch('[0-9]{1,20}|infinity', value): row[field] = value
         rows.append(row)
@@ -205,8 +205,9 @@ def inspect():
     except OSError: report['disk_bytes'] = {'status': 'unavailable'}
     report['deployment'] = deployment()
     with tempfile.TemporaryDirectory(prefix='aifinance-inspect-') as temp:
-        # Ignore global dnf.conf options that can redirect to a user-writable config tree.
-        dnf = ['/usr/bin/dnf', '-C', '--noplugins', '--config=/dev/null',
+        # /dev/null is not a regular config file and DNF rejects it. Preserve the
+        # root-owned vendor config checked above; keep this command cache-only.
+        dnf = ['/usr/bin/dnf', '-C', '--noplugins',
                '--setopt=reposdir=/etc/yum.repos.d',
                '--setopt=varsdir=/etc/dnf/vars,/etc/yum/vars',
                '--setopt=cachedir=/var/cache/dnf', '--setopt=persistdir=' + temp,
@@ -216,7 +217,7 @@ def inspect():
             'packages_unfiltered': (dnf + ['repoquery', '--available', '--disable-modular-filtering', '--qf',
                                          '%{name}|%{version}-%{release}|%{arch}|%{repoid}',
                                          'postgresql', 'postgresql-server', 'postgresql-contrib', 'postgresql-libs'], parse_packages),
-            'services': (['/usr/bin/systemctl', 'show'] + list(UNITS) + ['-p', 'Id', '-p', 'LoadState', '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result', '-p', 'MemoryCurrent', '-p', 'MemoryMax'], parse_units),
+            'services': (['/usr/bin/systemctl', 'show'] + list(UNITS) + ['-p', 'Id', '-p', 'LoadState', '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result', '-p', 'MemoryCurrent', '-p', 'MemoryLimit', '-p', 'MemoryMax'], parse_units),
         }
         for name, (args, parser) in commands.items():
             try:

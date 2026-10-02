@@ -44,8 +44,8 @@ def environment(text):
 
 def main():
     role = sys.argv[1] if len(sys.argv) == 2 else ""
-    if role not in ("api", "web"):
-        raise SystemExit("Only api and web roles are permitted")
+    if role not in ("api", "web", "migrate", "seed-topics"):
+        raise SystemExit("Only api, web and the two fixed first-setup roles are permitted")
     env = environment(Path("/etc/aifinance-preview.env").read_text())
     release = Path("/opt/aifinance/state/current").resolve(strict=True)
     sha = (release / "RELEASE_SHA").read_text().strip()
@@ -56,10 +56,12 @@ def main():
         for key in ("DATABASE_URL", "ADMIN_PASSWORD", "SESSION_SECRET", "IMG_PROXY_SIGN_SECRET"):
             del env[key]
     os.chdir(release)
-    entry = "apps/api/src/main.ts" if role == "api" else "apps/web/server.ts"
+    entry = {"api": "apps/api/src/main.ts", "web": "apps/web/server.ts",
+             "migrate": "scripts/migrate.ts", "seed-topics": "scripts/seed.ts"}[role]
+    extra = ["--topics-only"] if role == "seed-topics" else []
     # Leave room for native allocations inside the system-level MemoryLimit, including on cgroup v1.
     heap = "128"
-    os.execve(NODE, [NODE, "--max-old-space-size=" + heap, entry], env)
+    os.execve(NODE, [NODE, "--max-old-space-size=" + heap, entry] + extra, env)
 
 
 if __name__ == "__main__":
