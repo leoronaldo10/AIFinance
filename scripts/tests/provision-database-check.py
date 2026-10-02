@@ -228,7 +228,11 @@ class DatabaseProvisionTests(unittest.TestCase):
             self.assertTrue(pidfile.exists())
             status = Path('/proc') / pidfile.read_text() / 'status'
             for attempt in range(50):
-                if not status.exists() or 'State:\tZ' in status.read_text():
+                try:
+                    exited = 'State:\tZ' in status.read_text()
+                except FileNotFoundError:
+                    exited = True  # Kernel may reap the process between observations.
+                if exited:
                     break
                 time.sleep(0.01)
             else:
