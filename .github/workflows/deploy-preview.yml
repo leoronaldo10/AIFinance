@@ -1,0 +1,24 @@
+name: Prepare or deploy native preview
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full reviewed SHA (leave empty for verify/inspect)
+        required: false
+        type: string
+      operation:
+        description: Build by default; verify only checks restricted SSH access
+        type: choice
+        default: build
+        options: [build, verify, inspect, deploy, rollback]
+permissions: {}
+jobs:
+  select-release-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Select the reviewed release branch
+        run: |
+          printf '%s\n' 'Select release/aifinance-preview in the Run workflow branch selector.'
+          printf '%s\n' 'This main-branch workflow only registers the manual entry and performs no server operation.'
+          printf '%s\n' 'Use inspect only after the separately approved server update, and retain Environment approval.'
