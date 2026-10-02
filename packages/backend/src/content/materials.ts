@@ -28,6 +28,8 @@ export interface XPostData {
 
 export interface MaterialInput {
   sourceId: string;
+  /** Raw RSS collection must stay out of processing, including later repair sweeps. */
+  collectOnly?: boolean;
   url: string;
   title: string;
   identityKey?: string;
@@ -130,6 +132,12 @@ export async function upsertMaterial(m: MaterialInput, db: Db = sql): Promise<Ma
 }
 
 async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
+  // Source policy is authoritative: ordinary ingest/import callers cannot write to the RSS-only
+  // entrance, nor can a caller grant collect-only status to an unrelated source.
+  const [source] = await db<{ collect_only: boolean }[]>`SELECT collect_only FROM sources WHERE id=${m.sourceId} FOR SHARE`;
+  if ((source?.collect_only === true) !== (m.collectOnly === true)) {
+    throw new Error("Collect-only source requires the dedicated material entrance");
+  }
   const identityKey = identityKeyFor(m);
   const discoveredAt = m.discoveredAt ?? new Date();
   const title = collapseWhitespace(m.title).slice(0, 1000) || m.url;
@@ -140,12 +148,12 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
   const [inserted] = await db<{ id: string }[]>`
     INSERT INTO articles (id, source_id, identity_key, url, title, author, language, published_at, published_at_claim,
       discovered_at, source_updated_at, timeline_at, backfill, backfill_reason, revision, content_hash, excerpt,
-      body_text, body_html, body_status, media, x_post, raw)
+      body_text, body_html, body_status, media, x_post, raw, collect_only, processing_state)
     VALUES (${newId}, ${m.sourceId}, ${identityKey}, ${m.url}, ${title}, ${m.author ?? null}, ${m.language ?? null},
       ${t.publishedAt}, ${m.publishedAt ?? null}, ${discoveredAt}, ${m.sourceUpdatedAt ?? null}, ${t.timelineAt},
       ${t.backfill}, ${t.backfillReason}, 1, ${hash}, ${m.excerpt ?? null}, ${m.bodyText ?? null}, ${m.bodyHtml ?? null},
       ${m.bodyStatus ?? (m.bodyText ? "ok" : "pending")}, ${db.json((m.media ?? []) as never)},
-      ${m.xPost ? db.json(m.xPost as never) : null}, ${m.raw === undefined ? null : db.json(m.raw as never)})
+      ${m.xPost ? db.json(m.xPost as never) : null}, ${m.raw === undefined ? null : db.json(m.raw as never)}, ${m.collectOnly === true}, ${m.collectOnly ? "skipped" : "new"})
     ON CONFLICT (identity_key) DO NOTHING RETURNING id`;
   if (inserted) {
     await db`INSERT INTO article_revisions (article_id, revision, content_hash, title, body_text)
@@ -155,8 +163,8 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
     return { articleId: newId, created: true, revised: false, backfill: t.backfill };
   }
 
-  const [existing] = await db<{ id: string; source_id: string; revision: number; content_hash: string | null; backfill: boolean; title: string; body_text: string | null; excerpt: string | null }[]>`
-    SELECT id, source_id, revision, content_hash, backfill, title, body_text, excerpt FROM articles WHERE identity_key = ${identityKey} FOR UPDATE`;
+  const [existing] = await db<{ id: string; source_id: string; collect_only: boolean; revision: number; content_hash: string | null; backfill: boolean; title: string; body_text: string | null; excerpt: string | null }[]>`
+    SELECT id, source_id, collect_only, revision, content_hash, backfill, title, body_text, excerpt FROM articles WHERE identity_key = ${identityKey} FOR UPDATE`;
   await db`INSERT INTO article_discoveries (article_id, source_id, via, discovered_at)
            VALUES (${existing!.id}, ${m.sourceId}, ${m.via}, ${discoveredAt}) ON CONFLICT DO NOTHING`;
   const unchanged: MaterialResult = { articleId: existing!.id, created: false, revised: false, backfill: existing!.backfill };
@@ -164,6 +172,9 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
   // discovery only: its title and summary are its own rendering, and taking them made the article flip
   // between the two sources' versions on every fetch. Only the article's own source revises it.
   if (existing!.source_id !== m.sourceId) return unchanged;
+  if (existing!.collect_only !== (m.collectOnly === true)) return unchanged;
+  if (m.collectOnly) await db`UPDATE articles SET collect_only=true, processing_state='skipped',
+    processing_queued_at=NULL, processing_retry_at=NULL WHERE id=${existing!.id}`;
   // What the row will hold after this report: a listing without body keeps the stored (extracted) body.
   const bodyText = m.bodyText ?? existing!.body_text;
   const excerpt = m.excerpt ?? existing!.excerpt;
@@ -196,7 +207,7 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
       body_status = CASE WHEN ${m.bodyText ?? null}::text IS NULL THEN body_status ELSE ${m.bodyStatus ?? "ok"} END,
       media = CASE WHEN ${m.media ? db.json(m.media as never) : null}::jsonb IS NULL THEN media ELSE ${m.media ? db.json(m.media as never) : null}::jsonb END,
       x_post = coalesce(${m.xPost ? db.json(m.xPost as never) : null}, x_post),
-      revision = revision + 1, content_hash = ${next}, processing_state = 'new', updated_at = now()
+      revision = revision + 1, content_hash = ${next}, processing_state = CASE WHEN collect_only THEN 'skipped' ELSE 'new' END, updated_at = now()
     WHERE id = ${existing!.id}
     RETURNING revision`;
   await db`INSERT INTO article_revisions (article_id, revision, content_hash, title, body_text)

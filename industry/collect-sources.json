@@ -1,0 +1,7 @@
+{
+  "sources": [
+    { "id": "collect-dynamics-finance", "name": "Microsoft Dynamics 365 Finance", "kind": "rss", "config": { "feedUrl": "https://www.microsoft.com/en-us/dynamics-365/blog/product/dynamics-365-finance/feed/" }, "enabled": false, "participation_mode": "isolated" },
+    { "id": "collect-journal-accountancy", "name": "Journal of Accountancy", "kind": "rss", "config": { "feedUrl": "https://www.journalofaccountancy.com/news/feed/" }, "enabled": false, "participation_mode": "isolated" },
+    { "id": "collect-accounting-today", "name": "Accounting Today", "kind": "rss", "config": { "feedUrl": "https://www.accountingtoday.com/feed?rss=true" }, "enabled": false, "participation_mode": "isolated" }
+  ]
+}

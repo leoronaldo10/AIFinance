@@ -1,3 +1,4 @@
+import { RawRssText } from "../../features/admin/raw-rss-text";
 import { SITE } from "@aihot/industry/site";
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
@@ -74,6 +75,17 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
     });
     setDialog("override");
   };
+
+  if (a.collect_only) return (
+    <AdminPage title={a.title} subtitle="原始候选 · 尚未经过 AI 筛选">
+      <Card title="公开 RSS 自带文本">
+        <p>{a.source_name}</p>
+        <a href={/^https?:\/\//i.test(a.url) ? a.url : undefined} target="_blank" rel="noreferrer" className="break-all text-accent">{a.url}</a>
+        <p className="mt-3 text-ink-3">原文时间 {a.published_at ? bj(a.published_at, true) : "未提供可信时间"} · 采集时间 {bj(a.discovered_at, true)} · 修订 {a.revision}</p>
+        <RawRssText excerpt={a.excerpt} body={a.body_text} chars={a.body_chars} title={a.title} />
+      </Card>
+    </AdminPage>
+  );
 
   return (
     <AdminPage

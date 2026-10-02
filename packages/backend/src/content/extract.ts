@@ -106,7 +106,7 @@ export function pageFetchable(url: string, sourceKind: string): boolean {
 /** Fetches and stores the body of one article. Unconfirmed bodies are recorded as such. */
 export async function extractArticleBody(articleId: string, allowJina = process.env.JINA_BODY_FALLBACK !== "false"): Promise<"ok" | "unconfirmed" | "skipped"> {
   const [a] = await sql<{ id: string; url: string; body_status: string; revision: number; x_post: { tweetId?: string } | null }[]>`
-    SELECT id, url, body_status, revision, x_post FROM articles WHERE id = ${articleId}`;
+    SELECT id, url, body_status, revision, x_post FROM articles WHERE id = ${articleId} AND NOT collect_only`;
   if (!a || a.body_status === "ok") return "skipped";
   if (a.x_post?.tweetId) return extractXArticle(a.id, a.x_post.tweetId);
   const got = await extractFromUrl(a.url, { allowJina, subject: `article:${a.id}` });
