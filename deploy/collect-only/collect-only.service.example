@@ -21,10 +21,15 @@ Environment=FEISHU_CONTENT_PUSH_ENABLED=false
 Environment=INDEXNOW_SUBMIT_ENABLED=false
 ExecStart=/REPLACE_WITH_NODE24_PATH scripts/collect-only.ts --run
 TimeoutStartSec=120
-MemoryMax=256M
+# Target systemd 239 / cgroup v1: verify the running kernel limit before RSS access.
+MemoryAccounting=yes
+MemoryLimit=256M
 TasksMax=32
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
 PrivateTmp=true
 UMask=0077

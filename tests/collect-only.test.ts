@@ -59,6 +59,29 @@ async function counts() {
   return Object.fromEntries(await Promise.all(tables.map(async name => [name, Number((await sql.unsafe(`SELECT count(*) AS n FROM ${name}`))[0]!.n)])));
 }
 
+test('acceptance command is read-only and refuses apply', async () => {
+  await getBoss();
+  const before = await counts();
+  const result = await promisify(execFile)(process.execPath, ['scripts/collect-only-check.ts'], { env: process.env });
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.checkOnly, true);
+  assert.equal(report.readyForApply, false);
+  assert.ok(report.migrations.includes('0041_collect_only.sql'));
+  assert.equal(report.columns.length, 2);
+  assert.equal(report.constraints[0].convalidated, true);
+  assert.deepEqual(report.counts, before);
+  await assert.rejects(promisify(execFile)(process.execPath, ['scripts/collect-only-check.ts', '--apply'], { env: process.env }));
+  await assert.rejects(promisify(execFile)(process.execPath, ['scripts/collect-only-check.ts'], {
+    env: { ...process.env, DATABASE_URL: 'postgres://fixture-user:fixture-secret@127.0.0.1:bad/fixture' },
+  }), (error: unknown) => {
+    const output = error as { stderr: string; stdout: string };
+    assert.match(output.stderr, /Collect-only check failed/);
+    assert.doesNotMatch(output.stderr + output.stdout, /fixture-secret|fixture-user|postgres:\/\//);
+    return true;
+  });
+  assert.deepEqual(await counts(), before);
+});
+
 test('real RSS → PG, three across entire batch, short text retained, duplicates/revisions, zero downstream writes', async () => {
   await getBoss(); // Creates queue tables only; never starts a worker.
   for (const [i, id] of ids.entries()) await seed(id, `/rss${i}`);
