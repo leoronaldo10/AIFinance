@@ -30,7 +30,7 @@
 
 ## 当前运行边界
 
-云环境已安装 Node.js 24、依赖及 PostgreSQL 17，API、worker 和网站可在云端运行。开发时关闭 `COLLECT_ENABLED`、`MODEL_CALLS_ENABLED`、`FEISHU_*_ENABLED`、`INDEXNOW_SUBMIT_ENABLED`。环境中的凭据、数据库、浏览器样稿截图和辅助脚本不提交仓库。
+运行环境需要 Node.js 24 和 PostgreSQL 17；是否已安装、可用须在目标环境核实。隔离预览使用独立 Compose、禁止 worker 和运行期外联，见 [部署说明](deploy.md)。开发时关闭 `COLLECT_ENABLED`、`MODEL_CALLS_ENABLED`、`FEISHU_*_ENABLED`、`INDEXNOW_SUBMIT_ENABLED`。环境中的凭据、数据库、浏览器样稿截图和辅助脚本不提交仓库。
 
 `industry/sources.json` 的旧示范源默认关闭；这不会自动关闭已有数据库中启用的信源，升级后需在后台检查。尚未启用真实采集和模型服务，也未把演示材料当作真实新闻发布。模型提示词已支持财务解读，启用前仍需验证输出质量。
 
@@ -40,6 +40,7 @@
 
 ```bash
 npm run typecheck
+npm run test:preview
 # 使用独立空库；名称必须以 _test 或 _ci 结尾。
 DATABASE_URL=postgres://127.0.0.1:5432/aifinance_ci node scripts/migrate.ts
 DATABASE_URL=postgres://127.0.0.1:5432/aifinance_ci MODEL_CALLS_ENABLED=true npm test

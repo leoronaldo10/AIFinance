@@ -66,6 +66,12 @@ async function serveStatic(pathname: string, res: import("node:http").ServerResp
 
 // One bad request must never take the process down: answer it and keep serving.
 const server = createServer((req, res) => {
+  if (process.env.PREVIEW_MODE === "true") {
+    // Preview pages must not load remote images, embeds or scripts in the visitor's browser.
+    res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    res.setHeader("Referrer-Policy", "no-referrer");
+  }
   handle(req, res).catch((error: unknown) => {
     const bad = error instanceof BadRequest || error instanceof URIError;
     if (!bad) console.error(JSON.stringify({ level: "error", msg: "web request failed", path: (req.url ?? "").split("?")[0]!.slice(0, 200), error: String(error).slice(0, 500) }));

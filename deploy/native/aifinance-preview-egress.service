@@ -1,0 +1,37 @@
+# TEMPLATE ONLY: a FOURTH auxiliary unit beside DB/API/web; separate root approval.
+[Unit]
+Description=AIFinance preview UID-only egress guard
+After=network.target firewalld.service
+Before=aifinance-preview-api.service aifinance-preview-web.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+RemainAfterExit=yes
+RuntimeDirectory=aifinance-preview-egress
+RuntimeDirectoryMode=0700
+# Preserve ownership receipt even when stop/apply fails; /run is cleared at boot.
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py start
+ExecStop=/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py stop
+TimeoutStartSec=40
+TimeoutStopSec=40
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/aifinance-preview-egress
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+MemoryAccounting=yes
+MemoryLimit=64M
+TasksMax=16
+CPUQuota=10%
+LimitNOFILE=64
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

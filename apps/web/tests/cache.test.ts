@@ -48,7 +48,7 @@ before(async () => {
   api.listen(0, "127.0.0.1");
   await once(api, "listening");
   web = spawn(process.execPath, [fileURLToPath(new URL("../server.ts", import.meta.url))], {
-    env: { ...process.env, WEB_PORT: "0", TRUST_PROXY: "false", API_BASE_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}` },
+    env: { ...process.env, PREVIEW_MODE: "true", WEB_PORT: "0", TRUST_PROXY: "false", API_BASE_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}` },
     stdio: ["ignore", "pipe", "pipe"],
   });
   await new Promise<void>((resolve, reject) => {
@@ -219,4 +219,14 @@ test("browser caching preserves noindex and private sign-in responses", async ()
 test("a visitor cannot name its own address to the api without a trusted proxy in front", async () => {
   const res = await fetch(`${origin}/api/site/echo-client`, { headers: { "X-Forwarded-For": "6.6.6.6", "X-Real-IP": "6.6.6.6" } });
   assert.deepEqual(await res.json(), { forwarded: "127.0.0.1", real: "127.0.0.1" });
+});
+
+test("isolated preview prevents browser subresource egress and search indexing", async () => {
+  const response = await fetch(`${origin}/`);
+  const csp = response.headers.get("content-security-policy")!;
+  assert.match(csp, /connect-src 'self'/);
+  assert.match(csp, /img-src 'self' data: blob:/);
+  assert.match(csp, /frame-src 'none'/);
+  assert.equal(response.headers.get("x-robots-tag"), "noindex, nofollow");
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer");
 });

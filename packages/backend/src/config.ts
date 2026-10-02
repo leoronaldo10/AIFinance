@@ -34,7 +34,10 @@ function bool(name: string, fallback: boolean): boolean {
 }
 
 
+const previewMode = bool("PREVIEW_MODE", false);
+
 export const config = {
+  previewMode,
   // Legacy engine fixtures test automatic projection; deployments always follow the industry review policy.
   get editorialReviewRequired() { return FEATURES.editorialReview && !(env.NODE_ENV === "test" && env.EDITORIAL_AUTOMATIC_FIXTURES === "true"); },
   databaseUrl: str("DATABASE_URL", "postgres://127.0.0.1:5432/aihot"),
@@ -46,8 +49,8 @@ export const config = {
   selectedVisibleAfterSeconds: int("SELECTED_VISIBLE_AFTER_SECONDS", 180),
   egressProxyUrl: env.EGRESS_PROXY_URL || null,
   allowPrivateNetworkFetch: bool("ALLOW_PRIVATE_NETWORK_FETCH", false),
-  feishuContentPushEnabled: bool("FEISHU_CONTENT_PUSH_ENABLED", false),
-  indexNowSubmitEnabled: bool("INDEXNOW_SUBMIT_ENABLED", false),
+  feishuContentPushEnabled: !previewMode && bool("FEISHU_CONTENT_PUSH_ENABLED", false),
+  indexNowSubmitEnabled: !previewMode && bool("INDEXNOW_SUBMIT_ENABLED", false),
   /** IndexNow key (32 hex characters); without one nothing is submitted and no key file is served. */
   indexNowKey: /^[0-9a-f]{32}$/.test(env.INDEXNOW_KEY ?? "") ? env.INDEXNOW_KEY! : null,
   imgProxyRequireSig: bool("IMG_PROXY_REQUIRE_SIG", true),
@@ -57,7 +60,7 @@ export const config = {
   // Name of this deployment in alerts ("production" sends them without a prefix).
   environmentName: str("AIHOT_ENVIRONMENT", isProduction ? "production" : "development"),
   // Model calls are live unless explicitly disabled (tests, replays).
-  modelCallsEnabled: bool("MODEL_CALLS_ENABLED", true),
+  modelCallsEnabled: !previewMode && bool("MODEL_CALLS_ENABLED", true),
   devAdmin: env.DEV_AUTH_ROLE === "admin" ? { displayName: env.DEV_AUTH_DISPLAY_NAME || "Dev Admin" } : null,
   /** The admin password (at least 12 characters). Feishu sign-in below is optional. */
   adminPassword: env.ADMIN_PASSWORD || null,

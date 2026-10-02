@@ -107,18 +107,9 @@
 
 ## 跑起来
 
-需要 [Docker](https://docs.docker.com/get-docker/)，和一个 OpenAI 兼容的模型 API Key（DeepSeek、千问、智谱都可以）。
+财务版位于本仓库 PR #1 的 `feat/finance-editorial-workflow`。首次体验请使用[隔离预览流程](docs/deploy.md#隔离预览2-核--2-gib-机器优先使用)：云端构建、独立数据库、关闭外联、不启动 worker，手动导入与审核演示材料。
 
-```bash
-git clone https://github.com/KKKKhazix/AIHOT.git myhot
-cd myhot
-node scripts/init-env.ts --llm-key <你的模型 API Key>
-docker compose up -d --build
-```
-
-打开 <http://localhost:3000>。后台在 `/admin`，管理员密码在 `.env` 的 `ADMIN_PASSWORD` 里。一两分钟后开始有内容，第一次导入的资料大约半小时处理完。
-
-机器上没有 Node、服务器在中国大陆、要配域名和 HTTPS，见 [部署](docs/deploy.md)。
+不要直接按上游 AIHOT 的快速启动方式配置模型 Key 并启动所有服务。正式生产、HTTPS、2 GiB 机器的运行限制和旧站迁移影响均见[部署说明](docs/deploy.md)。
 
 ## 把它改成你的行业
 

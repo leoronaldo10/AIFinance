@@ -1,19 +1,69 @@
 # 部署
 
-## 用 Docker（推荐）
+本仓库是 `leoronaldo10/AIFinance`。财务编辑功能目前位于 PR #1 的 `feat/finance-editorial-workflow`；不要克隆上游 AIHOT，也不要把 main 当作已包含本 PR。上线前核对实际提交、CI 和审阅结果。
+
+没有 Docker 的 Alibaba Cloud Linux ECS 可先审阅[原生预览与 GitHub Actions 准备方案](native-deploy.md)；它需要独立的 systemd 网络隔离验收，不可直接套用下面的 Docker 保证。
+
+## 隔离预览（2 核 / 2 GiB 机器优先使用）
+
+预览用于手动导入演示材料、编辑、审核和出稿，不启用真实采集、模型或通知。它使用独立数据库和卷，不连接旧站数据。**此流程不是正式生产部署。**
+
+在内存充足的云端构建机上获取已审阅代码（构建仍需要访问镜像与 npm 仓库）：
+
+```bash
+git clone --branch feat/finance-editorial-workflow https://github.com/leoronaldo10/AIFinance.git aifinance
+cd aifinance
+git rev-parse HEAD  # 必须与本次审阅通过的提交一致；后续分支更新需重新验证
+npm ci
+npm run typecheck
+npm run test:preview
+npm run build -w @aihot/web
+node --test apps/web/tests/*.test.ts
+docker build -t aifinance-preview:local .
+```
+
+生产镜像验证还需要独立 PostgreSQL 上的后端测试和迁移/冒烟，见 [finance-editorial.md](finance-editorial.md)。通过后把镜像传到目标机器，使用明确版本标签或 digest 设置 `PREVIEW_IMAGE`；不要在 2 GiB ECS 上默认执行镜像构建。镜像传输、拉取和构建不属于运行期断网保证。
+
+在预览目录生成独立凭据，不需要模型 Key：
+
+```bash
+node scripts/init-env.ts --preview
+# 编辑 .env.preview：PREVIEW_IMAGE 改为刚验证的镜像，SITE_URL 改为实际预览入口。
+docker compose --env-file .env.preview -f docker-compose.preview.yml config --quiet
+docker compose --env-file .env.preview -f docker-compose.preview.yml up -d --no-build
+```
+
+不要与 `docker-compose.yml` 叠加使用；也不要去掉 `--env-file .env.preview`。此配置只有 db、setup、api、web；setup 仅迁移独立预览库和初始化主题，不导入示范源。所有应用变量采用白名单，不加载生产 `.env`、模型 Key、飞书、采集服务或对象存储凭据。
+
+安全边界：
+
+- 运行容器只加入 Docker `internal` 网络，应用没有外网路由；没有 worker。`PREVIEW_MODE=true` 额外禁止 worker 启动、模型/推送/IndexNow，以及统一 HTTP 抓取入口（含信源试抓和图片代理）。不要接入其他网络、代理或挂载生产凭据。内部网络不是针对容器逃逸或宿主机服务的沙箱，仍保留原 SSRF 防护。
+- 浏览器响应增加 CSP，禁止外站图片、脚本、嵌入和连接；设置 noindex。读者主动点击原文仍会离开本站。后台试抓在预览中失败是预期行为，外部图片不可用；使用文字演示材料和本地资源。
+- 只发布 `127.0.0.1:3100`，数据库和 API 不映射宿主机端口。手机查看需由宿主机现有 HTTPS 反向代理转发到此地址；TLS 终止放在隔离网络外。域名、证书及现存端口需先核实，不能直接开放 HTTP 管理员登录。
+- 配置使用生产模式与管理员密码，禁止开发免登录。不要共享管理员密码。默认不信任转发 IP（限流按代理地址聚合）；noindex 不等于访问控制，若预览需私密，须在反向代理另设访问认证。
+- db / api / web 内存上限分别为 384 / 384 / 512 MiB；setup 上限 384 MiB，完成后才启动应用。这只是小规模预览的初始限制，不是 2 GiB 容量保证；必须验证实际内存、磁盘和并发，给 OS 与反向代理留余量。
+
+首次启动后核查 `docker compose ... ps` 只有上述服务；跑健康检查、管理员登录、导入→审核→公开→撤回与手机页面验收。还应验证容器出站请求失败。未通过这些运行期检查不能认定安全预览已可用。停止时仍使用同一 `--env-file` 和 `-f`；`down` 保留数据，`down -v` 删除预览数据，不要误用于生产项目。
+
+## 旧站升级的额外门槛
+
+0039 会撤下全部已有公开文章并移除精选；0040 与 seed 更新当前主题。回填审核队列在 SQL 迁移提交后逐篇进行，须用数据副本演练耗时和失败恢复。备份并验证可恢复后再安排维护窗口，停止旧 worker，核查已有启用信源与积压任务。`sources.json` 的 disabled 不会覆盖数据库状态。旧内容需重新审核；只回滚应用镜像不会恢复旧公开状态。不要把已有生产数据库直接用于预览。
+
+## 正式生产部署（确认采集、预算和内容策略后）
 
 需要一台装了 Docker（带 Compose）的机器。云服务器建议至少 2 核、4 GB 内存，构建镜像时要用到。
 
 ```bash
-git clone https://github.com/KKKKhazix/AIHOT.git myhot
-cd myhot
+git clone --branch feat/finance-editorial-workflow https://github.com/leoronaldo10/AIFinance.git aifinance
+cd aifinance
+git rev-parse HEAD  # 核对已审阅提交
 node scripts/init-env.ts --llm-key <你的模型 API Key>
 docker compose up -d --build
 ```
 
 `init-env.ts` 会生成 `.env`，填好随机密钥和管理员密码，并把密码打印一次。机器上没有 Node 的话，把 `.env.example` 复制成 `.env`，自己填 `ADMIN_PASSWORD`（至少 12 位）、`SESSION_SECRET`、`IMG_PROXY_SIGN_SECRET`、`POSTGRES_PASSWORD`（各用 `openssl rand -hex 32` 生成）和 `LLM_API_KEY`。
 
-启动后打开 `http://服务器地址:3000`，后台在 `/admin`，用管理员密码登录。第一次启动会导入示范信源，一两分钟后开始出现内容；第一次导入的一百多条资料大约半小时处理完（每条都要预筛、评分，入选的还要写标题摘要）。
+默认 Compose 包含 worker；`.env.example` 的采集和模型开关默认开启。仅在明确启用自动化时使用，先配置预算和核实信源。财务版示范源默认关闭，内容必须审核后才公开，不会启动后自动出新闻。管理员登录前必须先配置下面的 HTTPS；不要经公网 HTTP 传输密码。
 
 `docker compose` 会起五个容器：`db`（PostgreSQL 17）、`setup`（每次启动先跑数据库迁移和种子数据，然后退出）、`api`、`worker`（抓取、模型处理、定时任务）、`web`（网页）。
 
@@ -50,7 +100,7 @@ git pull
 docker compose up -d --build
 ```
 
-数据库迁移只做向后兼容的增量，更新时自动执行。
+更新会自动执行迁移。0039 存在上文所述内容可见性变化，不可按无影响更新处理；每次更新均核对新提交与迁移。
 
 ### 备份
 
