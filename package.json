@@ -16,7 +16,7 @@
     "dev:worker": "npm run dev -w @aihot/worker",
     "dev:web": "npm run dev -w @aihot/web",
     "typecheck": "tsc -p packages/contracts && tsc -p packages/backend && tsc -p apps/api && tsc -p apps/worker && tsc -p tests && npm run typecheck -w @aihot/web",
-    "test:deploy": "node --test scripts/tests/deploy.test.ts scripts/tests/access.test.ts",
+    "test:deploy": "node --test scripts/tests/deploy.test.ts scripts/tests/access.test.ts && python3 -B scripts/tests/test_release_extraction.py && python3 -B scripts/tests/launcher-check.py && python3 -B scripts/tests/prepare-native-check.py && python3 -B scripts/tests/first-install-check.py && bash -n deploy/native/release.sh deploy/native/package.sh deploy/native/inspect-prerequisites.sh",
     "test:preview": "node --test scripts/tests/preview.test.ts",
     "test": "node --test --test-concurrency=1 --test-timeout=120000 \"tests/*.test.ts\""
   },

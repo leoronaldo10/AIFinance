@@ -1,6 +1,6 @@
 # 原生预览：SSH 排查与 GitHub Actions 发布准备
 
-这是可审阅的方案与模板，不是已配置、已部署的服务。保留 `docker-compose.preview.yml`；没有 Docker 的 ECS 使用另一套 systemd 预览方案，**不能将 Docker internal 网络保证套到 systemd 上**。两种方式不要共用数据库或数据目录。本流程不依赖用户电脑开机，构建在 GitHub Actions，服务由 ECS systemd 运行；云端诊断会话不是持久运维通道。
+这是可审阅的方案与模板，不是已配置、已部署的服务。[首次原生准备检查](native-prepare.md) 明确区分本地测试与目标机验收；依赖安装与数据库创建不在发布脚本中；[首次安装阶段](native-first-install.md) 仅实现另行审批的独立 Node 安装，PG/数据库/首次启动仍需目标数据与明确审批。保留 `docker-compose.preview.yml`；没有 Docker 的 ECS 使用另一套 systemd 预览方案，**不能将 Docker internal 网络保证套到 systemd 上**。两种方式不要共用数据库或数据目录。本流程不依赖用户电脑开机，构建在 GitHub Actions，服务由 ECS systemd 运行；云端诊断会话不是持久运维通道。
 
 ## 当前事实与上线前阻碍
 
@@ -10,9 +10,9 @@
 
 - 出站 SSH 可达性、账号、主机指纹、凭据交付及服务器安全组。不得默认固定云端出口 IP，不得承诺会话保存密钥。不要通过开放全部来源或关闭主机指纹校验解决连通性。
 - 独立 `aifinance-deploy` 与运行账号 `aifinance`、路径权限和最小 sudo 权限。不能直接使用 root SSH 或依赖 `/root/.local/bin`。这些模板不创建账号、不写 authorized_keys、不改 sudoers。
-- `/usr/local/bin/node` 可被服务账号执行，版本为 Node 24.11+ 的 24.x；系统 Python 3.6.8+、curl、flock、tar 可用（接入阶段不需 Node/PostgreSQL）。不要替换现有机器的默认 Node 或机器人的运行环境。
-- 独立的本地 PostgreSQL 与 `aifinance_preview` 数据库、独立数据库角色和新凭据；不复用生产数据库和凭据。现存数据与备份/恢复流程尚未确认。
-- HTTPS 域名与宿主机反向代理。服务仅占用 loopback 3100/3101，先确认端口空闲；不占用 8000，不重启 Nginx/机器人/其他服务。
+- `/opt/aifinance/runtime/node/bin/node` 可被服务账号执行，版本为 Node 24.11+ 的 24.x；系统 Python 3.6.8+、curl、flock、tar 可用（接入阶段不需 Node/PostgreSQL）。不要替换现有机器的默认 Node 或机器人的运行环境。
+- 独立的本地 PostgreSQL 16/17 实例，仅监听 `127.0.0.1:55432`；数据库与登录角色均为 `aifinance_preview`，使用独立新凭据，拒绝覆盖连接目标的 URL 参数；不复用生产数据库和凭据。现存数据与备份/恢复流程尚未确认。
+- 服务仅占用 loopback 3100/3101，先确认端口空闲；不占用 8000，不重启 Nginx/机器人/其他服务。仅本人预览可把 `SITE_URL` 设为精确的 `http://127.0.0.1:3100` 或 `http://localhost:3100`，但仍须另行审批安全的私人访问通道。当前受限部署 SSH 身份禁止转发，不能擅自扩大。共享访问需要 HTTPS；不允许将 HTTP 管理登录发布到公网。
 - 核实 systemd 的 `IPAddressDeny=any` / `IPAddressAllow=localhost` 在此内核与 cgroup/BPF 上真正生效；不支持时必须停止，不得仅看 unit 解析成功就认定隔离。限制允许 loopback，不能隔离宿主机其他服务；应用仍保留 SSRF 防护，配置仅允许专用 loopback DB。原生模板不等价于完全沙箱。
 - 云端构建 runner 与 Alibaba Cloud Linux 的 glibc/libstdc++ 可能不同。打包包括生产依赖及原生模块，不能假设二进制兼容。切换前脚本只检查 Node；不以部署账号执行上传的 JavaScript。原生模块在受限应用服务启动时加载，失败由健康检查触发回滚，仍需目标机启动验收。若失败，另建匹配目标系统的可信构建环境，不在 2GB ECS 上临时编译或盲目升级系统库。
 
@@ -29,10 +29,11 @@ GitHub Actions 接入必须在受限的 `aifinance-preview` Environment 内配�
 ## 文件与发布行为
 
 - `deploy/native/package.sh`：只打包指定的干净提交、构建产物和生产依赖，输出提交 SHA、迁移文件指纹、tar.gz 与 SHA256。拒绝未提交修改；不会把未追踪 `.env` 或 `.data` 打包。
-- `deploy/native/run-preview.py`：白名单读取 `/etc/aifinance-preview.env`，丢弃继承环境，强制生产模式、安全预览和关闭外联开关。web 不接收数据库和管理密钥。不会启动 worker。
-- 两个 `aifinance-preview-*.service`：仅 API/web；运行账号隔离、只读系统和专用数据写目录，内存上限 384/512 MiB。PostgreSQL 与 OS 另需资源预算；swap 不等于内存容量验证。
-- `deploy/native/release.sh`：以部署账号运行，目录锁防并发，校验包与安全解包，核对数据库指纹和 Node 版本，原子切换 current，只重启两个固定服务。API 健康响应必须包含目标 SHA，web 首页必须可访问。
-- 新版本不健康时恢复旧链接并再次检查；回滚也失败会非零退出并明确提示人工处理。首次部署没有旧版时不会假称已回滚。没有自动删除旧版本、数据库迁移、数据库恢复、服务安装或重启其他服务。
+- `deploy/native/run-preview.py`：白名单读取 `/etc/aifinance-preview.env`，丢弃继承环境，强制生产模式、安全预览和关闭外联开关。web 不接收数据库和管理密钥。独立 Node 的 API/web JS 堆预算为 128/128 MiB，不会启动 worker。
+- 两个 `aifinance-preview-*.service`：仅 API/web；运行账号隔离、只读系统和专用数据写目录，系统级 `MemoryLimit=320M/256M` 兼容 systemd 239 的 cgroup v1，另设任务数与 CPU 上限。PG 暂按 256 MiB 留预算，三者共 832 MiB；这些是待实测的低负载试运行上限，不能证明现有 2 GiB 主机容量足够。必须测实际限制、峰值与旧服务影响；swap 不等于内存容量验证。
+- `deploy/native/release.sh`：以部署账号运行，目录锁防并发，校验包与安全解包，核对数据库指纹和 Node 版本，原子切换 current，只重启两个固定服务。API 健康响应必须包含明确请求的目标 SHA，web 首页必须可访问。锁内如发现残留 `.current-next` 则保留证据并拒绝；只清理本次创建的临时链接，不跟随目录链接。
+- `deploy/native/extract-release.py`：与 release 脚本一起安装为管理员持有的可信 helper，不能从上传包中执行。完整验证路径和软链接后才写入；目录固定 0755，普通文件 0644，仅原有可执行文件为 0755，不继承归属、特殊权限、硬链接或设备。完成前 staging 保持 0700，完成后根目录改为 0755，避免运行账号无法遍历。提取进程先设置 128 MiB 地址空间、30/35 秒 CPU、2 GiB 单文件限制，PAX/GNU 扩展头在解析前限制每项 64 KiB/合计 16 MiB；不支持限制时拒绝。必须补做真实跨 UID 读取验收。
+- 新版本不健康时恢复旧链接并再次检查；回滚也失败会非零退出并明确提示人工处理。首次部署没有旧版时不会假称已回滚。当前重启专用 sudo 不包含 stop；首次验收失败必须由已授权的管理员仅停止新建的预览服务，保留数据库和证据，不擅自扩大部署账号权限。没有自动删除旧版本、数据库迁移、数据库恢复、服务安装或重启其他服务。
 
 工作目录预期（需先审批并由管理员配置）：
 

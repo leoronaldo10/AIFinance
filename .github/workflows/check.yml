@@ -46,6 +46,10 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Preview safety regression
         run: npm run test:preview && npm run test:deploy
+      - name: Release readable by a different runtime UID
+        # Root is used only to create/drop identities in disposable /tmp test fixtures.
+        # This job has no SSH credentials and never connects to the deployment host.
+        run: sudo python3 -B scripts/tests/test_release_extraction.py --require-cross-uid
       - name: Typecheck
         run: npm run typecheck
       - name: Build web
@@ -116,4 +120,4 @@ jobs:
         run: >-
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges
           -v "$PWD:/repo:ro" -w /repo python:3.6.8-stretch
-          sh -c 'python -B scripts/tests/python36-check.py && python -B scripts/tests/inspect-check.py'
+          sh -c 'python -B scripts/tests/python36-check.py && python -B scripts/tests/inspect-check.py && python -B scripts/tests/test_release_extraction.py && python -B scripts/tests/launcher-check.py && python -B scripts/tests/prepare-native-check.py && python -B scripts/tests/first-install-check.py'

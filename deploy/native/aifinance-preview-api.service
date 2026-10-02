@@ -7,7 +7,7 @@ After=network.target
 Type=simple
 User=aifinance
 Group=aifinance
-ExecStart=/usr/bin/python3 /opt/aifinance/bin/run-preview.py api
+ExecStart=/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py api
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -18,7 +18,12 @@ ReadWritePaths=/opt/aifinance/shared/data
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
 IPAddressAllow=localhost
-MemoryMax=384M
+# MemoryLimit is supported by systemd 239 on the target's cgroup v1 hierarchy.
+MemoryAccounting=yes
+MemoryLimit=320M
+TasksMax=64
+CPUQuota=50%
+LimitNOFILE=4096
 UMask=0077
 
 [Install]

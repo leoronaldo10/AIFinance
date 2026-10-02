@@ -18,7 +18,7 @@ ROOT = Path('/opt/aifinance')
 HOME = Path('/var/lib/aifinance-deploy')
 SUDO = Path('/etc/sudoers.d/aifinance-preview')
 SUDO_RULE = 'aifinance-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart aifinance-preview-api.service aifinance-preview-web.service\n'
-SCRIPTS = ('ssh-gateway.py', 'release.sh', 'run-preview.py')
+SCRIPTS = ('ssh-gateway.py', 'release.sh', 'extract-release.py', 'run-preview.py')
 # Exact reviewed locale names; LC_* is the sole legacy pattern we already supported.
 # No generic glob matching: it could admit loader/shell/interpreter controls.
 ACCEPT_ENV = frozenset(('LANG', 'LANGUAGE', 'XMODIFIERS', 'LC_*', 'LC_CTYPE',

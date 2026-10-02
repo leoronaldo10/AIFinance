@@ -138,7 +138,7 @@ class AccessCompatibility(unittest.TestCase):
 
     def test_launcher_environment_and_exec_boundary(self):
         app = module('launcher36', 'run-preview.py')
-        text = 'DATABASE_URL=postgres://preview:local@127.0.0.1:5432/aifinance_preview\nSITE_URL=https://preview.example.com\nADMIN_PASSWORD=' + 'a' * 16 + '\nSESSION_SECRET=' + 'b' * 32 + '\nIMG_PROXY_SIGN_SECRET=' + 'c' * 32
+        text = 'DATABASE_URL=postgres://aifinance_preview:local@127.0.0.1:55432/aifinance_preview\nSITE_URL=https://preview.example.com\nADMIN_PASSWORD=' + 'a' * 16 + '\nSESSION_SECRET=' + 'b' * 32 + '\nIMG_PROXY_SIGN_SECRET=' + 'c' * 32
         self.assertEqual(app.environment(text)['MODEL_CALLS_ENABLED'], 'false')
         with self.assertRaises(ValueError):
             app.environment(text + '\nLLM_API_KEY=not-real')
@@ -160,28 +160,31 @@ class AccessCompatibility(unittest.TestCase):
                     self.assertNotIn('SESSION_SECRET', env)
                     self.assertNotIn('DATABASE_URL', env)
                     self.assertEqual(env['AIHOT_RELEASE'], 'a' * 40)
-                    self.assertEqual(execute.call_args[0][0], '/usr/local/bin/node')
+                    self.assertEqual(execute.call_args[0][0], '/opt/aifinance/runtime/node/bin/node')
+                    self.assertEqual(execute.call_args[0][1], [app.NODE, '--max-old-space-size=128', 'apps/web/server.ts'])
             finally:
                 os.chdir(previous)
 
-    def test_release_embedded_python_extract_and_reject(self):
+    def test_release_standalone_python_extract_and_reject(self):
         script = (ROOT / 'deploy/native/release.sh').read_text()
-        embedded = script.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
-        ast.parse(embedded)
+        self.assertIn('python3 "$script_dir/extract-release.py" "$archive" "$stage"', script)
+        extractor = ROOT / 'deploy/native/extract-release.py'
+        ast.parse(extractor.read_text())
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             archive = base / 'release.tar.gz'
-            stage = base / 'stage'
-            stage.mkdir()
             for name, expected in [('safe.txt', 0), ('../escape', 1)]:
+                stage = base / ('stage-' + str(expected))
+                stage.mkdir(mode=0o700)
                 with tarfile.open(str(archive), 'w:gz') as tf:
                     info = tarfile.TarInfo(name)
                     info.size = 4
                     tf.addfile(info, io.BytesIO(b'test'))
-                result = subprocess.run([sys.executable, '-c', embedded, str(archive), str(stage)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                result = subprocess.run([sys.executable, '-B', str(extractor), str(archive), str(stage)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
                 self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(stage.stat().st_mode & 0o7777, 0o755 if expected == 0 else 0o700)
             self.assertFalse((base / 'escape').exists())
-            self.assertEqual((stage / 'safe.txt').read_bytes(), b'test')
+            self.assertEqual((base / 'stage-0/safe.txt').read_bytes(), b'test')
 
 
 if __name__ == '__main__':

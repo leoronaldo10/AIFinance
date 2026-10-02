@@ -7,7 +7,7 @@ After=network.target
 Type=simple
 User=aifinance
 Group=aifinance
-ExecStart=/usr/bin/python3 /opt/aifinance/bin/run-preview.py web
+ExecStart=/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py web
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -18,7 +18,12 @@ ReadWritePaths=/opt/aifinance/shared/data
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
 IPAddressAllow=localhost
-MemoryMax=512M
+# Provisional low-load budget; verify actual enforcement and peak usage before native-ready.
+MemoryAccounting=yes
+MemoryLimit=256M
+TasksMax=64
+CPUQuota=50%
+LimitNOFILE=4096
 UMask=0077
 
 [Install]
