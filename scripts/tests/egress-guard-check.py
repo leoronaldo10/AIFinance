@@ -34,7 +34,11 @@ def kernel_table():
 class GuardTests(unittest.TestCase):
     def test_four_rules_match_only_explicit_app_uid(self):
         payload = m.rules(UID, TOKEN)
-        self.assertTrue(payload.startswith('create table inet ' + m.TABLE + ' {'))
+        self.assertEqual(payload.splitlines()[0], 'create table inet ' + m.TABLE)
+        self.assertEqual(len(payload.splitlines()), 6)
+        self.assertTrue(payload.splitlines()[1].startswith('add chain inet ' + m.TABLE + ' ' + m.CHAIN + ' {'))
+        self.assertEqual(sum(line.startswith('add rule inet ' + m.TABLE + ' ' + m.CHAIN + ' ') for line in payload.splitlines()), 4)
+        self.assertNotIn('add table', payload)
         self.assertEqual(payload.count('meta skuid 1007 '), 4)
         self.assertIn('ip daddr 127.0.0.0/8 counter accept', payload)
         self.assertIn('ip6 daddr ::1 counter accept', payload)
@@ -103,6 +107,12 @@ class GuardTests(unittest.TestCase):
             with self.subTest(value=value), patch.object(m, 'nft', return_value=json.dumps(value)), self.assertRaises(ValueError):
                 m.inspect_table(UID, TOKEN)
 
+    def test_nft104_empty_table_success_is_not_a_loaded_guard(self):
+        empty = {'nftables': [{'metainfo': {'version': '1.0.4'}},
+                             {'table': {'family': 'inet', 'name': m.TABLE, 'handle': 42}}]}
+        with patch.object(m, 'nft', return_value=json.dumps(empty)), self.assertRaises(ValueError):
+            m.inspect_table(UID, TOKEN)
+
     def test_start_check_failure_does_not_create_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             receipt = Path(directory) / 'receipt.json'
@@ -129,6 +139,11 @@ class GuardTests(unittest.TestCase):
                 patch.object(m, 'nft', return_value='') as nft, patch.object(m, 'verify', return_value={'guard_loaded': True}) as verify:
             self.assertTrue(m.start(UID)['guard_loaded'])
             self.assertEqual(nft.call_count, 2)
+            check_call, apply_call = nft.call_args_list
+            self.assertEqual(check_call[0][0], ['--check', '--file', '-'])
+            self.assertEqual(apply_call[0][0], ['--file', '-'])
+            self.assertEqual(check_call[0][1], apply_call[0][1])
+            self.assertEqual(len(apply_call[0][1].splitlines()), 6)
             verify.assert_called_once_with(UID)
 
     def test_verify_rejects_uid_change_and_unavailable_kernel_table(self):

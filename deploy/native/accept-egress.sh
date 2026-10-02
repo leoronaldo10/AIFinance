@@ -31,7 +31,7 @@ import hashlib, importlib.util, os, stat
 from pathlib import Path
 expected = {
  '/opt/aifinance/bin/isolation-probe.py': '46350936233416c282bd8941c063cdffb09bf138e5f4e29158afc236dfd8ac7e',
- '/opt/aifinance/bin/egress-guard.py': 'f46d15ad0d52c5d7c75a5599750ea2535a036c195c4169faff0f6c64162e538a',
+ '/opt/aifinance/bin/egress-guard.py': '5c407c3916e1f44441f0a3962ea802d148084c281426ec0f809e9ad542913367',
  '/etc/systemd/system/aifinance-preview-egress.service': 'e89d001be5bb1929553c1b219759a9f123da6484229af3264e954f072047773e',
 }
 for name, digest in expected.items():
@@ -41,7 +41,7 @@ for name, digest in expected.items():
   if s.st_uid != 0 or s.st_mode & 0o022 or not (stat.S_ISREG(s.st_mode) if q==p else stat.S_ISDIR(s.st_mode)):
    raise SystemExit('Untrusted installed helper path')
  if hashlib.sha256(p.read_bytes()).hexdigest() != digest:
-  raise SystemExit('Installed helper differs from approved e6f84e81')
+  raise SystemExit('Installed helper differs from reviewed fixed hashes')
 for name in ('/run/aifinance-egress-acceptance', '/run/aifinance-preview-egress/receipt.json'):
  p=Path(name)
  if p.exists() or p.is_symlink(): raise SystemExit('Existing acceptance directory or guard receipt')

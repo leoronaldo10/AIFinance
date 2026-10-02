@@ -103,20 +103,19 @@ systemd-run --unit=aifinance-isolation-before --wait --pipe \
 
 ```bash
 cat > /run/aifinance-isolation-check/probe.nft <<EOF
-create table inet aifinance_preview_probe {
-  chain app_output {
-    type filter hook output priority -10; policy accept;
-    meta skuid $APP_UID ip daddr 127.0.0.0/8 counter accept comment "app-loopback-v4"
-    meta skuid $APP_UID ip6 daddr ::1 counter accept comment "app-loopback-v6"
-    meta skuid $APP_UID meta nfproto ipv4 counter reject with icmp type admin-prohibited comment "app-deny-v4"
-    meta skuid $APP_UID meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited comment "app-deny-v6"
-  }
-}
+create table inet aifinance_preview_probe
+add chain inet aifinance_preview_probe app_output { type filter hook output priority -10; policy accept; }
+add rule inet aifinance_preview_probe app_output meta skuid $APP_UID ip daddr 127.0.0.0/8 counter accept comment "app-loopback-v4"
+add rule inet aifinance_preview_probe app_output meta skuid $APP_UID ip6 daddr ::1 counter accept comment "app-loopback-v6"
+add rule inet aifinance_preview_probe app_output meta skuid $APP_UID meta nfproto ipv4 counter reject with icmp type admin-prohibited comment "app-deny-v4"
+add rule inet aifinance_preview_probe app_output meta skuid $APP_UID meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited comment "app-deny-v6"
 EOF
 nft --check --file /run/aifinance-isolation-check/probe.nft
 nft --file /run/aifinance-isolation-check/probe.nft
 nft -a list table inet aifinance_preview_probe
 ```
+
+nft 1.0.4 只展开 `add table` 的嵌套对象；`create table { chain ... }` 会仅建立空表。因此这里保留排他的 `create table`，其后在**同一批次**显式添加链和四条规则。
 
 不要加 `ct state established accept` 到 UID 拒绝前，否则规则上线前的外部连接可能保留。此表的 accept 只结束本链，仍要经过后续 base chain；不会绕过 firewalld 的限制。reject 会终止匹配包。`--check` 只做目标解析/校验，不代表过滤已生效；实际 nft 应用是独立原子批次，`create table` 在同名表出现时应失败，不能改成合并已有表；不允许 `flush ruleset`。
 

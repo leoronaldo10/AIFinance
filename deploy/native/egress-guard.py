@@ -95,16 +95,16 @@ def rules(uid, token):
     # The only interpolation is validated numeric UID and random hex owned by root.
     if type(uid) is not int or uid <= 0 or uid >= 4294967295 or not re.fullmatch('[0-9a-f]{32}', token):
         raise ValueError('invalid_guard_identity')
-    return '''create table inet %s {
-  chain %s {
-    type filter hook output priority -10; policy accept;
-    meta skuid %d ip daddr 127.0.0.0/8 counter accept comment "%s:loopback-v4"
-    meta skuid %d ip6 daddr ::1 counter accept comment "%s:loopback-v6"
-    meta skuid %d meta nfproto ipv4 counter reject with icmp type admin-prohibited comment "%s:deny-v4"
-    meta skuid %d meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited comment "%s:deny-v6"
-  }
-}
-''' % (TABLE, CHAIN, uid, token, uid, token, uid, token, uid, token)
+    # nft 1.0.4 expands nested table contents only for CMD_ADD, not CMD_CREATE.
+    # Keep exclusive creation, but spell every object out in the same transaction.
+    return '''create table inet %s
+add chain inet %s %s { type filter hook output priority -10; policy accept; }
+add rule inet %s %s meta skuid %d ip daddr 127.0.0.0/8 counter accept comment "%s:loopback-v4"
+add rule inet %s %s meta skuid %d ip6 daddr ::1 counter accept comment "%s:loopback-v6"
+add rule inet %s %s meta skuid %d meta nfproto ipv4 counter reject with icmp type admin-prohibited comment "%s:deny-v4"
+add rule inet %s %s meta skuid %d meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited comment "%s:deny-v6"
+''' % (TABLE, TABLE, CHAIN, TABLE, CHAIN, uid, token, TABLE, CHAIN, uid, token,
+       TABLE, CHAIN, uid, token, TABLE, CHAIN, uid, token)
 
 
 def expected_objects(uid, token):
