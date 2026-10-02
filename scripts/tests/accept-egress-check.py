@@ -35,6 +35,13 @@ if name=='ip':
   fam=6 if '-6' in a else 4
   s['addresses'].remove(fam); out()
  if 'route' in a: out('default via 192.168.1.1 dev eth0' if '-4' in a else 'default via fe80::1 dev eth0')
+ if 'to' in a:
+  assert a[a.index('to')+1]=='2001:db8:ffff::254/128'
+  s['dad_queries']=s.get('dad_queries',0)+1
+  if scenario=='dad-query-failure': out('1: lo inet6 2001:db8:ffff::254/128 scope global',code=1)
+  if scenario=='dad-address-missing': out()
+  flags=' dadfailed' if scenario=='dad-failure' else (' tentative' if scenario=='dad-timeout' or (scenario=='dad-delayed' and s['dad_queries']<3) else '')
+  out('1: lo inet6 2001:db8:ffff::254/128 scope global'+flags)
  lines=['1: lo inet 127.0.0.1/8 scope host lo']
  if 4 in s['addresses']: lines.append('1: lo inet 192.0.2.254/32 scope global lo')
  if 6 in s['addresses']: lines.append('1: lo inet6 2001:db8:ffff::254/128 scope global')
@@ -90,6 +97,7 @@ if name=='systemd-run':
  # Successful transient units may be collected before cleanup.
  s['units'].pop(unit,None)
  out(json.dumps(result))
+if name=='sleep': out()
 if name=='journalctl': out('{"listeners_ready":true}')
 raise SystemExit('unexpected mock command '+name+' '+str(a))
 '''.replace('REAL_PY',repr(sys.executable)).replace('#!PYTHON','#!'+sys.executable)
@@ -100,7 +108,7 @@ class RunnerTests(unittest.TestCase):
    root=pathlib.Path(directory); evidence=root/'evidence'; state=root/'state.json'; commands=root/'bin'; commands.mkdir()
    state.write_text(json.dumps({'scenario':scenario,'addresses':[],'units':{},'log':[]}))
    script=SCRIPT.read_text().replace('[[ $# == 0 && $EUID == 0 ]]','[[ $# == 0 ]]').replace('readonly EVIDENCE=/run/aifinance-egress-acceptance','readonly EVIDENCE='+str(evidence))
-   for name,path in [('python3','/usr/bin/python3'),('systemctl','/usr/bin/systemctl'),('systemd-run','/usr/bin/systemd-run'),('journalctl','/usr/bin/journalctl'),('ss','/usr/sbin/ss'),('ip','/usr/sbin/ip'),('nft','/usr/sbin/nft')]:
+   for name,path in [('python3','/usr/bin/python3'),('systemctl','/usr/bin/systemctl'),('systemd-run','/usr/bin/systemd-run'),('journalctl','/usr/bin/journalctl'),('ss','/usr/sbin/ss'),('ip','/usr/sbin/ip'),('nft','/usr/sbin/nft'),('sleep','/usr/bin/sleep')]:
     tool=commands/name; tool.write_text(FAKE); tool.chmod(0o755); script=script.replace(path,str(tool))
    copy=root/'test-only.sh'; copy.write_text(script)
    result=subprocess.run(['/usr/bin/bash',str(copy)],env=dict(os.environ,FAKE_STATE=str(state)),stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=20)
@@ -110,6 +118,13 @@ class RunnerTests(unittest.TestCase):
   r,s=self.run_case('success'); self.assertEqual(r.returncode,0,r.stdout+r.stderr); self.assertEqual(s['addresses'],[]); self.assertEqual(s['units'],{}); self.assertTrue(s['guard_loaded']); self.assertIn('probe_passed=true',s['result_file'])
  def test_baseline_failure_never_loads_guard(self):
   r,s=self.run_case('baseline-failure'); self.assertNotEqual(r.returncode,0); self.assertEqual(s['addresses'],[]); self.assertEqual(s['units'],{}); self.assertNotIn('guard_attempted',s)
+ def test_delayed_dad_readiness_waits_without_disabling_ipv6(self):
+  r,s=self.run_case('dad-delayed'); self.assertEqual(r.returncode,0,r.stdout+r.stderr); self.assertEqual(s['dad_queries'],3); self.assertTrue(s['guard_loaded']); self.assertEqual(sum(x[0]=='sleep' for x in s['log']),2)
+ def test_persistent_tentative_stops_after_bounded_wait_before_services(self):
+  r,s=self.run_case('dad-timeout'); self.assertNotEqual(r.returncode,0); self.assertEqual(s['dad_queries'],11); self.assertEqual(sum(x[0]=='sleep' for x in s['log']),10); self.assertEqual(s['addresses'],[]); self.assertEqual(s['units'],{}); self.assertNotIn('guard_attempted',s)
+ def test_dad_failure_missing_address_or_query_error_never_starts_services(self):
+  for scenario in ('dad-failure','dad-address-missing','dad-query-failure'):
+   r,s=self.run_case(scenario); self.assertNotEqual(r.returncode,0,scenario); self.assertEqual(s['dad_queries'],1); self.assertEqual(s['addresses'],[]); self.assertEqual(s['units'],{}); self.assertNotIn('guard_attempted',s); self.assertFalse(any(x[0]=='sleep' for x in s['log']))
  def test_partial_address_failure_removes_only_first_address(self):
   r,s=self.run_case('address6-failure'); self.assertNotEqual(r.returncode,0); self.assertEqual(s['addresses'],[]); deletions=[x for x in s['log'] if x[0]=='ip' and 'del' in x]; self.assertEqual(len(deletions),1); self.assertIn('-4',deletions[0])
  def test_failed_guard_start_does_not_delete_guard_or_receipt(self):
@@ -128,6 +143,6 @@ class RunnerTests(unittest.TestCase):
  def test_changed_unit_owner_refuses_stop_and_retains_addresses(self):
   r,s=self.run_case('foreign-owner'); self.assertNotEqual(r.returncode,0); self.assertTrue(s['guard_loaded']); self.assertEqual(s['addresses'],[4,6]); self.assertIn('cleanup_failed=1',s['result_file']); self.assertFalse(any(x[0]=='systemctl' and x[1]=='stop' and 'aifinance-isolation-listener.service' in x for x in s['log']))
  def test_no_dangerous_commands_in_deliverable(self):
-  s=SCRIPT.read_text(); self.assertNotIn('nft flush',s); self.assertNotIn('reset-failed "',s); self.assertNotIn('systemctl enable',s); self.assertNotIn('systemctl restart',s); self.assertNotIn('initdb',s); self.assertNotIn('ExecStartPre=',s)
+  s=SCRIPT.read_text(); self.assertNotIn('nft flush',s); self.assertNotIn('reset-failed "',s); self.assertNotIn('systemctl enable',s); self.assertNotIn('systemctl restart',s); self.assertNotIn('initdb',s); self.assertNotIn('ExecStartPre=',s); self.assertNotIn('nodad',s); self.assertNotIn('sysctl',s)
 
 if __name__=='__main__': unittest.main(verbosity=2)

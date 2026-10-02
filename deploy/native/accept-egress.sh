@@ -170,8 +170,16 @@ PY
 created4=1
 /usr/sbin/ip -6 address add 2001:db8:ffff::254/128 dev lo
 created6=1
-v6=$(/usr/sbin/ip -o -6 address show dev lo)
-[[ $v6 == *'2001:db8:ffff::254/128'* && $v6 != *tentative* && $v6 != *dadfailed* ]] || fail 'IPv6 address is not ready'
+# DAD is asynchronous. Inspect only our address; never disable DAD or skip IPv6.
+for attempt in {1..11}; do
+  v6=$(/usr/sbin/ip -o -6 address show dev lo to 2001:db8:ffff::254/128)
+  printf '%s\n' "$v6" >"$EVIDENCE/ipv6-ready.$attempt.txt"
+  [[ $v6 == *'2001:db8:ffff::254/128'* ]] || fail 'IPv6 test address disappeared'
+  [[ $v6 != *dadfailed* ]] || fail 'IPv6 duplicate address detection failed'
+  [[ $v6 == *tentative* ]] || break
+  (( attempt < 11 )) || fail 'IPv6 address remained tentative after 10 seconds'
+  /usr/bin/sleep 1
+done
 
 props=(-p "Description=$OWNER" -p MemoryAccounting=yes -p TasksMax=16 -p CPUQuota=10%
        -p RuntimeMaxSec=190 -p TimeoutStopSec=5 -p KillMode=control-group -p Restart=no
