@@ -156,7 +156,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   const [article] = await tx<ArticleRow[]>`
     SELECT id, revision, source_id, url, title, language, published_at, discovered_at, timeline_at, backfill, body_status,
            body_text, excerpt, x_post, grouped_at
-    FROM articles WHERE id = ${articleId} FOR UPDATE`;
+    FROM articles WHERE id = ${articleId} AND NOT collect_only FOR UPDATE`;
   if (!article) return null;
   // Reports take this lock exclusively while reading candidates. Hold it through commit so a
   // release stamped before their cutoff cannot commit after their candidate snapshot.

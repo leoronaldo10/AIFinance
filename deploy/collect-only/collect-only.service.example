@@ -1,0 +1,35 @@
+# Review-only template. Do not install before production outbound access is approved.
+[Unit]
+Description=Finance RSS raw collection (no worker, models or publication)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Dedicated non-login collector identity; never the web/API UID or deploy identity.
+User=REPLACE_WITH_DEDICATED_COLLECTOR_USER
+WorkingDirectory=/REPLACE_WITH_IMMUTABLE_REVIEWED_RELEASE
+# This file contains DATABASE_URL only; no admin/model/integration credentials.
+EnvironmentFile=/REPLACE_WITH_COLLECTOR_DB_ONLY_ENV_FILE
+# Only this separately approved collector process permits guarded RSS HTTP.
+Environment=PREVIEW_MODE=false
+Environment=MODEL_CALLS_ENABLED=false
+Environment=COLLECT_ENABLED=false
+Environment=ALLOW_PRIVATE_NETWORK_FETCH=false
+Environment=AIHOT_CREDENTIALS_DIR=
+Environment=FEISHU_INTERNAL_ENABLED=false
+Environment=FEISHU_CONTENT_PUSH_ENABLED=false
+Environment=INDEXNOW_SUBMIT_ENABLED=false
+ExecStart=/REPLACE_WITH_NODE24_PATH scripts/collect-only.ts --run
+TimeoutStartSec=120
+# Target systemd 239 / cgroup v1: verify the running kernel limit before RSS access.
+MemoryAccounting=yes
+MemoryLimit=256M
+TasksMax=32
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+PrivateTmp=true
+UMask=0077

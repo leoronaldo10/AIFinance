@@ -45,7 +45,7 @@ function rewriteUrl(c: Candidate, source: SourceRow): Candidate {
 
 async function loadSource(id: string): Promise<SourceRow | null> {
   const [s] = await sql<SourceRow[]>`
-    SELECT id, name, kind, config, tier, participation_mode, first_party, interval_minutes, enabled, cursor, fail_count
+    SELECT id, name, kind, config, tier, participation_mode, collect_only, first_party, interval_minutes, enabled, cursor, fail_count
     FROM sources WHERE id = ${id}`;
   return s ?? null;
 }
@@ -84,6 +84,7 @@ async function store(sourceId: string, candidates: Candidate[], backfill: string
 export async function collectSource(sourceId: string, opts: { force?: boolean } = {}): Promise<CollectResult> {
   const source = await loadSource(sourceId);
   if (!source) return { sourceId, status: "skipped", found: 0, created: 0, revised: 0, error: "missing" };
+  if (source.collect_only) return { sourceId, status: "skipped", found: 0, created: 0, revised: 0, error: "collect-only" };
   if (!source.enabled && !opts.force) return { sourceId, status: "skipped", found: 0, created: 0, revised: 0, error: "paused" };
   if (source.kind === "mp_account" || source.kind === "external") {
     // WeChat accounts are reconciled by the mp job; external sources only receive reports.

@@ -607,7 +607,7 @@ async function decide(articleId: string, opts: GroupOptions): Promise<GroupResul
     SELECT a.id, a.title, a.url, a.published_at, a.discovered_at, a.grouped_at, a.body_text, a.x_post, a.backfill,
            s.id AS source_id, s.name AS source_name, s.signal_group_id, s.first_party, s.participation_mode,
            EXISTS (SELECT 1 FROM regroup_pending rp WHERE rp.article_id = a.id) AS regroup_pending
-    FROM articles a JOIN sources s ON s.id = a.source_id WHERE a.id = ${articleId}`;
+    FROM articles a JOIN sources s ON s.id = a.source_id WHERE a.id = ${articleId} AND NOT a.collect_only`;
   if (!a) return { verdict: "skipped" };
   const observedAt = a.published_at ?? a.discovered_at;
   const source = { id: a.source_id, signal_group_id: a.signal_group_id };

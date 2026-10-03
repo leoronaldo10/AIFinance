@@ -230,7 +230,7 @@ class DatabaseProvisionTests(unittest.TestCase):
             for attempt in range(50):
                 try:
                     exited = 'State:\tZ' in status.read_text()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     exited = True  # Kernel may reap the process between observations.
                 if exited:
                     break

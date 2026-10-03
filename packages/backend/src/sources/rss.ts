@@ -92,8 +92,13 @@ export function isTeaser(text: string): boolean {
  * The body and excerpt of a feed entry: its text when it is the article, else no body (a summary, or
  * a teaser that stands in as the excerpt when the entry has none).
  */
-function feedText(bodyHtml: string | null, summaryHtml: string, source: SourceRow): Pick<Candidate, "excerpt" | "bodyHtml" | "bodyText" | "bodyStatus"> {
+function feedText(bodyHtml: string | null, summaryHtml: string, source: SourceRow, publicTextOnly = false): Pick<Candidate, "excerpt" | "bodyHtml" | "bodyText" | "bodyStatus"> {
   const bodyText = bodyHtml ? stripTags(bodyHtml) : null;
+  if (publicTextOnly) {
+    const text = (bodyText || stripTags(summaryHtml)).slice(0, 20_000);
+    return { excerpt: stripTags(summaryHtml).slice(0, 2000) || null, bodyHtml: null,
+      bodyText: text || null, bodyStatus: text ? "ok" : "none" };
+  }
   const teaser = !!bodyText && source.participation_mode === "editorial" && isTeaser(bodyText);
   const excerpt = summaryHtml ? collapseWhitespace(stripTags(summaryHtml)).slice(0, 2000) : teaser ? collapseWhitespace(bodyText!) : null;
   return bodyText && bodyText.length > 280 && !teaser
@@ -114,7 +119,7 @@ export interface RssRead {
   notModified: boolean;
 }
 
-export async function fetchRss(source: SourceRow, opts: { force?: boolean } = {}): Promise<RssRead> {
+export async function fetchRss(source: SourceRow, opts: { force?: boolean; publicTextOnly?: boolean } = {}): Promise<RssRead> {
   const url = String(source.config.feedUrl ?? "");
   if (!url) throw new FetchError("feedUrl missing");
   // Config changes can alter parsing/filtering even when the upstream bytes did not change.
@@ -123,10 +128,10 @@ export async function fetchRss(source: SourceRow, opts: { force?: boolean } = {}
   const headers: Record<string, string> = { accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8" };
   if (previous?.etag) headers["if-none-match"] = previous.etag;
   if (previous?.lastModified) headers["if-modified-since"] = previous.lastModified;
-  let res = await guardedFetch(url, { headers, timeoutMs: 25_000 });
+  let res = await guardedFetch(url, { headers, timeoutMs: 25_000, sameOriginRedirects: opts.publicTextOnly, maxBytes: opts.publicTextOnly ? 2 * 1024 * 1024 : undefined });
   // A redirect may have changed destinations, whose ETag namespace is unrelated to the old one.
   if (res.status === 304 && previous && res.url !== previous.responseUrl) {
-    res = await guardedFetch(url, { headers: { accept: headers.accept! }, timeoutMs: 25_000 });
+    res = await guardedFetch(url, { headers: { accept: headers.accept! }, timeoutMs: 25_000, sameOriginRedirects: opts.publicTextOnly, maxBytes: opts.publicTextOnly ? 2 * 1024 * 1024 : undefined });
   }
   const validator: RssValidator = {
     configHash, responseUrl: res.url,
@@ -171,8 +176,8 @@ export async function fetchRss(source: SourceRow, opts: { force?: boolean } = {}
         title,
         author: text(it["dc:creator"]) || text(it.author) || null,
         publishedAt: parseDate(text(it.pubDate) || text(it["dc:date"]) || text(it.published)),
-        ...feedText(bodyHtml, description, source),
-        media: media.slice(0, 6),
+        ...feedText(bodyHtml, description, source, opts.publicTextOnly),
+        media: opts.publicTextOnly ? [] : media.slice(0, 6),
         categories: arr(it.category).map((c) => text(c)).filter(Boolean),
         raw: { guid: text(it.guid) || null },
       });
@@ -197,8 +202,8 @@ export async function fetchRss(source: SourceRow, opts: { force?: boolean } = {}
         author: text(arr(e.author)[0]?.name) || null,
         publishedAt: parseDate(text(e.published) || text(e.updated)),
         sourceUpdatedAt: parseDate(text(e.updated)),
-        ...feedText(bodyHtml, summary, source),
-        media: content ? imagesFrom(content, link) : [],
+        ...feedText(bodyHtml, summary, source, opts.publicTextOnly),
+        media: !opts.publicTextOnly && content ? imagesFrom(content, link) : [],
         categories: arr(e.category).map((c: any) => c?.["@term"] ?? text(c)).filter(Boolean),
         raw: { id: text(e.id) || null },
       });

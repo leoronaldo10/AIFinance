@@ -44,6 +44,8 @@ export interface GuardedFetchOptions {
   maxBytes?: number;
   /** Follow redirects manually so every hop passes the SSRF guard. */
   maxRedirects?: number;
+  /** Refuse redirects outside the original scheme, host and port before connecting. */
+  sameOriginRedirects?: boolean;
   /** "egress" by default; see EgressRoute. */
   route?: EgressRoute;
 }
@@ -65,9 +67,11 @@ export async function guardedFetch(input: string, opts: GuardedFetchOptions = {}
   // nominal 20 s image request to occupy the API for minutes.
   const signal = AbortSignal.timeout(opts.timeoutMs ?? 20_000);
   const route = opts.route ?? "egress";
-  const check = (target: string) => withinDeadline(
-    assertPublicUrl(target, config.allowPrivateNetworkFetch, proxied(new URL(target), route)), signal,
-  );
+  const check = (target: string) => {
+    const parsed = new URL(target);
+    if (opts.sameOriginRedirects && (parsed.username || parsed.password)) throw new Error("URL credentials are forbidden");
+    return withinDeadline(assertPublicUrl(target, config.allowPrivateNetworkFetch, proxied(parsed, route)), signal);
+  };
   let url = await check(input);
   const maxRedirects = opts.maxRedirects ?? 5;
   const maxBytes = opts.maxBytes ?? 8 * 1024 * 1024;
@@ -84,7 +88,9 @@ export async function guardedFetch(input: string, opts: GuardedFetchOptions = {}
       // Release the connection even when the next URL is refused or the redirect limit is reached.
       await res.body?.cancel();
       if (hop >= maxRedirects) throw new Error(`Too many redirects for ${input}`);
-      url = await check(new URL(res.headers.get("location")!, url).toString());
+      const next = new URL(res.headers.get("location")!, url);
+      if (opts.sameOriginRedirects && next.origin !== new URL(input).origin) throw new Error("Cross-origin redirect refused");
+      url = await check(next.toString());
       continue;
     }
     const chunks: Buffer[] = [];

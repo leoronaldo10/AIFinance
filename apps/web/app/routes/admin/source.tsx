@@ -9,6 +9,7 @@ import { HEALTH_LABEL, KIND_LABEL, MODE_LABEL, TIER_LABEL, VISIBILITY_LABEL } fr
 import { AdminPage, Badge, Button, Card, DataTable, Dot, Empty, Field, healthTone, Input, Json, KV, ReasonDialog, Select, Stat, Textarea, Time } from "../../features/admin/ui";
 
 interface Source {
+  collect_only: boolean;
   id: string;
   name: string;
   kind: string;
@@ -36,6 +37,7 @@ interface Source {
 
 /** X runs: pages read, and older stretches still to read (backlog) or given up (dropped). */
 interface RunDetail {
+  reason?: string;
   pages?: number;
   backlog?: number;
   dropped?: number;
@@ -137,7 +139,7 @@ export default function SourceDetail({ loaderData }: Route.ComponentProps) {
         </span>
       }
       subtitle={<span className="font-mono text-[12px]">{s.id}</span>}
-      actions={
+      actions={!s.collect_only &&
         <>
           <Button
             busy={pending === "preview"}
@@ -242,8 +244,8 @@ export default function SourceDetail({ loaderData }: Route.ComponentProps) {
             </div>
             <div className="mt-4 flex items-center justify-end gap-2">
               {changes > 0 && <span className="text-[12.5px] text-ink-3">{changes} 项改动未保存</span>}
-              <Button tone="ghost" disabled={!changes} onClick={() => setDraft(draftOf(s))}>还原</Button>
-              <Button tone="primary" disabled={!changes} onClick={() => patch() && setDialog("save")}>保存</Button>
+              <Button tone="ghost" disabled={s.collect_only || !changes} onClick={() => setDraft(draftOf(s))}>还原</Button>
+              <Button tone="primary" disabled={s.collect_only || !changes} onClick={() => patch() && setDialog("save")}>保存</Button>
             </div>
           </Card>
 
@@ -298,6 +300,7 @@ export default function SourceDetail({ loaderData }: Route.ComponentProps) {
                     </span>
                   ),
                 },
+                { key: "reason", label: "说明", render: (r) => r.error ?? r.detail?.reason ?? "—" },
                 { key: "n", label: "发现/新增", align: "right", render: (r) => `${r.found_count ?? "—"}/${r.new_count ?? "—"}` },
                 { key: "ms", label: "耗时", align: "right", render: (r) => duration(r.started_at, r.finished_at) },
               ]}

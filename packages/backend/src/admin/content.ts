@@ -18,14 +18,14 @@ import { Conflict } from "./sources.ts";
 
 export async function searchContent(q: string) {
   const term = q.trim();
-  if (!term) return [];
+
   const byId = ARTICLE_ID_PATTERN.test(term) ? term : null;
   const url = /^https?:\/\//i.test(term) ? normalizeUrl(term) : null;
   return sql`
-    SELECT a.id, coalesce(p.title, a.title) AS title, a.url, s.name AS source, a.discovered_at, a.processing_state,
+    SELECT a.id, a.title, a.url, s.name AS source, a.discovered_at, a.processing_state, s.participation_mode, a.collect_only,
            p.visibility, p.selected, p.score
     FROM articles a JOIN sources s ON s.id = a.source_id LEFT JOIN publications p ON p.article_id = a.id
-    WHERE (${byId}::text IS NOT NULL AND a.id = ${byId})
+    WHERE (${term} = '') OR (${byId}::text IS NOT NULL AND a.id = ${byId})
        OR (${url}::text IS NOT NULL AND (a.url = ${url} OR a.identity_key = ${url} OR a.url = ${term}))
        OR (${url}::text IS NULL AND (a.title ILIKE ${`%${term}%`} OR p.title ILIKE ${`%${term}%`}))
     ORDER BY a.discovered_at DESC LIMIT 50`;
@@ -34,7 +34,8 @@ export async function searchContent(q: string) {
 export async function contentChain(id: string) {
   const [article] = await sql`
     SELECT a.id, a.source_id, a.url, a.identity_key, a.title, a.author, a.language, a.published_at, a.published_at_claim, a.discovered_at,
-           a.timeline_at, a.backfill, a.body_status, a.revision, a.processing_state, a.processing_error, a.grouped_at, length(a.body_text) AS body_chars,
+           a.timeline_at, a.backfill, a.collect_only, a.body_status, a.revision, a.processing_state, a.processing_error, a.grouped_at, length(a.body_text) AS body_chars,
+           left(a.body_text, 20000) AS body_text, left(a.excerpt, 2000) AS excerpt,
            s.name AS source_name, s.kind AS source_kind, s.tier, s.participation_mode, s.site_fulltext, s.syndicate_fulltext
     FROM articles a JOIN sources s ON s.id = a.source_id WHERE a.id = ${id}`;
   if (!article) return null;
@@ -70,6 +71,11 @@ async function inHotRanking(id: string): Promise<boolean> {
   return !!p?.story_id && ranking.entries.some((e) => e.storyId === Number(p.story_id));
 }
 
+async function assertMutable(id: string) {
+  const [row] = await sql`SELECT collect_only FROM articles WHERE id=${id}`;
+  if (row?.collect_only) throw new Conflict("仅采集原始候选不可编辑、发布或重跑");
+}
+
 const STALE = "这条内容的人工设置已被修改，请刷新后再操作";
 
 async function overrideRow(id: string) {
@@ -82,6 +88,7 @@ async function overrideRow(id: string) {
  * search index through the one publication projection; ETags change with the content.
  */
 export async function setVisibility(id: string, input: { visibility: "public" | "summary-only" | "withdrawn"; reason: string; version: number }, actor: string) {
+  await assertMutable(id);
   if (!input.reason?.trim()) throw new Error("reason is required");
   const before = await overrideRow(id);
   if (before.version !== input.version) throw new Conflict(STALE);
@@ -103,6 +110,7 @@ export async function setVisibility(id: string, input: { visibility: "public" | 
 
 /** Marks a detail page for search indexing (sitemap, IndexNow, robots) or removes the mark. */
 export async function setSeoIndexed(id: string, input: { indexed: boolean; reason: string }, actor: string) {
+  await assertMutable(id);
   if (!input.reason?.trim()) throw new Error("reason is required");
   const [before] = await sql<{ seo_indexed_at: Date | null; indexable: boolean }[]>`SELECT seo_indexed_at, indexable FROM publications WHERE article_id = ${id}`;
   if (!before) return null;
@@ -129,6 +137,7 @@ const FieldsSchema = z
 
 /** Manual corrections win over model output; null clears a correction. */
 export async function overrideFields(id: string, input: { fields: unknown; clear?: string[]; reason: string; version: number }, actor: string) {
+  await assertMutable(id);
   if (!input.reason?.trim()) throw new Error("reason is required");
   const fields = FieldsSchema.parse(input.fields ?? {});
   const before = await overrideRow(id);
@@ -156,8 +165,9 @@ export async function overrideFields(id: string, input: { fields: unknown; clear
  * the request id, so submitting the same request twice neither enqueues nor pays twice.
  */
 export async function rerun(id: string, step: "extract" | "analyze" | "group", requestId: string, actor: string) {
+  await assertMutable(id);
   if (!/^[\w-]{8,80}$/.test(requestId)) throw new Error("a stable request id is required");
-  const [a] = await sql`SELECT id FROM articles WHERE id = ${id}`;
+  const [a] = await sql`SELECT id FROM articles WHERE id = ${id} AND NOT collect_only`;
   if (!a) return null;
   let jobId: string | null;
   if (step === "group") {
@@ -181,6 +191,7 @@ export async function rerun(id: string, step: "extract" | "analyze" | "group", r
  * evidence leaves the old story, whose digest is rewritten.
  */
 export async function detachFromFact(id: string, reason: string, actor: string) {
+  await assertMutable(id);
   const { facts, stories } = await sql.begin(async (tx) => {
     // The grouping job writes under the same lock and reads this decision again before it does.
     await tx`SELECT 1 FROM articles WHERE id = ${id} FOR UPDATE`;

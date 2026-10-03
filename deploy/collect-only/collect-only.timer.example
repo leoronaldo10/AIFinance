@@ -1,0 +1,12 @@
+# Review-only, intentionally no installation commands or automatic enablement.
+[Unit]
+Description=Hourly fixed-source raw RSS batch
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=60
+Unit=collect-only.service
+
+[Install]
+WantedBy=timers.target
