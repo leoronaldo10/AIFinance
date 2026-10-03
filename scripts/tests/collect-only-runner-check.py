@@ -130,6 +130,36 @@ class CollectorFixtures(unittest.TestCase):
         self.assertNotIn('database.env',probe)
         self.assertIn('BindReadOnlyPaths=',m.unit_text('run'))
 
+    def test_all_four_templates_only_replace_database_requires_with_requisite(self):
+        old={'check':'11e4aafb6ea50f88f458b0d6e7ff163d7b7672089e697ce7b05bd6b75a495290',
+             'probe':'ddeb397d63a1d4e41a217c12f9fc18269bc0fb32caeb992510e0a5a44cea6e1d',
+             'run':'68c2023c52b5e565ee3665d19429321d3edf4b02ac19d5946ec999a60e138904',
+             'seed':'2131e5a02cfe7e12c46908c2e082d74a5b4092d29e64df7799423e7a519d5637'}
+        for mode,digest in old.items():
+            text=m.unit_text(mode)
+            self.assertEqual(text.count('Requisite=aifinance-preview-db.service\n'),1)
+            self.assertNotIn('Requires=aifinance-preview-db.service',text)
+            self.assertIn('After=aifinance-preview-db.service\n',text)
+            restored=text.replace('Requisite=aifinance-preview-db.service\n','Requires=aifinance-preview-db.service\n')
+            self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),digest)
+
+    def test_loaded_requisite_exact_and_database_not_implicitly_started(self):
+        profile={'LoadState':'loaded','DropInPaths':'','User':m.ACCOUNT,'Group':m.ACCOUNT,
+                 'MemoryAccounting':'yes','MemoryLimit':str(m.LIMIT),'TasksMax':'32','TimeoutStartUSec':'2min',
+                 'NoNewPrivileges':'yes','CapabilityBoundingSet':'','AmbientCapabilities':'','ProtectSystem':'strict',
+                 'ProtectHome':'yes','PrivateTmp':'yes','WorkingDirectory':str(m.RELEASE),'KillMode':'control-group',
+                 'Requisite':'aifinance-preview-db.service','Requires':'sysinit.target','Wants':'','BindsTo':'','ExecStartPre':''}
+        def prop(unit,key):return str(m.SYSTEM/unit) if key=='FragmentPath' else profile[key]
+        def read(path,*unused):return m.unit_text(path.name[len(m.PREFIX):-len('.service')])
+        with patch.object(m,'trusted'),patch.object(m,'read',side_effect=read),patch.object(m,'prop',side_effect=prop),patch.object(m,'effective_exec') as execute:
+            m.verify_units()
+            for key,value in (('Requisite',''),('Requisite','aifinance-preview-db.service other.service'),
+                              ('Requires','aifinance-preview-db.service sysinit.target'),
+                              ('Wants','aifinance-preview-db.service'),('BindsTo','aifinance-preview-db.service')):
+                original=profile[key];profile[key]=value;execute.reset_mock()
+                with self.assertRaises(ValueError):m.verify_units()
+                execute.assert_not_called();profile[key]=original
+
     def test_kernel_memory_pids_identity_and_cgroup_checks(self):
         def fixture(path):
             text=str(path)

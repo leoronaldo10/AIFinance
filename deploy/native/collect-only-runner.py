@@ -367,7 +367,7 @@ def unit_text(mode):
     network = 'PrivateNetwork=yes\n' if mode == 'probe' else 'BindReadOnlyPaths=%s/hosts:/etc/hosts %s/nsswitch.conf:/etc/nsswitch.conf\n' % (CONFIG, CONFIG)
     text = '''[Unit]
 Description=Bounded finance collect-only %s
-Requires=aifinance-preview-db.service
+Requisite=aifinance-preview-db.service
 After=aifinance-preview-db.service
 [Service]
 Type=oneshot
@@ -421,10 +421,15 @@ def verify_units():
                       'MemoryLimit': str(LIMIT), 'TasksMax': '32', 'TimeoutStartUSec': '2min',
                       'NoNewPrivileges': 'yes', 'CapabilityBoundingSet': '', 'AmbientCapabilities': '',
                       'ProtectSystem': 'strict', 'ProtectHome': 'yes', 'PrivateTmp': 'yes',
-                      'WorkingDirectory': str(RELEASE), 'KillMode': 'control-group'}
+                      'WorkingDirectory': str(RELEASE), 'KillMode': 'control-group',
+                      'Requisite': 'aifinance-preview-db.service'}
         for name, expected in properties.items():
             if prop(unit, name) != expected:
                 raise ValueError('loaded_collector_safety_property_mismatch')
+        # Requisite checks existing state but never queues a database start.
+        for relationship in ('Requires', 'Wants', 'BindsTo'):
+            if 'aifinance-preview-db.service' in prop(unit, relationship).split():
+                raise ValueError('collector_must_not_start_database')
         command_line = '/usr/bin/sleep 30' if mode == 'probe' else '/usr/bin/python3 -I -B %s _execute --mode %s' % (SELF, mode)
         effective_exec(unit, 'ExecStart', command_line)
         if mode == 'probe':
