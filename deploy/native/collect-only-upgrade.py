@@ -589,7 +589,7 @@ def migration_sql(release, old_names):
     if digest(raw) != MIGRATION_DIGEST:
         raise ValueError('reviewed_0041_bytes_required')
     wanted = ','.join("'" + n + "'" for n in old_names)
-    return ("BEGIN; SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='60s';\n"
+    return ("BEGIN; SET LOCAL search_path=pg_catalog,public,pg_temp; SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='60s';\n"
             "LOCK TABLE public.schema_migrations IN EXCLUSIVE MODE;\n"
             "DO $$ BEGIN IF (SELECT array_agg(name ORDER BY name) FROM public.schema_migrations) "
             "IS DISTINCT FROM ARRAY[" + wanted + "]::text[] THEN RAISE EXCEPTION 'ledger mismatch'; END IF; END $$;\n" +

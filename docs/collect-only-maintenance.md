@@ -52,7 +52,7 @@
 - 独立短期 PG17 恢复单元以现有应用 OS UID989 运行、PrivateNetwork、只允许 AF_UNIX、无 TCP listener、私有 0700 socket、空 caps/NNP、MemoryLimit256MiB/Tasks32/240秒上限。隐藏生产 env、生产数据目录及 DB socket；不传生产密码，不改 HBA。临时集群的数据库超级用户不能访问生产服务或取得 OS root
 - 在独立集群完整恢复包含 ownership/ACL 的备份，再以该集群真实非超级用户 app 登录比较计数、逐行哈希、账本、owner/ACL/extension/role/sequence。当前只支持精确既有 app 角色与 app/postgres/pg_database_owner 依赖；未知依赖失败停止，不能静默跳过
 - 恢复成功证据含实际 cgroup v1 memory+pids 限额、UID/权限、peak/failcnt；确认通过才清理本次独占临时叶目录，失败目录保留。所有备份/验收记录保留
-- 再核对数据库未变化，仅在一个事务里执行原文 0041+账本插入，设置 lock_timeout5秒/statement_timeout60秒；不运行 migrate.ts 的编辑回填
+- 再核对数据库未变化，仅在一个事务里执行原文 0041+账本插入，固定事务 search_path=pg_catalog,public,pg_temp（含临时schema最后），设置 lock_timeout5秒/statement_timeout60秒；不运行 migrate.ts 的编辑回填
 - 检查精确新增账本、布尔 false/NOT NULL、已验证约束、旧行内容/旧账本及计数不变；仅更新 shared schema 记录，保存旧清单，绝不改旧 release 清单
 - 原子切 current 到固定 d57，启动 API/Web，核对精确版本健康/UID/实际内存限制/旧8000 listener/原 UID989 egress，写 root-only `/var/lib/aifinance-maintenance/collect-only-upgrade.json`
 

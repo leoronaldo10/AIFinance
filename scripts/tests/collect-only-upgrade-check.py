@@ -36,7 +36,7 @@ class UpgradeSafety(unittest.TestCase):
         sql = m.migration_sql(REPO, names)
         self.assertTrue(sql.startswith('BEGIN;'))
         self.assertTrue(sql.endswith('COMMIT;\n'))
-        for text in ["lock_timeout='5s'", "statement_timeout='60s'", 'LOCK TABLE public.schema_migrations', 'IS DISTINCT FROM ARRAY', "VALUES ('0041_collect_only.sql')"]:
+        for text in ["SET LOCAL search_path=pg_catalog,public,pg_temp", "lock_timeout='5s'", "statement_timeout='60s'", 'LOCK TABLE public.schema_migrations', 'IS DISTINCT FROM ARRAY', "VALUES ('0041_collect_only.sql')"]:
             self.assertIn(text, sql)
         self.assertLess(sql.index('LOCK TABLE'), sql.index('ALTER TABLE'))
         self.assertLess(sql.index('ALTER TABLE'), sql.index('INSERT INTO'))
