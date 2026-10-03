@@ -31,6 +31,8 @@ OLD_COMMAND = 'authorizedkeyscommand /usr/bin/ecs_config_instance_connect --uid 
 MARKER = b'# AIFINANCE fixed deploy key boundary v1'
 APPEND = b'\n' + MARKER + b'\nMatch all\nMatch User aifinance-deploy\n    AuthorizedKeysCommand none\nMatch all\n'
 CONTEXTS = (None, 'root', 'aifinance-preview', 'aifinance', 'aifinance-deploy')
+CRYPTO_OPTIONS = frozenset(('Ciphers', 'MACs', 'GSSAPIKexAlgorithms', 'KexAlgorithms',
+                            'HostKeyAlgorithms', 'PubkeyAcceptedKeyTypes', 'CASignatureAlgorithms'))
 # Closed literal codes from this repair and the exact pinned installer/old runner.
 # Arbitrary exception strings, even lowercase strings resembling tokens, stay private.
 KNOWN_REASONS = frozenset((
@@ -91,7 +93,7 @@ KNOWN_REASONS = frozenset((
     'unexpected_sudo_directory_mode unit_failed_timed_out_or_resource_evidence_missing '
     'unreadable_process_identity unsafe_installer_file unsafe_installer_parent unsafe_root_directory '
     'unsafe_root_file unsafe_sshd_environment_policy unsupported_sshd_config_security_attributes '
-    'unverified_sshd_config_invocation valid_original_ed25519_key_required validated_source_constraint_required '
+    'unverified_sshd_config_invocation unverified_sshd_crypto_arguments valid_original_ed25519_key_required validated_source_constraint_required '
 ).split())
 
 
@@ -123,10 +125,10 @@ def installer(source):
     return module
 
 
-def effective(m, path):
+def effective(m, path, crypto=()):
     result = {}
     for user in CONTEXTS:
-        args = [m.SSHD, '-T', '-f', str(path)]
+        args = [m.SSHD, '-T', '-f', str(path)] + list(crypto)
         if user:
             args += ['-C', 'user=' + user + ',host=localhost,addr=127.0.0.1']
         result[user] = m.access_output(args).splitlines()
@@ -189,9 +191,19 @@ def daemon(m):
             raise Refused('unverified_sshd_config_invocation')
         if flag in args:
             args.remove(flag)
+    crypto, names = [], set()
+    for arg in list(args):
+        if not arg.startswith('-o'):
+            continue
+        match = re.fullmatch(r'-o([A-Za-z]+)=([A-Za-z0-9_@.][A-Za-z0-9_@.-]*(?:,[A-Za-z0-9_@.][A-Za-z0-9_@.-]*)*)', arg)
+        if not match or match.group(1) not in CRYPTO_OPTIONS or match.group(1) in names:
+            raise Refused('unverified_sshd_crypto_arguments')
+        names.add(match.group(1)); crypto.append(arg); args.remove(arg)
+    if crypto and (names != CRYPTO_OPTIONS or args):
+        raise Refused('unverified_sshd_crypto_arguments')
     if args not in ([], ['-f', str(CONFIG)]):
         raise Refused('unverified_sshd_config_invocation')
-    data['command'] = flags
+    data['command'] = flags; data['crypto'] = crypto
     return data
 
 
@@ -256,7 +268,8 @@ def run(m, source):
         if MARKER in old:
             raise Refused('existing_repair_requires_review')
         new = old + APPEND
-        before, identity, terminal = effective(m, CONFIG), daemon(m), session()
+        identity, terminal = daemon(m), session()
+        crypto = identity['crypto']; before = effective(m, CONFIG, crypto)
         runner = m.load_runner()
         with m.release_lock(runner):
             ops_absent(m)
@@ -270,9 +283,9 @@ def run(m, source):
             report['stage'] = 'candidate_syntax'
             stage_file(m, CANDIDATE, new, mode, gid, attrs)
             staged = CANDIDATE.lstat(); published_identity = staged.st_dev, staged.st_ino
-            m.access_output([m.SSHD, '-t', '-f', str(CANDIDATE)])
+            m.access_output([m.SSHD, '-t', '-f', str(CANDIDATE)] + crypto)
             report['stage'] = 'candidate_policy'
-            compare(before, effective(m, CANDIDATE))
+            compare(before, effective(m, CANDIDATE, crypto))
             report['stage'] = 'config_switch'
             live = CONFIG.lstat()
             if (m.read_file(CONFIG, mode, gid=gid) != old or
@@ -281,13 +294,13 @@ def run(m, source):
             attempted = True
             os.replace(str(CANDIDATE), str(CONFIG)); m.sync_directory(CONFIG.parent)
             report['stage'] = 'live_syntax'
-            m.access_output([m.SSHD, '-t'])
+            m.access_output([m.SSHD, '-t'] + crypto)
             report['stage'] = 'sshd_reload'
             m.access_output([m.CTL, 'reload', 'sshd.service'])
             report['stage'] = 'live_policy'
             if m.read_file(CONFIG, mode, gid=gid) != new or attributes(CONFIG) != attrs:
                 raise Refused('concurrent_sshd_config_change')
-            compare(before, effective(m, CONFIG))
+            compare(before, effective(m, CONFIG, crypto))
             if daemon(m) != identity or session() != terminal:
                 raise Refused('daemon_or_operator_session_changed')
             verified = True; report['ssh_restricted'] = True
@@ -298,8 +311,16 @@ def run(m, source):
         m.write_new(EVIDENCE / 'ops-stage.json', b'{"keep_deploy_restriction_on_failure":true}\n', 0o600)
         for action in ('check', 'apply'):
             report['stage'] = 'ops_' + action
-            with contextlib.redirect_stdout(io.StringIO()):
-                m.main([action, '--source', str(source), '--manifest-sha256', MANIFEST_SHA])
+            original_output = m.access_output
+            def active_policy_output(args):
+                extra = crypto if args[:2] in ([m.SSHD, '-t'], [m.SSHD, '-T']) else []
+                return original_output(args + extra)
+            m.access_output = active_policy_output
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    m.main([action, '--source', str(source), '--manifest-sha256', MANIFEST_SHA])
+            finally:
+                m.access_output = original_output
         report.update(failed=False, stage='complete', reason='verified_repair_and_ops_install')
     except BaseException as error:
         report['reason'] = safe_reason(error, report['stage'] + '_failed')
@@ -317,14 +338,14 @@ def run(m, source):
                         raise Refused('rollback_refused_concurrent_change')
                     if current == new:
                         stage_file(m, RESTORE, old, mode, gid, attrs)
-                        m.access_output([m.SSHD, '-t', '-f', str(RESTORE)])
+                        m.access_output([m.SSHD, '-t', '-f', str(RESTORE)] + crypto)
                         live = CONFIG.lstat()
                         if (m.read_file(CONFIG, mode, gid=gid) != new or attributes(CONFIG) != attrs or
                                 (live.st_dev, live.st_ino) != published_identity):
                             raise Refused('rollback_refused_concurrent_change')
                         os.replace(str(RESTORE), str(CONFIG)); m.sync_directory(CONFIG.parent)
-                    m.access_output([m.SSHD, '-t']); m.access_output([m.CTL, 'reload', 'sshd.service'])
-                    if effective(m, CONFIG) != before or daemon(m) != identity or session() != terminal or attributes(CONFIG) != attrs:
+                    m.access_output([m.SSHD, '-t'] + crypto); m.access_output([m.CTL, 'reload', 'sshd.service'])
+                    if effective(m, CONFIG, crypto) != before or daemon(m) != identity or session() != terminal or attributes(CONFIG) != attrs:
                         raise Refused('rollback_verification_failed')
                     report.update(rollback='restored', ssh_restricted=False)
             except BlockingIOError:

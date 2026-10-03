@@ -21,6 +21,15 @@ def load(name, path):
 
 r = load('repair_ops_ssh', REPO / 'deploy/native/repair-ops-ssh.py')
 fixtures = load('existing_install_fixtures', REPO / 'scripts/tests/install-ops-check.py')
+CRYPTO = ['-oCiphers=aes256-gcm@openssh.com,aes256-ctr', '-oMACs=hmac-sha2-256-etm@openssh.com',
+          '-oGSSAPIKexAlgorithms=gss-group14-sha256-,gss-nistp256-sha256-',
+          '-oKexAlgorithms=curve25519-sha256,ecdh-sha2-nistp256',
+          '-oHostKeyAlgorithms=ssh-ed25519,rsa-sha2-256', '-oPubkeyAcceptedKeyTypes=ssh-ed25519,rsa-sha2-256',
+          '-oCASignatureAlgorithms=ssh-ed25519,rsa-sha2-256']
+
+
+def argv_bytes(options):
+    return ('\x00'.join(['/usr/sbin/sshd', '-D'] + options) + '\x00').encode()
 
 
 class RepairFixture:
@@ -59,6 +68,10 @@ class RepairFixture:
             self.reloads += 1
             if self.problem == 'title_counter':
                 self.cmdline = b'sshd: /usr/sbin/sshd -D [listener] 7 of 10-100 startups\x00'
+            if self.problem == 'crypto_changed':
+                self.cmdline = self.cmdline.replace(b'-oCiphers=aes256-gcm@openssh.com,aes256-ctr', b'-oCiphers=aes128-ctr')
+            if self.problem == 'flags_changed' and self.reloads == 1:
+                self.cmdline += b'-e\x00'
             if self.problem == 'reload' and self.reloads == 1:
                 raise ValueError('secret fixture stderr must never escape')
             if self.problem == 'ops_race' and self.reloads == 1:
@@ -76,7 +89,8 @@ class RepairFixture:
                 raise ValueError('untrusted SSH parser detail')
             return ''
         if args[:2] == [self.m.SSHD, '-T']:
-            path = Path(args[args.index('-f') + 1]); changed = r.MARKER in path.read_bytes()
+            path = Path(args[args.index('-f') + 1]) if '-f' in args else r.CONFIG
+            changed = r.MARKER in path.read_bytes()
             user = args[args.index('-C') + 1].split(',')[0][5:] if '-C' in args else None
             rows = ['port 22', 'forcecommand none', r.OLD_COMMAND]
             if changed and user == 'aifinance-deploy' and self.problem != 'deploy_conflict':
@@ -238,12 +252,53 @@ class RepairTests(unittest.TestCase):
                         b'sshd: [listener] 0 of 10-100 startups\x00', b'/other/sshd\x00-D\x00'):
             with RepairFixture() as f:
                 f.cmdline = command; result = f.run()
-                self.assertEqual(result['reason'], 'unverified_sshd_config_invocation')
+                self.assertIn(result['reason'], ('unverified_sshd_config_invocation', 'unverified_sshd_crypto_arguments'))
                 self.assertEqual(r.CONFIG.read_bytes(), f.old); self.assertEqual(f.reloads, 0)
         with RepairFixture() as f:
             f.cmdline = b'sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups\x00'
             f.problem = 'title_counter'
             self.assertFalse(f.run()['failed'])
+
+    def test_actual_seven_crypto_tokens_forward_unchanged_to_every_check_and_original_installer(self):
+        # Vendor GSSAPI options are forwarded as evidence; this fixture never
+        # drops them to fit a different local OpenSSH build.
+        with RepairFixture() as f:
+            f.cmdline = argv_bytes(CRYPTO)
+            f.ops.side_effect = lambda args: f.m.access_output([f.m.SSHD, '-T', '-C',
+                'user=aifinance-deploy,host=localhost,addr=127.0.0.1'])
+            self.assertFalse(f.run()['failed'])
+            commands = [args for args in f.commands if args[:2] in ([f.m.SSHD, '-t'], [f.m.SSHD, '-T'])]
+            self.assertGreaterEqual(len(commands), 19)
+            for args in commands:
+                self.assertEqual([arg for arg in args if arg.startswith('-o')], CRYPTO)
+            self.assertEqual(len([args for args in commands if args[1] == '-T' and '-f' not in args]), 2)
+            f.assert_source_unchanged(self)
+        with RepairFixture() as f:
+            original_order = list(reversed(CRYPTO)); f.cmdline = argv_bytes(original_order); f.problem = 'reload'
+            result = f.run(); self.assertEqual(result['rollback'], 'restored')
+            for args in f.commands:
+                if args[:2] in ([f.m.SSHD, '-t'], [f.m.SSHD, '-T']):
+                    self.assertEqual([arg for arg in args if arg.startswith('-o')], original_order)
+
+    def test_crypto_allowlist_rejects_auth_overrides_duplicates_partial_sets_and_malformed_values(self):
+        bad = [CRYPTO + ['-oAuthorizedKeysCommand=none'], CRYPTO + ['-oForceCommand=anything'],
+               CRYPTO + ['-oInclude=/unreviewed'], CRYPTO + [CRYPTO[0]], CRYPTO[:-1],
+               CRYPTO + ['-f', '/unreviewed/config']]
+        bad += [[first] + CRYPTO[1:] for first in ('-oCiphers=+aes256-ctr', '-oCiphers=-aes256-ctr',
+                  '-oCiphers=aes256-ctr,-aes128-ctr', '-oCiphers=aes256-ctr,', '-oCiphers=aes256-ctr ssh-rsa',
+                  '-oCiphers=aes256-ctr;bad', '-oCiphers=', '-oCiphers=aes256/ctr')]
+        for options in bad:
+            with RepairFixture() as f:
+                f.cmdline = argv_bytes(options); result = f.run()
+                self.assertEqual(result['reason'], 'unverified_sshd_crypto_arguments')
+                self.assertEqual(r.CONFIG.read_bytes(), f.old); self.assertEqual(f.reloads, 0); f.ops.assert_not_called()
+
+    def test_any_crypto_value_or_original_flag_change_after_reload_is_rejected(self):
+        for problem in ('crypto_changed', 'flags_changed'):
+            with RepairFixture() as f:
+                f.cmdline = argv_bytes(CRYPTO); f.problem = problem; result = f.run()
+                self.assertEqual(result['reason'], 'daemon_or_operator_session_changed')
+                self.assertTrue(result['failed']); f.ops.assert_not_called()
 
     def test_selinux_label_preserved_for_candidate_and_rollback(self):
         with RepairFixture() as f:
