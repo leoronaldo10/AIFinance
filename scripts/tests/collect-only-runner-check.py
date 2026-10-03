@@ -301,6 +301,61 @@ class CollectorFixtures(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(ValueError,'resource_evidence_missing'):m.run_unit('probe',USER)
 
+    def test_inactive_unloaded_unit_starts_without_reset_failed(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+            active=iter(['inactive','activating','inactive','inactive'])
+            def prop(unit,name):
+                if name=='ActiveState':return next(active)
+                return {'MainPID':'123','Result':'success','ExecMainStatus':'0'}[name]
+            def cmd(args,**kw):
+                if args[1]=='reset-failed':
+                    raise subprocess.CalledProcessError(1,args,stderr='Unit not loaded')
+                return ''
+            stack.enter_context(patch.object(m,'STATE',Path(d)))
+            for key in ('verify_units','verify_network','trusted'):
+                stack.enter_context(patch.object(m,key))
+            stack.enter_context(patch.object(m.os,'fchown'))
+            call=stack.enter_context(patch.object(m,'command',side_effect=cmd))
+            stack.enter_context(patch.object(m,'prop',side_effect=prop))
+            stack.enter_context(patch.object(m,'resource_evidence',return_value={'kernel':'fixture'}))
+            stack.enter_context(patch.object(m.time,'sleep'))
+            self.assertEqual(len(m.run_unit('probe',USER)['samples']),1)
+            self.assertEqual([c[0][0][1:] for c in call.call_args_list],
+                             [['start','--no-block','aifinance-collect-probe.service']])
+
+    def test_failed_unit_reset_error_still_stops_before_start(self):
+        for reset_fails in (False,True):
+            with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+                state=Path(d);active=iter(['failed','activating','inactive','inactive'])
+                def prop(unit,name):
+                    if name=='ActiveState':return next(active)
+                    return {'MainPID':'123','Result':'success','ExecMainStatus':'0'}[name]
+                def cmd(args,**kw):
+                    if reset_fails and args[1]=='reset-failed':
+                        raise subprocess.CalledProcessError(1,args)
+                    return ''
+                stack.enter_context(patch.object(m,'STATE',state))
+                for key in ('verify_units','verify_network','trusted'):
+                    stack.enter_context(patch.object(m,key))
+                stack.enter_context(patch.object(m.os,'fchown'))
+                call=stack.enter_context(patch.object(m,'command',side_effect=cmd))
+                stack.enter_context(patch.object(m,'prop',side_effect=prop))
+                stack.enter_context(patch.object(m,'resource_evidence',return_value={'kernel':'fixture'}))
+                stack.enter_context(patch.object(m.time,'sleep'))
+                if reset_fails:
+                    with self.assertRaises(subprocess.CalledProcessError):m.run_unit('probe',USER)
+                else:self.assertEqual(len(m.run_unit('probe',USER)['samples']),1)
+                calls=[c[0][0][1:] for c in call.call_args_list]
+                self.assertEqual(calls,[['reset-failed','aifinance-collect-probe.service']]+
+                                 ([] if reset_fails else [['start','--no-block','aifinance-collect-probe.service']]))
+                self.assertFalse((state/'launch.json').exists())
+
+    def test_nonidle_unit_refused_before_any_state_write(self):
+        for active in ('active','activating','deactivating','reloading','','unknown'):
+            with patch.object(m,'verify_units'),patch.object(m,'verify_network'),patch.object(m,'prop',return_value=active),patch.object(m,'command') as call,patch.object(m,'replace_owned') as replace:
+                with self.assertRaisesRegex(ValueError,'collector_unit_already_running'):m.run_unit('probe',USER)
+                call.assert_not_called();replace.assert_not_called()
+
     def test_launch_requires_live_root_controller_and_mode_gates(self):
         launch={'mode':'run','pid':123,'start_ticks':'999'}
         def proc(path):

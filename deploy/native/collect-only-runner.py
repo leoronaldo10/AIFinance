@@ -562,10 +562,14 @@ def execute(mode):
 def run_unit(mode, user):
     unit = unit_name(mode)
     verify_units(); verify_network(user)
-    if prop(unit, 'ActiveState') not in ('inactive', 'failed'):
+    initial_state = prop(unit, 'ActiveState')
+    if initial_state not in ('inactive', 'failed'):
         raise ValueError('collector_unit_already_running')
     replace_owned(STATE / 'output.json', '')
-    command([CTL, 'reset-failed', unit])
+    # systemd 239 may unload an inactive unit between queries. ResetFailedUnit
+    # does not load it again; StartUnit does. Only a failed unit needs resetting.
+    if initial_state == 'failed':
+        command([CTL, 'reset-failed', unit])
     started = time.monotonic(); samples = []
     launch = STATE / 'launch.json'
     write_new(launch, json.dumps({'mode': mode, 'pid': os.getpid(), 'start_ticks': Path('/proc/self/stat').read_text().split(') ', 1)[1].split()[19]}))
