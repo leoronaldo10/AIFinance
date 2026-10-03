@@ -50,7 +50,7 @@ class UpgradeSafety(unittest.TestCase):
 
     def test_current_requires_exact_old_and_no_ready(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root / 'state').mkdir(); (root / 'shared').mkdir(); old = root / 'releases' / m.OLD
+            root = Path(directory); root.chmod(0o755); (root / 'state').mkdir(); (root / 'state').chmod(0o755); (root / 'shared').mkdir(); old = root / 'releases' / m.OLD
             old.mkdir(parents=True); (old / 'RELEASE_SHA').write_text(m.OLD+'\n'); (root / 'state/current').symlink_to(old)
             with patch.object(m, 'ROOT', root):
                 m.current_old()
@@ -103,22 +103,67 @@ class UpgradeSafety(unittest.TestCase):
 
     def test_existing_lock_inode_is_not_created_or_replaced(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root / 'state').mkdir()
-            with patch.object(m, 'ROOT', root), patch.object(m, 'account', return_value=SimpleNamespace(pw_uid=os.getuid())):
+            root = Path(directory); root.chmod(0o755); (root / 'state').mkdir(); (root / 'state').chmod(0o755)
+            with patch.object(m, 'ROOT', root), patch.object(m, 'account', return_value=SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())), patch.object(m,'trusted'):
                 with self.assertRaises(FileNotFoundError):
                     with m.release_lock(): pass
-                p = root / 'state/release.lock'; p.write_text('must not truncate'); ino = p.stat().st_ino
+                p = root / 'state/release.lock'; p.write_text('must not truncate'); p.chmod(0o644); ino = p.stat().st_ino
                 with m.release_lock():
                     self.assertEqual(p.read_text(), 'must not truncate')
                 self.assertEqual(ino, p.stat().st_ino)
 
     def test_attempting_second_lock_fails(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root / 'state').mkdir(); (root / 'state/release.lock').touch()
-            with patch.object(m, 'ROOT', root), patch.object(m, 'account', return_value=SimpleNamespace(pw_uid=os.getuid())):
+            root = Path(directory); root.chmod(0o755); (root / 'state').mkdir(); (root / 'state').chmod(0o755); (root / 'state/release.lock').touch(); (root / 'state/release.lock').chmod(0o644)
+            with patch.object(m, 'ROOT', root), patch.object(m, 'account', return_value=SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())), patch.object(m,'trusted'):
                 with m.release_lock():
                     with self.assertRaises(BlockingIOError):
                         with m.release_lock(): pass
+
+    def test_absent_canonical_lock_created_only_for_apply_with_deploy_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);root.chmod(0o755);(root/'state').mkdir();(root/'state').chmod(0o755)
+            user=SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())
+            with patch.object(m,'ROOT',root),patch.object(m,'account',return_value=user),patch.object(m,'trusted'):
+                self.assertIsNone(m.lock_info());self.assertFalse((root/'state/release.lock').exists())
+                previous=os.umask(0o077)
+                try:
+                    with m.release_lock(create=True):
+                        path=root/'state/release.lock';st=path.stat()
+                        self.assertEqual((st.st_uid,st.st_gid,st.st_mode & 0o777),(os.getuid(),os.getgid(),0o644))
+                        first=st.st_ino
+                finally:os.umask(previous)
+                with m.release_lock(create=True):self.assertEqual((root/'state/release.lock').stat().st_ino,first)
+
+    def test_existing_lock_symlink_and_wrong_mode_are_not_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);root.chmod(0o755);(root/'state').mkdir();(root/'state').chmod(0o755)
+            path=root/'state/release.lock';path.write_text('preserve');path.chmod(0o600)
+            with patch.object(m,'ROOT',root),patch.object(m,'account',return_value=SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())),patch.object(m,'trusted'):
+                with self.assertRaises(ValueError):
+                    with m.release_lock(create=True):pass
+                self.assertEqual(path.stat().st_mode & 0o777,0o600)
+                path.unlink();path.symlink_to(root/'missing')
+                with self.assertRaises(ValueError):
+                    with m.release_lock(create=True):pass
+                self.assertTrue(path.is_symlink())
+
+    def test_absent_backup_parent_is_read_only_until_apply_and_umask_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);backups=base/'backups'/'aifinance-collect-only'
+            real_stat=Path.stat
+            def root_group(path,*args,**kwargs):
+                values=list(real_stat(path,*args,**kwargs));values[5]=0;return os.stat_result(values)
+            with patch.object(m,'BACKUPS',backups),patch.object(m,'trusted'),patch.object(m.os,'fchown'),patch.object(m.Path,'stat',root_group):
+                self.assertFalse(m.backup_parent());self.assertFalse(backups.parent.exists())
+                previous=os.umask(0o077)
+                try:self.assertTrue(m.backup_parent(create=True))
+                finally:os.umask(previous)
+                self.assertEqual(backups.parent.stat().st_mode & 0o777,0o755)
+                self.assertFalse(backups.exists())
+                backups.parent.chmod(0o700)
+                with self.assertRaises(ValueError):m.backup_parent(create=True)
+                self.assertEqual(backups.parent.stat().st_mode & 0o777,0o700)
 
     def test_default_check_cannot_apply_stage_or_start(self):
         with patch.object(m, 'preflight', return_value={}) as preflight, patch.object(m, 'apply') as apply, patch.object(m, 'stage') as stage, patch.object(m, 'restore_child') as restore, patch('sys.stdout', new_callable=io.StringIO) as out:

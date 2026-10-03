@@ -284,6 +284,44 @@ def quiet_database():
             raise ValueError('unreviewed_aifinance_writer_or_timer')
 
 
+def backup_parent(create=False):
+    parent = BACKUPS.parent
+    if not parent.exists() and not parent.is_symlink():
+        trusted(parent.parent, directory=True)
+        if not create:
+            return False
+        parent.mkdir(mode=0o700)
+        # Only the new directory is assigned root:root; existing paths are never repaired.
+        fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
+    trusted(parent, directory=True)
+    if stat.S_IMODE(parent.stat().st_mode) != 0o755 or parent.stat().st_gid != 0:
+        raise ValueError('backup_parent_mode_mismatch')
+    return True
+
+
+def lock_info():
+    deploy = account('aifinance-deploy')
+    for parent in (ROOT, ROOT / 'state'):
+        st = parent.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid not in (0, deploy.pw_uid) or stat.S_IMODE(st.st_mode) != 0o755:
+            raise ValueError('release_lock_parent_mismatch')
+    trusted(ROOT.parent, directory=True)
+    path = ROOT / 'state/release.lock'
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != deploy.pw_uid or
+            info.st_gid != deploy.pw_gid or stat.S_IMODE(info.st_mode) != 0o644):
+        raise ValueError('existing_release_lock_owner_mode_mismatch')
+    return info
+
+
 def preflight(expected):
     if os.getuid() != 0 or os.geteuid() != 0:
         raise ValueError('root_administrator_required')
@@ -301,6 +339,8 @@ def preflight(expected):
     current_old()
     absent(STATE / 'collect-only-upgrade.json')
     size = archive_check(expected)
+    backup_parent_exists = backup_parent()
+    lock_exists = lock_info() is not None
     manifest, names = exact_schema(ROOT / 'releases' / OLD, OLD_SCHEMA)
     if small(ROOT / 'shared/schema.sha256') != manifest.encode():
         raise ValueError('shared_schema_mismatch')
@@ -321,27 +361,48 @@ def preflight(expected):
     database_size = int(psql("SELECT pg_catalog.pg_database_size(current_database())"))
     required = database_size * 4 + size * 4 + 1024 ** 3
     for path in (ROOT, Path('/var/lib'), Path('/var/backups')):
-        if shutil.disk_usage(str(path)).free < required:
+        existing = path if path.exists() else path.parent
+        if shutil.disk_usage(str(existing)).free < required:
             raise ValueError('backup_restore_artifact_disk_reserve_insufficient')
     memory = re.search(r'^MemAvailable:\s+(\d+) kB$', Path('/proc/meminfo').read_text(), re.M)
     if not memory or int(memory.group(1)) < 700 * 1024:
         raise ValueError('maintenance_memory_reserve_insufficient')
     return {'old_release': OLD, 'release': NEW, 'archive_sha256': expected,
             'database_bytes': database_size, 'required_free_bytes': required,
-            'migrations': names, 'native_ready_written': False}
+            'migrations': names, 'native_ready_written': False, 'backup_parent_exists': backup_parent_exists,
+            'release_lock_exists': lock_exists}
 
 
 @contextlib.contextmanager
-def release_lock():
-    # Do not replace or truncate the deploy account's existing lock inode.
+def release_lock(create=False):
+    # Reuse the deploy account's inode, or create that very canonical lock with
+    # its existing expected owner/mode. Never truncate, repair or replace one.
+    info = lock_info()
     path = ROOT / 'state/release.lock'
-    fd = os.open(str(path), os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if info is None and not create:
+        raise FileNotFoundError('canonical_release_lock_absent')
+    if info is None:
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            info = lock_info()
+            if info is None:
+                raise ValueError('release_lock_creation_race')
+            fd = os.open(str(path), os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        else:
+            deploy = account('aifinance-deploy')
+            os.fchown(fd, deploy.pw_uid, deploy.pw_gid)
+            os.fchmod(fd, 0o644)
+    else:
+        fd = os.open(str(path), os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        s = os.fstat(fd)
-        if not stat.S_ISREG(s.st_mode) or s.st_uid not in (0, account('aifinance-deploy').pw_uid):
-            raise ValueError('unsafe_release_lock')
+        actual = os.fstat(fd)
+        expected = lock_info()
+        if expected is None or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError('release_lock_replaced')
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if (path.lstat().st_dev, path.lstat().st_ino) != (s.st_dev, s.st_ino):
+        expected = lock_info()
+        if expected is None or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
             raise ValueError('release_lock_replaced')
         yield
     finally:
@@ -616,7 +677,8 @@ def restore_backup(backup, run, before):
 
 
 def apply(expected):
-    with release_lock():
+    preflight(expected)  # No lock/directory creation before read-only checks pass.
+    with release_lock(create=True):
         report = preflight(expected)
         snapshot_archive(expected)
         command(['/usr/sbin/runuser', '-u', 'aifinance-deploy', '--', '/usr/bin/python3', '-I', '-B', str(BIN / 'collect-only-upgrade.py'), 'stage', '--archive-sha256', expected], timeout=150)
@@ -626,6 +688,7 @@ def apply(expected):
         if names != sorted(report['migrations'] + [MIGRATION]):
             raise ValueError('only_0041_allowed')
         old_listener = helper('first-preview.py').listeners()['8000']
+        backup_parent(create=True)
         protected_dir(STATE); protected_dir(BACKUPS)
         run = time.strftime('%Y%m%d%H%M%S', time.gmtime()) + '-' + os.urandom(4).hex()
         evidence = BACKUPS / run

@@ -3,6 +3,7 @@
 import ast
 import copy
 import hashlib
+from contextlib import ExitStack
 import importlib.util
 import io
 import json
@@ -250,7 +251,17 @@ class CollectorFixtures(unittest.TestCase):
             def read(path,*args):return configuration if str(path)=='/etc/aifinance-preview.env' else actual_read(path,*args)
             old=m.os.umask(0o077)
             try:
-                with patch.object(m,'ROOT',root),patch.object(m,'STATE',state),patch.object(m,'CONFIG',config),patch.object(m,'SYSTEM',system),patch.object(m,'MAINTENANCE',maintenance),patch.object(m,'upgrade_gate'),patch.object(m,'validate_release'),patch.object(m,'trusted'),patch.object(m,'prop',return_value='not-found'),patch.object(m,'account',return_value=USER),patch.object(m.pwd,'getpwnam',return_value=USER),patch.object(m,'no_processes'),patch.object(m.os,'chown'),patch.object(m.os,'fchown'),patch.object(m,'configure_network'),patch.object(m,'command'),patch.object(m,'verify_units'),patch.object(m,'read',side_effect=read),patch.object(m.Path,'stat',st):
+                with ExitStack() as stack:
+                    for target, key, value in [(m,'ROOT',root),(m,'STATE',state),(m,'CONFIG',config),(m,'SYSTEM',system),(m,'MAINTENANCE',maintenance),(m.Path,'stat',st)]:
+                        stack.enter_context(patch.object(target,key,value))
+                    for key in ('upgrade_gate','validate_release','trusted','no_processes','configure_network','command','verify_units'):
+                        stack.enter_context(patch.object(m,key))
+                    stack.enter_context(patch.object(m,'prop',return_value='not-found'))
+                    stack.enter_context(patch.object(m,'account',return_value=USER))
+                    stack.enter_context(patch.object(m.pwd,'getpwnam',return_value=USER))
+                    stack.enter_context(patch.object(m.os,'chown'))
+                    stack.enter_context(patch.object(m.os,'fchown'))
+                    stack.enter_context(patch.object(m,'read',side_effect=read))
                     result=m.install()
                 self.assertFalse(result['timer_installed'])
                 self.assertEqual(config.stat().st_mode & 0o777,0o750)

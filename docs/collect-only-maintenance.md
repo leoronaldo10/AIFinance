@@ -43,12 +43,12 @@
 
 ### Upgrade apply
 
-- 持有既有 `state/release.lock` 的同一 flock；拒绝缺失/替换锁，不覆盖它
+- 持有 `state/release.lock` 的同一 flock；已有锁须为既有 deploy UID/GID、0644、非链接普通文件，不能覆盖或修复。若首次维护尚无锁，check 只报告缺失，apply 在只读前置核验通过后独占创建同一路径、同 owner/mode，再持锁复核；不扩展 deploy 权限
 - 将已核验上传制品复制到 root-owned `/opt/aifinance/maintenance-inputs`，再次核对复制后 SHA256；只有 deploy 身份运行现有受审 extractor，绝不执行上传 JS 为 deploy/root
 - 新 release 用 nofollow 文件描述符冻结为 root-owned 只读树。既有受限 deploy 身份及其目录重命名权仍属信任边界；不新增其能力、不更改现有 releases 父目录归属
 - 只停止 API/Web 两个 unit；DB、既有 egress 和旧 8000 保持。检查无 UID989 进程、无其它数据库会话、无未知活跃 aifinance unit/timer。管理员仍须确认无另名 cron/外部写入器；不能仅凭瞬时会话为零证明不存在将来的外部写入
 - 以实际非超级用户应用登录读取表计数、完整逐行内容哈希、旧账本、owner/ACL/extension/role/sequence 元数据。禁止读取或记录角色密码哈希。单次输出超过1MiB或查询超时即停，大表触发此上限不等于备份损坏，不能取消边界强跑
-- PG17 custom-format 全库备份为 root-only 0600，立即持久化哈希/大小/时间和基线证据，位置 `/var/backups/aifinance-collect-only/<run-id>`
+- PG17 custom-format 全库备份为 root-only 0600，立即持久化哈希/大小/时间和基线证据，位置 `/var/backups/aifinance-collect-only/<run-id>`。目标机若尚无 `/var/backups`，check 只核对 `/var` 所在文件系统剩余空间，apply 仅新建 root-owned0755 父目录；既有路径/owner/mode不符即停，不递归修改归属
 - 独立短期 PG17 恢复单元以现有应用 OS UID989 运行、PrivateNetwork、只允许 AF_UNIX、无 TCP listener、私有 0700 socket、空 caps/NNP、MemoryLimit256MiB/Tasks32/240秒上限。隐藏生产 env、生产数据目录及 DB socket；不传生产密码，不改 HBA。临时集群的数据库超级用户不能访问生产服务或取得 OS root
 - 在独立集群完整恢复包含 ownership/ACL 的备份，再以该集群真实非超级用户 app 登录比较计数、逐行哈希、账本、owner/ACL/extension/role/sequence。当前只支持精确既有 app 角色与 app/postgres/pg_database_owner 依赖；未知依赖失败停止，不能静默跳过
 - 恢复成功证据含实际 cgroup v1 memory+pids 限额、UID/权限、peak/failcnt；确认通过才清理本次独占临时叶目录，失败目录保留。所有备份/验收记录保留
