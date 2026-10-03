@@ -43,3 +43,9 @@ Public workflow output is bounded JSON with allowlisted statuses, checks and cou
 This entry does not accept a new root helper through SSH upload, generalize database migrations, sign off `native-ready`, or certify load/reboot recovery. A new root-code fix still needs code review, exact hash approval and a fixed update procedure. An application upgrade retains the existing separate schema and deployment checks.
 
 Offline fixtures, real Python 3.6 CI and disposable PostgreSQL tests verify code paths. Actual target resource enforcement and first-batch behavior must still be observed through the fixed entry before enabling the schedule.
+
+## Existing cloud SSH key hooks
+
+`repair-ops-ssh.py` is a separately reviewed, root-terminal-only repair for the known cloud SSH key lookup. It reuses the five unchanged, pinned installer inputs. It appends a restriction for `aifinance-deploy` only and accepts the candidate only when full effective global, root, and preview-account policies are unchanged and the deployment account differs solely in `AuthorizedKeysCommand none`. Existing conflicting policy or an unknown configuration layout stops the repair. The original configuration and repair evidence remain private and are preserved.
+
+The repair validates syntax before an atomic replacement, reloads the existing SSH daemon, then verifies its identity and effective policies. A failed SSH phase restores only a recognized configuration. Once SSH verification succeeds and ops installation starts, failure keeps the deployment-account restriction: a partial privileged ops installation must not regain alternate key access. The unchanged installer then checks and applies its original gates. Output includes a bounded stage and safe reason; preserve the evidence and do not retry a partial operation automatically.
