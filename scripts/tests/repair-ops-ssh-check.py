@@ -138,6 +138,32 @@ class RepairTests(unittest.TestCase):
                 self.assertEqual(result['reason'], reason); self.assertEqual(r.CONFIG.read_bytes(), original)
                 self.assertFalse(r.EVIDENCE.exists()); f.ops.assert_not_called()
 
+    def test_exact_disjoint_preview_none_block_preserves_target_style_config(self):
+        with RepairFixture() as f:
+            original = (f.old + b'AuthorizedKeysCommandUser nobody\nMatch User aifinance-preview\n'
+                        b'    AuthorizedKeysCommand none\nMatch all\n')
+            r.CONFIG.write_bytes(original)
+            result = f.run()
+            self.assertFalse(result['failed']); self.assertTrue(result['ssh_restricted'])
+            self.assertEqual(r.CONFIG.read_bytes(), original + r.APPEND)
+            self.assertEqual((r.EVIDENCE / 'sshd_config.before').read_bytes(), original)
+            f.assert_source_unchanged(self)
+
+    def test_preview_allowance_rejects_overlap_unknown_conditions_and_resets_each_match(self):
+        selectors = ('User aifinance-deploy', 'User *', 'User aifinance-preview,aifinance-deploy',
+                     'User !aifinance-preview', 'User aifinance-preview Group privileged',
+                     'User aifinance-preview Address 127.0.0.1', 'Group aifinance-preview',
+                     'User "aifinance-preview"', 'all')
+        for selector in selectors:
+            raw = ('Match ' + selector + '\n AuthorizedKeysCommand none\n').encode()
+            with self.assertRaisesRegex(r.Refused, 'earlier_match_key_command_requires_review'):
+                r.config_scope(raw)
+        for suffix in (b' AuthorizedKeysCommand /different\n',
+                       b' AuthorizedKeysCommand none extra\n',
+                       b' AuthorizedKeysCommand none\nMatch all\n AuthorizedKeysCommand none\n'):
+            with self.assertRaisesRegex(r.Refused, 'earlier_match_key_command_requires_review'):
+                r.config_scope(b'Match User aifinance-preview\n' + suffix)
+
     def test_reload_failure_restores_known_config_without_leaking_error(self):
         with RepairFixture() as f:
             f.problem = 'reload'; result = f.run()

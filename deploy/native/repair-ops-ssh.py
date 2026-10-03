@@ -147,7 +147,7 @@ def compare(before, after):
 
 
 def config_scope(raw):
-    matched = False
+    matched, preview_only = False, False
     for line in raw.decode('utf-8', 'strict').splitlines():
         keyword = re.match(r'^\s*([A-Za-z][A-Za-z0-9]*)(?:\s|=|$)', line)
         if not keyword:
@@ -157,8 +157,13 @@ def config_scope(raw):
             raise Refused('include_requires_separate_review')
         if key == 'match':
             matched = True
+            words = line.split()
+            preview_only = (len(words) == 3 and words[0].lower() == 'match' and
+                            words[1].lower() == 'user' and words[2] == 'aifinance-preview')
         if matched and key == 'authorizedkeyscommand':
-            raise Refused('earlier_match_key_command_requires_review')
+            words = line.split()
+            if not (preview_only and len(words) == 2 and words[0].lower() == 'authorizedkeyscommand' and words[1] == 'none'):
+                raise Refused('earlier_match_key_command_requires_review')
 
 
 def daemon(m):
