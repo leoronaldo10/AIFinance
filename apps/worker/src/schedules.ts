@@ -98,6 +98,7 @@ export const SCHEDULES: Scheduled[] = [
 
 export async function registerSchedules(boss: PgBoss) {
   for (const s of SCHEDULES) {
+    if (FEATURES.editorialReview && /^(reports\.|hot\.|stories\.)/.test(s.name)) continue;
     const queue = `cron.${s.name}`;
     await ensureQueue(queue, { policy: "singleton", retryLimit: 1, expireInSeconds: 3600 });
     await boss.schedule(queue, s.cron, {}, { tz: "Asia/Shanghai", missed: s.missed ?? "skip" });
@@ -105,7 +106,7 @@ export async function registerSchedules(boss: PgBoss) {
     await boss.work(queue, { pollingIntervalSeconds: 15 }, async () => recordRun(s.name, s.run));
   }
   // A schedule removed from the table (a module switched off) must not keep firing from an earlier run.
-  const names = new Set(SCHEDULES.map((s) => `cron.${s.name}`));
+  const names = new Set(SCHEDULES.filter(s => !FEATURES.editorialReview || !/^(reports\.|hot\.|stories\.)/.test(s.name)).map((s) => `cron.${s.name}`));
   for (const existing of await boss.getSchedules()) {
     if (existing.name.startsWith("cron.") && !names.has(existing.name)) await boss.unschedule(existing.name);
   }

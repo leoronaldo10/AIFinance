@@ -14,6 +14,10 @@ for (const name of Object.keys(process.env)) if (/_MODEL$/.test(name) && name !=
 const T = tag();
 const SOURCE = `test-default-model-${T}`;
 const seen: Array<{ model: string; system: string }> = [];
+const finance = {
+  relevance: "公开样表可用于评估字段整理能力。", scenarios: ["表格整理"], availability: "unknown",
+  conditions: "地区和价格尚未核实。", nextStep: "先核对开放范围。", limitations: "仅根据公告，未实测。", evidence: "announcement",
+};
 const provider = await stub((_hit, req) => {
   const body = JSON.parse(req.body) as { model: string; messages: Array<{ role: string; content: unknown }> };
   const system = body.messages[0]!.role === "system" ? String(body.messages[0]!.content) : "";
@@ -22,7 +26,7 @@ const provider = await stub((_hit, req) => {
   const content =
     system.includes("宽召回") ? { label: "PASS", reason: "测试" }
     : system.includes("事件注意力评分器") ? { attentionScore: 80 }
-    : system.includes("内容理解编辑") ? { itemType: "product_launch", authorRole: "principal", tags: ["产品更新"], editorialJudgment: "理由", titleZh: "一个模型的标题", summaryZh: "一个模型写的摘要。第二句。" }
+    : system.includes("内容理解编辑") ? { itemType: "product_launch", authorRole: "principal", tags: ["产品更新"], editorialJudgment: "理由", titleZh: "一个模型的标题", summaryZh: "一个模型写的摘要。第二句。", finance }
     : system.includes("资料结构化助手") ? { category: "ai-products", tags: ["产品更新"], subjects: [], fact: null }
     : user.includes("title_zh") ? "title_zh: 标题\nsummary_zh: 摘要。"
     : null;
@@ -48,6 +52,8 @@ test("one model runs the prefilter, both scores, the writing and the structure",
   const res = await analyzeArticle(articleId);
   assert.equal(res!.output!.selected, true);
   assert.equal(res!.output!.titleZh, "一个模型的标题");
+  assert.deepEqual(res!.output!.finance, finance, "financial conditions survive model validation and storage");
+  assert.deepEqual((await sql`SELECT output->'finance' AS finance FROM analyses WHERE article_id=${articleId}`)[0]!.finance, finance);
   assert.equal(seen.length, 5, "prefilter, two scores, understand, structure");
   assert.ok(seen.every((r) => r.model === "one-model"), "every request names the configured model");
   const services = await sql<{ service: string }[]>`SELECT DISTINCT service FROM receipts WHERE subject LIKE ${`article:${articleId}%`}`;

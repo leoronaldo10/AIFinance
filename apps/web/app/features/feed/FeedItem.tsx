@@ -1,3 +1,4 @@
+import { AVAILABILITY_LABELS } from "@aihot/contracts/editorial";
 // One report in a feed. Desktop (≥ 961px): a white card beside the time rail. Mobile: a compact row
 // with a divider, the reason in a grey box. One markup, two presentations, as on the original site.
 import { memo } from "react";
@@ -67,6 +68,7 @@ export const FeedItem = memo(function FeedItem({ item, group, filters, read = fa
         </>
       )}
 
+      {item.finance && <div className="mt-3 rounded-control bg-accent-soft/50 p-3 text-sm"><p className="mb-1 font-medium text-accent">{AVAILABILITY_LABELS[item.finance.availability]} · {item.finance.scenarios.slice(0,2).join(" / ")}</p><p className="line-clamp-2 leading-relaxed text-ink-2">{item.finance.relevance}</p></div>}
       {isX && item.x!.media.length > 0 && <MediaThumbs media={item.x!.media} className="mt-2.5" />}
       {isX && item.x!.quoted?.text && <QuotedLine quoted={item.x!.quoted} />}
 

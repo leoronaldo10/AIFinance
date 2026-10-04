@@ -19,7 +19,7 @@ export interface TopicRow {
 
 type TopicCount = { slug: string; total: number; recent: number; pages: number; indexable: boolean; latest: Date | null };
 const topicsCache = cached(
-  () => sql<TopicRow[]>`SELECT slug, name, grp, entity_id, tags, definition, related, position FROM topics ORDER BY position`,
+  () => sql<TopicRow[]>`SELECT slug, name, grp, entity_id, tags, definition, related, position FROM topics WHERE active ORDER BY position`,
   { freshMs: 60_000, maxStaleMs: 10 * 60_000 },
 );
 // Counts may lag by about a minute, like the public directory cache; item reads always check visibility.
@@ -41,6 +41,7 @@ export async function seedTopics(): Promise<number> {
       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name, grp = EXCLUDED.grp, entity_id = EXCLUDED.entity_id,
         tags = EXCLUDED.tags, definition = EXCLUDED.definition, related = EXCLUDED.related, position = EXCLUDED.position`;
   }
+  await sql`UPDATE topics SET active = (slug = ANY(${data.topics.map(t => t.slug)}::text[]))`;
   topicsCache.clear();
   countsCache.clear();
   return data.topics.length;
@@ -80,7 +81,7 @@ export function topicPageCounts(): Promise<TopicCount[]> {
  */
 async function queryTopicCounts(): Promise<TopicCount[]> {
   const [topics, items] = await Promise.all([
-    sql<Array<Pick<TopicRow, "slug" | "entity_id" | "tags">>>`SELECT slug, entity_id, tags FROM topics ORDER BY position`,
+    sql<Array<Pick<TopicRow, "slug" | "entity_id" | "tags">>>`SELECT slug, entity_id, tags FROM topics WHERE active ORDER BY position`,
     sql<{ tags: string[]; timeline_at: Date }[]>`SELECT p.tags, p.timeline_at FROM publications p WHERE p.visibility = 'public' AND p.selected`,
   ]);
   const recentFrom = Date.now() - 30 * 86400_000;
