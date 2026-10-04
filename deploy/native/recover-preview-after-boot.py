@@ -67,6 +67,16 @@ COLLECT_SIZES = {'installed.json': 67, 'probe.json': 46767, 'seed-attempt.json':
                  'network.json': 25, 'output.json': 0}
 ACTIONS = ['diagnose', 'restart-preview', 'probe', 'recover-pre-seed', 'seed', 'run', 'disable', 'enable-hourly']
 HOOKS = ('ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload')
+# v239 omits these empty structured arrays from systemctl show. Only a typed
+# D-Bus zero-length array proves absence; missing metadata itself proves nothing.
+OMITTED_ARRAYS = dict((name, 'a(sasbttttuii)') for name in HOOKS)
+OMITTED_ARRAYS['EnvironmentFiles'] = 'a(sb)'
+SERVICE_PATHS = {
+    API: '/org/freedesktop/systemd1/unit/aifinance_2dpreview_2dapi_2eservice',
+    WEB: '/org/freedesktop/systemd1/unit/aifinance_2dpreview_2dweb_2eservice',
+    DB: '/org/freedesktop/systemd1/unit/aifinance_2dpreview_2ddb_2eservice',
+    GUARD: '/org/freedesktop/systemd1/unit/aifinance_2dpreview_2degress_2eservice',
+}
 PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'Result', 'MainPID', 'ControlPID',
               'UnitFileState', 'FragmentPath', 'DropInPaths', 'NeedDaemonReload',
               'ExecStart', 'User', 'Group', 'BindsTo', 'After', 'Requires', 'Wants',
@@ -199,6 +209,18 @@ def properties(unit, keys=PROPERTIES):
         key, separator, value = line.partition('=')
         require(separator and key in keys and key not in values, 'invalid_unit_metadata')
         values[key] = value
+    missing = set(keys) - set(values)
+    if missing:
+        require(unit in SERVICE_PATHS and missing.issubset(OMITTED_ARRAYS), 'incomplete_unit_metadata')
+        for key in keys:
+            if key not in missing:
+                continue
+            with checking(unit + ':' + key):
+                empty = command(['/usr/bin/busctl', '--system', '--no-pager', 'get-property',
+                                 'org.freedesktop.systemd1', SERVICE_PATHS[unit],
+                                 'org.freedesktop.systemd1.Service', key], timeout=10, maximum=256)
+                require(empty == OMITTED_ARRAYS[key] + ' 0', 'omitted_unit_array_not_verified_empty')
+            values[key] = ''
     require(set(values) == set(keys), 'incomplete_unit_metadata')
     return values
 

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -116,6 +117,95 @@ class RecoveryChecks(unittest.TestCase):
         m.exact_exec(exec_value(expected), expected)
         for value in (exec_value(expected) + ' ' + exec_value('/bin/true'), exec_value(expected).replace('ignore_errors=no', 'ignore_errors=yes')):
             with self.assertRaises(m.Refused): m.exact_exec(value, expected)
+
+    def test_v239_omitted_arrays_require_typed_empty_dbus_proof_for_all_four_units(self):
+        for unit in m.UNITS:
+            expected = unit_values(unit)
+            omitted = {key for key in m.OMITTED_ARRAYS if not expected[key]}
+            text = '\n'.join(key + '=' + value for key, value in expected.items() if key not in omitted)
+            queried = []
+            def command(args, **kwargs):
+                if args[0] == m.CTL:
+                    self.assertEqual(args, [m.CTL, 'show', unit, '--no-pager', '--property=' + ','.join(m.PROPERTIES)])
+                    return text
+                key = args[-1]; queried.append(key)
+                self.assertEqual(args, ['/usr/bin/busctl', '--system', '--no-pager', 'get-property',
+                                        'org.freedesktop.systemd1', m.SERVICE_PATHS[unit],
+                                        'org.freedesktop.systemd1.Service', key])
+                self.assertEqual(kwargs, {'timeout': 10, 'maximum': 256})
+                self.assertIn(key, omitted)
+                return m.OMITTED_ARRAYS[key] + ' 0'
+            with self.subTest(unit=unit), patch.object(m, 'command', side_effect=command), \
+                    patch.object(m, 'read', side_effect=lambda path, **kw: (REPO / 'deploy/native' / path.name).read_bytes()):
+                self.assertEqual(m.properties(unit), expected)
+                self.assertEqual(set(queried), omitted)
+                queried[:] = []
+                m.check_unit(unit)
+                self.assertEqual(set(queried), omitted)
+
+    def test_complete_systemctl_metadata_does_not_need_dbus_fallback(self):
+        expected = unit_values(m.GUARD)
+        text = '\n'.join(key + '=' + value for key, value in expected.items())
+        with patch.object(m, 'command', return_value=text) as command:
+            self.assertEqual(m.properties(m.GUARD), expected)
+            self.assertEqual(command.call_count, 1)
+
+    def test_unsupported_missing_fields_never_default_or_probe_dbus(self):
+        for missing in ('ExecStart', 'User', 'MainPID', 'After', 'Environment', 'PassEnvironment', 'UnknownProperty'):
+            keys = m.PROPERTIES + (('UnknownProperty',) if missing == 'UnknownProperty' else ())
+            text = '\n'.join(key + '=' + value for key, value in unit_values(m.GUARD).items()
+                             if key not in (missing, 'EnvironmentFiles'))
+            with self.subTest(missing=missing), patch.object(m, 'command', return_value=text) as command:
+                with self.assertRaises(m.Refused) as caught: m.properties(m.GUARD, keys)
+                self.assertEqual(caught.exception.reason, 'incomplete_unit_metadata')
+                self.assertEqual(command.call_count, 1)
+        for unit in ('aifinance-collect-run.service', 'unreviewed.service', m.API + '/escape'):
+            with patch.object(m, 'command', return_value='') as command:
+                with self.assertRaises(m.Refused): m.properties(unit, ('ExecStop',))
+                self.assertEqual(command.call_count, 1)
+
+    def test_malformed_duplicate_unknown_metadata_is_rejected_before_dbus(self):
+        for text in ('LoadState', 'LoadState=loaded\nLoadState=loaded', 'Other=unexpected',
+                     '=empty-key', 'LoadState=loaded\n\nUser=root'):
+            with self.subTest(text=text), patch.object(m, 'command', return_value=text) as command:
+                with self.assertRaises(m.Refused) as caught: m.properties(m.GUARD)
+                self.assertEqual(caught.exception.reason, 'invalid_unit_metadata')
+                self.assertEqual(command.call_count, 1)
+
+    def test_dbus_nonempty_wrong_signature_and_malformed_arrays_fail_closed(self):
+        fixtures = {
+            'EnvironmentFiles': ('a(sb) 1 "/unreviewed.env" false', 'a(sasbttttuii) 0', 'as 0'),
+            'ExecStartPost': ('a(sasbttttuii) 1 "/bin/true"', 'a(sb) 0', 'as 0'),
+        }
+        for key, outputs in fixtures.items():
+            for response in outputs + ('', '0', 'a(sb) 0\nSECRET FIXTURE', m.OMITTED_ARRAYS[key] + ' 00'):
+                with self.subTest(key=key, response=response), patch.object(m, 'command', side_effect=['', response]):
+                    with self.assertRaises(m.Refused) as caught: m.properties(m.GUARD, (key,))
+                    self.assertEqual(caught.exception.reason, 'omitted_unit_array_not_verified_empty')
+                    self.assertEqual(caught.exception.target, m.GUARD + ':' + key)
+                    self.assertNotIn('SECRET', repr(caught.exception))
+
+    def test_missing_expected_hooks_are_still_required_after_empty_array_proof(self):
+        for unit, key in ((m.API, 'ExecStartPre'), (m.WEB, 'ExecStartPre'), (m.GUARD, 'ExecStop')):
+            values = unit_values(unit)
+            text = '\n'.join(name + '=' + value for name, value in values.items() if name != key)
+            with self.subTest(unit=unit, key=key), patch.object(m, 'command', side_effect=[text, m.OMITTED_ARRAYS[key] + ' 0']), \
+                    patch.object(m, 'read', side_effect=lambda path, **kw: (REPO / 'deploy/native' / path.name).read_bytes()):
+                with self.assertRaises(m.Refused) as caught: m.check_unit(unit)
+                self.assertEqual(caught.exception.reason, 'effective_command_mismatch')
+
+    def test_unavailable_failing_or_timed_out_dbus_never_proves_empty(self):
+        errors = (FileNotFoundError(2, 'private fixture'), PermissionError(13, 'private fixture'),
+                  m.Refused('command_exit_nonzero'), m.Refused('command_timeout'), m.Refused('command_output_limit'),
+                  subprocess.TimeoutExpired('/usr/bin/busctl', 10), subprocess.CalledProcessError(1, '/usr/bin/busctl'))
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch.object(m, 'command', side_effect=['', error]) as command:
+                with self.assertRaises(m.Refused if isinstance(error, OSError) else type(error)) as caught:
+                    m.properties(m.GUARD, ('EnvironmentFiles',))
+                if isinstance(caught.exception, m.Refused):
+                    self.assertEqual(caught.exception.target, m.GUARD + ':EnvironmentFiles')
+                    self.assertNotIn('private fixture', m.safe_error(caught.exception))
+                self.assertEqual(command.call_count, 2)
 
     def test_unknown_guard_or_collector_table_blocks_before_start(self):
         for name in ('aifinance_collect_egress_v1', 'aifinance_preview_egress_v1', 'aifinance_preview_probe'):
