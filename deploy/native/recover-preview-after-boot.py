@@ -80,6 +80,7 @@ SERVICE_PATHS = {
 PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'Result', 'MainPID', 'ControlPID',
               'UnitFileState', 'FragmentPath', 'DropInPaths', 'NeedDaemonReload',
               'ExecStart', 'User', 'Group', 'BindsTo', 'After', 'Requires', 'Wants',
+              'Slice', 'DefaultDependencies', 'RequiresMountsFor',
               'Requisite', 'OnFailure', 'Environment', 'EnvironmentFiles', 'PassEnvironment',
               'MemoryAccounting', 'MemoryLimit', 'TasksMax', 'Restart') + HOOKS
 
@@ -203,7 +204,11 @@ def command(args, timeout=20, maximum=262144, output=None):
 
 
 def properties(unit, keys=PROPERTIES):
-    text = command([CTL, 'show', unit, '--no-pager', '--property=' + ','.join(keys)])
+    args = [CTL, 'show', unit, '--no-pager', '--property=' + ','.join(keys)]
+    if unit == '-.mount':
+        # The fixed root mount name begins with an option prefix.
+        args = [CTL, 'show', '--no-pager', '--property=' + ','.join(keys), '--', unit]
+    text = command(args)
     values = {}
     for line in text.splitlines():
         key, separator, value = line.partition('=')
@@ -334,7 +339,13 @@ def check_unit(unit):
     require(after.issubset(set(v['After'].split())) and
             not any(x.startswith('aifinance-') and x not in after for x in v['After'].split()),
             'effective_after_dependency_mismatch')
-    require(set(v['Requires'].split()).issubset({'sysinit.target'} | ({GUARD} if app else set())) and
+    mounts = {'/var/tmp'} | ({'/run/aifinance-preview-egress'} if unit == GUARD else
+                            {'/run/aifinance-preview-db'} if unit == DB else set())
+    # Exactly the observed v239 default dependencies, not arbitrary services or
+    # mounts. check_units verifies the already-active generated root mount first.
+    require(set(v['Requires'].split()) == {'-.mount', 'system.slice', 'sysinit.target'} and
+            v['Slice'] == 'system.slice' and v['DefaultDependencies'] == 'yes' and
+            set(v['RequiresMountsFor'].split()) == mounts and
             all(not v[key] for key in ('Wants', 'Requisite', 'OnFailure', 'Environment', 'EnvironmentFiles', 'PassEnvironment')),
             'unexpected_activation_or_environment_dependency')
     starts = {API: '/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py api',
@@ -356,6 +367,10 @@ def check_unit(unit):
 
 
 def check_units():
+    with checking('-.mount'):
+        expected = dict(LoadState='loaded', ActiveState='active', FragmentPath='/run/systemd/generator/-.mount',
+                        SourcePath='/etc/fstab', Where='/', DropInPaths='')
+        require(properties('-.mount', tuple(expected)) == expected, 'reviewed_active_root_mount_required')
     for unit in UNITS:
         with checking(unit):
             check_unit(unit)

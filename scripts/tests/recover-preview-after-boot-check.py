@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,14 @@ def exec_value(command):
     return '{ path=%s ; argv[]=%s ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }' % (command.split()[0], command)
 
 
-def unit_values(unit):
+def root_mount_values():
+    return dict(LoadState='loaded', ActiveState='active', FragmentPath='/run/systemd/generator/-.mount',
+                SourcePath='/etc/fstab', Where='/', DropInPaths='')
+
+
+def unit_values(unit, keys=None):
+    if unit == '-.mount':
+        return root_mount_values()
     app = unit in (m.API, m.WEB)
     identity = 'aifinance' if app else 'postgres' if unit == m.DB else 'root'
     values = dict((name, '') for name in m.PROPERTIES)
@@ -34,17 +42,26 @@ def unit_values(unit):
                   MainPID='0', ControlPID='0', UnitFileState='disabled',
                   FragmentPath=str(m.SYSTEM / unit), NeedDaemonReload='no', User=identity, Group=identity,
                   MemoryAccounting='yes', MemoryLimit=str({m.API: 320, m.WEB: 256, m.DB: 256, m.GUARD: 64}[unit] * 1024 ** 2),
-                  TasksMax='16' if unit == m.GUARD else '64', Restart='on-failure' if app else 'no', Requires='sysinit.target',
-                  After='network.target basic.target sysinit.target system.slice systemd-journald.socket')
+                  TasksMax='16' if unit == m.GUARD else '64', Restart='on-failure' if app else 'no',
+                  Requires='-.mount system.slice sysinit.target', Slice='system.slice', DefaultDependencies='yes',
+                  RequiresMountsFor='/var/tmp')
+    # Target read-only sweep: preserve actual implicit ordering alongside the
+    # explicit guard BindsTo; guard is not also reported in Requires on v239.
+    values['After'] = {
+        m.GUARD: '-.mount firewalld.service systemd-tmpfiles-setup.service basic.target system.slice sysinit.target network.target systemd-journald.socket tmp.mount',
+        m.DB: 'systemd-tmpfiles-setup.service tmp.mount basic.target sysinit.target system.slice -.mount network.target',
+        m.API: 'sysinit.target basic.target system.slice -.mount network.target tmp.mount aifinance-preview-egress.service systemd-journald.socket systemd-tmpfiles-setup.service',
+        m.WEB: 'aifinance-preview-egress.service network.target -.mount systemd-journald.socket systemd-tmpfiles-setup.service basic.target tmp.mount sysinit.target system.slice',
+    }[unit]
     if app:
         values['BindsTo'] = m.GUARD
-        values['After'] += ' ' + m.GUARD
         values['ExecStart'] = exec_value('/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py ' + ('api' if unit == m.API else 'web'))
         values['ExecStartPre'] = exec_value('/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py verify')
     elif unit == m.DB:
+        values['RequiresMountsFor'] += ' /run/aifinance-preview-db'
         values['ExecStart'] = exec_value('/usr/pgsql-17/bin/postgres -D /var/lib/pgsql/aifinance-preview -c config_file=/etc/aifinance-preview-db/postgresql.conf')
     else:
-        values['After'] += ' firewalld.service'
+        values['RequiresMountsFor'] += ' /run/aifinance-preview-egress'
         values['ExecStart'] = exec_value('/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py start')
         values['ExecStop'] = exec_value('/usr/bin/python3 -I -B /opt/aifinance/bin/egress-guard.py stop')
     return values
@@ -102,15 +119,81 @@ class RecoveryChecks(unittest.TestCase):
                    ('Requires', 'sysinit.target aifinance-collect-seed.service'), ('OnFailure', 'other.service'),
                    ('EnvironmentFiles', '/etc/unreviewed.env'), ('MemoryLimit', '999'), ('Restart', 'always')]
         for key, value in changes:
-            def changed(unit):
-                values = unit_values(unit)
+            def changed(unit, keys=None):
+                values = unit_values(unit, keys)
                 if unit == m.API: values[key] = value
                 return values
             with self.subTest(key=key), patch.object(m, 'read', side_effect=data), patch.object(m, 'properties', side_effect=changed), patch.object(m, 'command', return_value=''):
                 with self.assertRaises(m.Refused): m.check_units()
         with patch.object(m, 'read', return_value=b'unreviewed unit'), patch.object(m, 'properties') as prop:
-            with self.assertRaises(m.Refused): m.check_units()
+            with self.assertRaises(m.Refused): m.check_unit(m.GUARD)
             prop.assert_not_called()
+
+    def test_target_dependencies_accept_only_exact_sets_in_any_order(self):
+        for unit in m.UNITS:
+            for ordered in itertools.permutations(('-.mount', 'system.slice', 'sysinit.target')):
+                values = unit_values(unit); values['Requires'] = ' '.join(ordered)
+                values['RequiresMountsFor'] = ' '.join(reversed(values['RequiresMountsFor'].split()))
+                with self.subTest(unit=unit, requires=ordered), patch.object(m, 'properties', return_value=values), \
+                        patch.object(m, 'read', side_effect=lambda path, **kw: (REPO / 'deploy/native' / path.name).read_bytes()):
+                    m.check_unit(unit)
+
+    def test_target_dependencies_refuse_other_mount_service_slice_or_missing_requirement(self):
+        for unit in m.UNITS:
+            expected = unit_values(unit)
+            changes = [('Requires', 'system.slice sysinit.target'), ('Requires', '-.mount sysinit.target'),
+                       ('Requires', '-.mount system.slice'), ('Requires', expected['Requires'] + ' tmp.mount'),
+                       ('Requires', expected['Requires'] + ' other.service'), ('Requires', expected['Requires'] + ' custom.slice'),
+                       ('Requires', expected['Requires'] + ' ' + m.GUARD), ('Slice', 'custom.slice'),
+                       ('DefaultDependencies', 'no'), ('RequiresMountsFor', ''),
+                       ('RequiresMountsFor', expected['RequiresMountsFor'] + ' /tmp'),
+                       ('RequiresMountsFor', '/var/tmp /run/other-service'),
+                       ('Wants', 'tmp.mount'), ('Requisite', 'other.service'), ('OnFailure', 'other.service'),
+                       ('Environment', 'UNREVIEWED=value'), ('EnvironmentFiles', '/etc/unreviewed.env'),
+                       ('PassEnvironment', 'UNREVIEWED'), ('ExecReload', exec_value('/bin/true')),
+                       ('DropInPaths', '/run/unreviewed.conf'), ('NeedDaemonReload', 'yes')]
+            if unit in (m.GUARD, m.DB):
+                changes.append(('RequiresMountsFor', '/var/tmp'))
+            for key, value in changes:
+                values = dict(expected); values[key] = value
+                with self.subTest(unit=unit, key=key, value=value), patch.object(m, 'properties', return_value=values), \
+                        patch.object(m, 'read', side_effect=lambda path, **kw: (REPO / 'deploy/native' / path.name).read_bytes()):
+                    with self.assertRaises(m.Refused): m.check_unit(unit)
+
+    def test_root_mount_proof_is_first_and_uses_option_separator(self):
+        queries = []
+        def command(args, **kwargs):
+            queries.append(args)
+            if args[1] == 'list-jobs': return ''
+            if args[-1] == '-.mount':
+                self.assertEqual(args, [m.CTL, 'show', '--no-pager', '--property=' + ','.join(root_mount_values()), '--', '-.mount'])
+                values = root_mount_values()
+            else:
+                values = unit_values(args[2])
+            return '\n'.join(key + '=' + value for key, value in values.items())
+        with patch.object(m, 'command', side_effect=command), \
+                patch.object(m, 'read', side_effect=lambda path, **kw: (REPO / 'deploy/native' / path.name).read_bytes()):
+            m.check_units()
+        self.assertEqual(queries[0][-2:], ['--', '-.mount'])
+        self.assertEqual(len(queries), 6)
+        self.assertTrue(all(args[1] in ('show', 'list-jobs') for args in queries))
+
+    def test_unverified_root_mount_blocks_all_preview_checks(self):
+        for key, value in (('LoadState', 'not-found'), ('ActiveState', 'inactive'), ('FragmentPath', '/etc/systemd/system/-.mount'),
+                           ('SourcePath', '/etc/other-fstab'), ('Where', '/tmp'), ('DropInPaths', '/run/unreviewed.conf')):
+            values = root_mount_values(); values[key] = value
+            with self.subTest(key=key), patch.object(m, 'properties', return_value=values) as properties, patch.object(m, 'check_unit') as check:
+                with self.assertRaises(m.Refused) as caught: m.check_units()
+                self.assertEqual(caught.exception.reason, 'reviewed_active_root_mount_required')
+                self.assertEqual(caught.exception.target, '-.mount')
+                self.assertEqual(properties.call_count, 1); check.assert_not_called()
+        for missing in root_mount_values():
+            text = '\n'.join(key + '=' + value for key, value in root_mount_values().items() if key != missing)
+            with self.subTest(missing=missing), patch.object(m, 'command', return_value=text) as command, patch.object(m, 'check_unit') as check:
+                with self.assertRaises(m.Refused) as caught: m.check_units()
+                self.assertEqual(caught.exception.reason, 'incomplete_unit_metadata')
+                self.assertEqual(caught.exception.target, '-.mount')
+                self.assertEqual(command.call_count, 1); check.assert_not_called()
 
     def test_extra_effective_command_is_refused(self):
         expected = '/usr/bin/python3 -I /opt/aifinance/bin/run-preview.py api'
@@ -151,7 +234,8 @@ class RecoveryChecks(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
 
     def test_unsupported_missing_fields_never_default_or_probe_dbus(self):
-        for missing in ('ExecStart', 'User', 'MainPID', 'After', 'Environment', 'PassEnvironment', 'UnknownProperty'):
+        for missing in ('ExecStart', 'User', 'MainPID', 'After', 'Environment', 'PassEnvironment',
+                        'Slice', 'DefaultDependencies', 'RequiresMountsFor', 'UnknownProperty'):
             keys = m.PROPERTIES + (('UnknownProperty',) if missing == 'UnknownProperty' else ())
             text = '\n'.join(key + '=' + value for key, value in unit_values(m.GUARD).items()
                              if key not in (missing, 'EnvironmentFiles'))
