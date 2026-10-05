@@ -497,13 +497,14 @@ class RecoveryChecks(unittest.TestCase):
 
 c = load('collector_boot_continuation', REPO / 'deploy/native/continue-collector-after-boot.py')
 cb = load('collector_boot_continuation_proof_fixture', REPO / 'scripts/tests/collector-boot-broker-check.py')
+old_broker = load('continuation_old_broker_checks', REPO / 'deploy/native/ops-broker.py')
 
 
 class ContinuationFixture(FlowFixture):
     def __enter__(self):
         super(ContinuationFixture, self).__enter__()
         for name, value in (('OPS', m.OPS), ('COLLECT', m.COLLECT), ('CONFIG', m.CONFIG),
-                            ('BIN', m.BIN), ('EVIDENCE', m.EVIDENCE), ('PRIOR', m.OPS / 'collector-boot-v2')):
+                            ('BIN', self.u.BIN), ('EVIDENCE', m.EVIDENCE), ('PRIOR', m.OPS / 'collector-boot-v2')):
             self.stack.enter_context(patch.object(c, name, value))
         self.stack.enter_context(patch.object(m, 'RUNNER_SHA_V2', 'a' * 64, create=True))
         self.stack.enter_context(patch.object(m, 'BROKER_SHA_V2', 'b' * 64, create=True))
@@ -582,11 +583,30 @@ class ContinuationFixture(FlowFixture):
         website['preserved_after'][str(db)] = dict(dbmeta)
         for path in (c.OPS / 'install.json', c.UPGRADE_RECORD):
             website['preserved_after'][str(path)] = dict(w.m.attributes(path.lstat()), sha256=c.sha(path.read_bytes()))
-        states = {name: dict(ActiveState='inactive', SubState='dead', Result='success', MainPID='0', ControlPID='0',
+        states = {name: dict(LoadState='loaded', UnitFileState='static', ActiveState='inactive', SubState='dead', Result='success', MainPID='0', ControlPID='0',
                   ExecMainCode='0', ExecMainStatus='0', ExecMainStartTimestampMonotonic='0', ExecMainExitTimestampMonotonic='0')
                   for name in ('probe', 'check', 'seed', 'run')}
         states['check'].update(ActiveState='failed', SubState='failed', Result='signal', ExecMainCode='2', ExecMainStatus='15',
                                ExecMainStartTimestampMonotonic='210', ExecMainExitTimestampMonotonic='220')
+        for name in ('hourly', 'timer'):
+            states[name] = dict(LoadState='not-found', ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0',
+                                FragmentPath='', DropInPaths='')
+        self.stack.enter_context(patch.object(c, 'TIMER_ROOTS', (self.root / 'run-systemd', self.root / 'vendor-systemd')))
+        r.w.SYSTEM = self.root / 'etc-systemd'; r.w.UNITS = w.m.UNITS
+        helper_bytes = {'egress-guard.py': b'# reviewed fixture guard\n', 'first-preview.py': b'ENV = {}\n'}
+        r.w.HELPER_PINS = {name: c.sha(raw) for name, raw in helper_bytes.items()}
+        for name, raw in helper_bytes.items(): self.f.f.put(c.BIN / name, raw, 0o644 if name == 'egress-guard.py' else 0o755)
+        self.stack.enter_context(patch.object(old_broker, 'COLLECT', c.COLLECT))
+        self.stack.enter_context(patch.object(old_broker, 'SYSTEM', r.w.SYSTEM))
+        self.worker.r = r.r
+        self.worker.idle = old_broker.Broker.idle.__get__(self.worker)
+        self.worker.no_timer = old_broker.Broker.no_timer.__get__(self.worker)
+        r.w.absent.side_effect = w.m.absent
+        r.w.command.return_value = ''
+        def properties(unit, keys):
+            alias = 'timer' if unit.endswith('.timer') else unit[len('aifinance-collect-'):-len('.service')]
+            return {key: states[alias][key] for key in keys}
+        r.w.properties.side_effect = properties
         r.b.Broker = Mock(return_value=self.worker); r.b.unit_states = Mock(return_value=states)
         r.b.document = Mock(return_value={'restore_verified': True})
         self.worker.identity.return_value = USER; self.worker.recovery_baseline.return_value = baseline
@@ -604,8 +624,186 @@ class ContinuationFixture(FlowFixture):
         del r.original_state
         return states
 
+    def composed_current_fixture(self):
+        self.stack.enter_context(patch.object(c, 'UPGRADE_RECORD', self.root / 'collect-only-upgrade.json'))
+        states = self.current_fixture(); r = self.recovery
+        runner = load('composed_old_collector_runner', REPO / 'deploy/native/collect-only-runner.py')
+        system = r.w.SYSTEM; pins = dict(r.w.HELPER_PINS)
+        for key, value in (('SYSTEM', system), ('CONFIG', c.CONFIG), ('STATE', c.COLLECT), ('MAINTENANCE', c.UPGRADE_RECORD.parent)):
+            self.stack.enter_context(patch.object(runner, key, value))
+        # Release contents/guard are covered separately; the state/configuration
+        # composition below runs the real validators with command-only fixtures.
+        self.stack.enter_context(patch.object(runner, 'validate_release'))
+        for key, value in (('OPS', c.OPS), ('POLICY', c.OPS / 'policy.json'), ('SELF', c.BIN / 'ops-broker.py'),
+                           ('INSTALL_EVIDENCE', c.OPS / 'install.json'), ('CONFIG', c.CONFIG), ('RUNNER_SHA', self.u.OLD_RUNNER)):
+            self.stack.enter_context(patch.object(old_broker, key, value))
+        self.stack.enter_context(patch.object(w.m, 'SYSTEM', system))
+        self.stack.enter_context(patch.object(w.m, 'HELPER_PINS', pins))
+        accounts = [SimpleNamespace(pw_name=name, pw_uid=uid, pw_gid=uid, pw_shell='/sbin/nologin', pw_dir='/nonexistent')
+                    for name, uid in [('aifinance-collect', 986), ('aifinance', 989), ('aifinance-deploy', 990), ('postgres', 26)]]
+        self.stack.enter_context(patch.object(runner.pwd, 'getpwnam', side_effect=lambda name: next(v for v in accounts if v.pw_name == name)))
+        self.stack.enter_context(patch.object(runner.pwd, 'getpwall', return_value=accounts))
+        group = SimpleNamespace(gr_gid=986, gr_mem=[])
+        self.stack.enter_context(patch.object(runner.grp, 'getgrnam', return_value=group))
+        self.stack.enter_context(patch.object(runner.grp, 'getgrall', return_value=[group]))
+        self.f.f.metadata(c.CONFIG, st_gid=986); c.CONFIG.chmod(0o750)
+        for name in ('hosts', 'nsswitch.conf'): self.f.f.metadata(c.CONFIG / name, st_gid=986)
+        real_stat = Path.stat
+        self.stack.enter_context(patch.object(Path, 'stat', lambda path, *args, **kw: self.f.f.info(real_stat(path, *args, **kw), path)))
+        proc = self.root / 'collector-proc'; proc.mkdir()
+        original_iterdir = Path.iterdir
+        self.stack.enter_context(patch.object(Path, 'iterdir', lambda path: original_iterdir(proc if path == Path('/proc') else path)))
+        self.composed_proc = proc
+        unit_values = {}
+        for alias in ('probe', 'check', 'seed', 'run'):
+            unit = runner.unit_name(alias)
+            value = dict(states[alias], Id=unit, FragmentPath=str(system / unit), DropInPaths='', User=runner.ACCOUNT,
+                         Group=runner.ACCOUNT, MemoryAccounting='yes', MemoryLimit=str(runner.LIMIT), TasksMax='32',
+                         TimeoutStartUSec='2min', NoNewPrivileges='yes', CapabilityBoundingSet='', AmbientCapabilities='',
+                         ProtectSystem='strict', ProtectHome='yes', PrivateTmp='yes', WorkingDirectory=str(runner.RELEASE),
+                         KillMode='control-group', Requisite='aifinance-preview-db.service', Requires='-.mount system.slice sysinit.target',
+                         Wants='', BindsTo='', After='aifinance-preview-db.service network.target', OnFailure='', Slice='system.slice',
+                         DefaultDependencies='yes', RequiresMountsFor='/var/tmp /opt/aifinance/releases/' + c.RELEASE,
+                         NeedDaemonReload='no', Environment='', EnvironmentFiles='', PassEnvironment='', ExecStartPost='',
+                         ExecStop='', ExecStopPost='', ExecReload='')
+            command = '/usr/bin/sleep 30' if alias == 'probe' else '/usr/bin/python3 -I -B %s _execute --mode %s' % (runner.SELF, alias)
+            value['ExecStart'] = w.exec_value(command)
+            value['ExecStartPre'] = '' if alias == 'probe' else w.exec_value('/usr/bin/python3 -I -B %s _verify --mode %s' % (runner.SELF, alias))
+            unit_values[unit] = value; states[alias] = value
+            self.f.f.put(system / unit, runner.unit_text(alias).encode(), 0o644)
+        for alias in ('hourly', 'timer'):
+            unit = old_broker.UNIT_ALIASES[alias]; unit_values[unit] = dict(states[alias], Id=unit)
+            states[alias] = unit_values[unit]
+        for alias in ('api', 'web', 'db', 'guard'):
+            unit = old_broker.UNIT_ALIASES[alias]
+            unit_values[unit] = dict(Id=unit, LoadState='loaded', ActiveState='active', SubState='exited' if alias == 'guard' else 'running')
+        objects = copy.deepcopy(runner.network_objects(986, {}))
+        for index, item in enumerate(objects): next(iter(item.values()))['handle'] = index + 1
+        self.command_calls = []; self.list_units = ''; self.omit_properties = set()
+        def command(args, *positional, **kwargs):
+            self.command_calls.append(list(args))
+            if args[0] == '/usr/sbin/nft': return json.dumps({'nftables': objects})
+            if args[0] == '/usr/bin/journalctl': return ''
+            if args[:2] == ['/usr/bin/systemctl', 'list-units']: return self.list_units
+            if args[:2] == ['/usr/bin/systemctl', 'show']:
+                if '-p' in args: return unit_values[args[2]].get(args[args.index('-p') + 1], '')
+                keys = next(v for v in args if v.startswith('--property='))[len('--property='):].split(',')
+                units = [v for v in args[2:] if v in unit_values]
+                return '\n\n'.join('\n'.join(key + '=' + unit_values[unit].get(key, '') for key in keys if (unit, key) not in self.omit_properties) for unit in units)
+            raise AssertionError('unexpected command in read-only composed preflight: ' + str(args))
+        self.stack.enter_context(patch.object(old_broker, 'bounded_command', side_effect=command))
+        self.stack.enter_context(patch.object(w.m, 'command', side_effect=command))
+        runner.command = command
+        self.f.f.put(c.UPGRADE_RECORD, self.u.encoded(dict(restore_verified=True, status='healthy', release=c.RELEASE)))
+        baseline = dict(self.worker.recovery_baseline.return_value)
+        self.f.f.put(c.OPS / 'install.json', self.u.encoded(dict(recovery_baseline=baseline)))
+        helper_plan = c.PRIOR / 'helper-update/plan.json'; plan = c.document(c.read(helper_plan))
+        history_raw, history_id = self.u.read(c.OPS / 'install.json', 0o600)
+        plan.update(history_sha256=c.sha(history_raw), history_identity=list(history_id))
+        self.f.f.put(helper_plan, self.u.encoded(plan))
+        website = dict(website_healthy=True, collector_started=False, native_ready_written=False,
+            preserved_after={str(c.COLLECT / name): {'sha256': c.sha(raw)} for name, raw in r.records.items()},
+            listeners={'8000': [], '3100': [['0100007F', '1']], '3101': [['0100007F', '2']], '55432': [['0100007F', '3']]})
+        website['preserved_after'][str(c.CONFIG / 'database.env')] = w.m.metadata(c.CONFIG / 'database.env', 0, 0, 0o400, 8192)
+        for path in (c.OPS / 'install.json', c.UPGRADE_RECORD):
+            website['preserved_after'][str(path)] = dict(w.m.attributes(path.lstat()), sha256=c.sha(path.read_bytes()))
+        self.f.f.put(m.WEBSITE / '05-complete.json', self.u.encoded(website))
+        self.f.f.put(m.WEBSITE / '01-evidence_create.json', self.u.encoded(dict(boot_id=m.BOOT, release=c.RELEASE, preserved_before=website['preserved_after'])))
+        r.manifest['predecessor']['website_sha256'] = c.sha(self.u.encoded(website))
+        r.b = old_broker; r.r = runner; r.w = w.m
+        del r.website_evidence; del r.collector_units
+        return states
+
 
 class ContinuationChecks(unittest.TestCase):
+    def test_timer_file_refusal_survives_safe_error_projection(self):
+        with ContinuationFixture() as f:
+            f.composed_current_fixture()
+            error = w.m.Refused('collector_timer_file_present')
+            self.assertEqual(c.safe_error(error, m, f.recovery), {'reason': 'collector_timer_file_present'})
+            self.assertIn('collector_timer_file_present', c.SAFE_REASON_CODES)
+
+    def test_composed_quiet_gate_rejects_metadata_pids_processes_and_unknown_units(self):
+        cases = ('load', 'enabled', 'pid', 'control_pid', 'process', 'timer_load', 'timer_active', 'timer_fragment',
+                 'timer_dropin', 'missing_timer_metadata', 'unknown_active', 'unknown_activating',
+                 'unknown_reloading', 'unknown_deactivating', 'malformed_list')
+        for kind in cases:
+            with self.subTest(kind=kind), ContinuationFixture() as f:
+                states = f.composed_current_fixture(); r = f.recovery
+                if kind == 'load': states['probe']['LoadState'] = 'masked'
+                if kind == 'enabled': states['probe']['UnitFileState'] = 'enabled'
+                if kind == 'pid': states['check']['MainPID'] = '987'
+                if kind == 'control_pid': states['seed']['ControlPID'] = '987'
+                if kind == 'process': f.f.f.put(f.composed_proc / '987/status', b'Uid: 986 986 986 986\n')
+                if kind == 'timer_load': states['timer']['LoadState'] = 'loaded'
+                if kind == 'timer_active': states['timer']['ActiveState'] = 'active'
+                if kind == 'timer_fragment': states['timer']['FragmentPath'] = '/unreviewed/timer'
+                if kind == 'timer_dropin': states['hourly']['DropInPaths'] = '/unreviewed/dropin'
+                if kind == 'missing_timer_metadata': f.omit_properties.add((old_broker.UNIT_ALIASES['timer'], 'DropInPaths'))
+                if kind.startswith('unknown_'): f.list_units = 'aifinance-other.service loaded %s running Other\n' % kind[len('unknown_'):]
+                if kind == 'malformed_list': f.list_units = 'unparseable\n'
+                with self.assertRaises((ValueError, old_broker.Refused, w.m.Refused)): r.original_state(r.b, r.r)
+                self.assertFalse(any(any(word in call for word in ('reset-failed', 'start', 'stop')) for call in f.command_calls))
+
+    def test_composed_quiet_gate_rejects_hourly_files_dropins_and_wants_in_every_root(self):
+        for root_index in range(3):
+            for name in ('aifinance-collect-hourly.service', 'aifinance-collect-hourly.timer'):
+                for kind in ('unit', 'dropin', 'wants'):
+                    with self.subTest(root=root_index, name=name, kind=kind), ContinuationFixture() as f:
+                        f.composed_current_fixture(); r = f.recovery
+                        root = ((r.w.SYSTEM,) + c.TIMER_ROOTS)[root_index]
+                        path = root / (name + '.d') if kind == 'dropin' else root / 'timers.target.wants' / name if kind == 'wants' else root / name
+                        if kind == 'dropin': path.mkdir(parents=True)
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True); path.symlink_to(root / 'missing-target')
+                        with self.assertRaises((old_broker.Refused, w.m.Refused)): r.original_state(r.b, r.r)
+                        self.assertFalse(any(any(word in call for word in ('reset-failed', 'start', 'stop')) for call in f.command_calls))
+
+    def test_helpers_are_verified_before_guard_execution_or_first_preview_import(self):
+        for name in ('egress-guard.py', 'first-preview.py'):
+            with self.subTest(name=name), ContinuationFixture() as f:
+                f.composed_current_fixture(); r = f.recovery
+                self.assertEqual((c.BIN / 'egress-guard.py').stat().st_mode & 0o777, 0o644)
+                f.f.f.put(c.BIN / name, b'raise RuntimeError("must never execute changed helper")\n', 0o644)
+                with self.assertRaisesRegex(c.Refused, 'website_helper_changed'): r.original_state(r.b, r.r)
+                r.r.validate_release.assert_not_called(); r.upgrade.helper.assert_not_called()
+                self.assertEqual(f.command_calls, [])
+
+    def test_website_gate_override_verifies_helpers_before_inherited_calls(self):
+        with ContinuationFixture() as f:
+            f.composed_current_fixture(); r = f.recovery; del r.website_gate
+            f.f.f.put(c.BIN / 'egress-guard.py', b'changed\n', 0o644)
+            with patch.object(m.Recovery, 'website_gate') as inherited:
+                with self.assertRaisesRegex(c.Refused, 'website_helper_changed'): r.website_gate(healthy=None)
+                inherited.assert_not_called()
+
+    def test_first_preview_import_uses_verified_bytes_then_rechecks_live_pin(self):
+        with ContinuationFixture() as f:
+            f.composed_current_fixture(); r = f.recovery; captured = []
+            real_module = c.module
+            def verified_module(raw, path, name):
+                captured.append(raw)
+                f.f.f.put(path, b'raise RuntimeError("changed helper must not execute")\n', 0o755)
+                return real_module(raw, path, name)
+            r.website_gate.side_effect = lambda *args, **kwargs: r.website_helpers()
+            with patch.object(c, 'module', side_effect=verified_module):
+                with self.assertRaisesRegex(c.Refused, 'website_helper_changed'): r.original_state(r.b, r.r)
+            self.assertEqual(captured, [b'ENV = {}\n']); self.assertEqual(r.fp.ENV, {})
+            r.upgrade.helper.assert_not_called()
+
+    def test_composed_failed_state_passes_real_validators_and_old_postboot_rule_refuses(self):
+        with ContinuationFixture() as f:
+            states = f.composed_current_fixture(); r = f.recovery
+            with self.assertRaises(w.m.Refused) as prior: w.m.collector_idle()
+            self.assertEqual(prior.exception.reason, 'collector_not_idle_after_boot')
+            before = {str(p): (p.read_bytes(), p.stat().st_ino) for p in f.root.rglob('*') if p.is_file()}
+            r.original_state(r.b, r.r)
+            self.assertEqual(states['check']['ActiveState'], 'failed')
+            self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_ino) for p in f.root.rglob('*') if p.is_file()})
+            self.assertEqual(r.snapshot['units']['check']['ExecMainStatus'], '15')
+            self.assertFalse(any(any(word in call for word in ('reset-failed', 'start', 'stop')) for call in f.command_calls))
+            r.upgrade.helper.assert_not_called()
+
     def test_v3_real_transaction_late_failures_restore_helpers_and_revoke_held_db(self):
         for failing in ('callback', 'completion_rename', 'completion_evidence'):
             with self.subTest(failing=failing), t.WithheldFixture() as f, ExitStack() as stack:
@@ -708,7 +906,7 @@ class ContinuationChecks(unittest.TestCase):
                 if kind.startswith('db_'):
                     metadata = dict(r.w.metadata.return_value); metadata['ctime_ns' if kind == 'db_ctime' else 'mtime_ns'] -= 1
                     r.w.metadata.return_value = metadata
-                with self.assertRaises(c.Refused): r.original_state(r.b, f.r)
+                with self.assertRaises((c.Refused, old_broker.Refused)): r.original_state(r.b, f.r)
 
     def test_historical_count_change_refused_before_permissions_or_probe(self):
         with ContinuationFixture() as f:

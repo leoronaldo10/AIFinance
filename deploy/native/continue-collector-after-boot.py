@@ -28,6 +28,7 @@ BIN = Path('/opt/aifinance/bin')
 COLLECT = Path('/var/lib/aifinance-maintenance/collect-only')
 UPGRADE_RECORD = Path('/var/lib/aifinance-maintenance/collect-only-upgrade.json')
 CONFIG = Path('/etc/aifinance-collect')
+TIMER_ROOTS = (Path('/run/systemd/system'), Path('/usr/lib/systemd/system'))
 BASE_SHA = 'bdb93f1eac36518e5e29ffeea00bc18cbd708a9b31395f778dce03ce9a14d020'
 WEBSITE_SHA = 'a484a7b35529e8101644e1dd382cb28b20a4d4142fab0d6c30b56dcbdc949dd7'
 RUNNER_SHA = 'b1485bcac62972b2f2145c2ec6ad6163eb49c0e4f3a7e0eee1abdb1bbe98da0f'
@@ -45,7 +46,7 @@ UNIT_FIELDS = ('ActiveState', 'SubState', 'Result', 'MainPID', 'ControlPID', 'Ex
                'ExecMainStatus', 'ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic')
 
 
-SAFE_REASON_CODES = frozenset("""prior_helper_security_attributes_changed historical_downstream_counts_changed absent_completion_transaction_required acceptance_payload_digest_mismatch accepted_restore_required
+SAFE_REASON_CODES = frozenset("""collector_timer_file_present collector_unit_metadata_changed prior_helper_security_attributes_changed historical_downstream_counts_changed absent_completion_transaction_required acceptance_payload_digest_mismatch accepted_restore_required
 actual_read_only_hosts_binding_required application_or_collector_process_present
 apply_requires_checked_snapshot_digest archive_verification_failed boot_id_mismatch canonical_lock_changed
 canonical_lock_owner_or_mode_mismatch canonical_lock_replaced canonical_manifest_required
@@ -121,7 +122,7 @@ website_preserved_collector_history_changed website_preserved_database_metadata_
 website_preserved_install_history_changed website_provenance_changed website_resource_boundary_changed
 website_restore_unit_busy website_unit_changed website_unit_identity_changed website_unit_pid_changed
 website_unit_state_changed website_writer_listener_remains withheld_evidence_changed withheld_plan_mismatch""".split())
-SAFE_STAGE_CODES = frozenset(('archive', 'archive_then_rearm', 'check', 'complete', 'current_boot_and_gate', 'current_collector_receipts', 'current_collector_units', 'current_database_metadata', 'current_website_health', 'db_only_network', 'entry', 'fresh_no_network_probe', 'fresh_read_only_nss_check', 'preflight', 'prior_v2_archive', 'prior_v2_inventory', 'prior_v2_sql_and_probe', 'prior_v2_transaction', 'read_only_sql', 'ready', 'restore_same_database_permission', 'website_pause', 'website_restore'))
+SAFE_STAGE_CODES = frozenset(('current_website_helpers', 'archive', 'archive_then_rearm', 'check', 'complete', 'current_boot_and_gate', 'current_collector_receipts', 'current_collector_units', 'current_database_metadata', 'current_website_health', 'db_only_network', 'entry', 'fresh_no_network_probe', 'fresh_read_only_nss_check', 'preflight', 'prior_v2_archive', 'prior_v2_inventory', 'prior_v2_sql_and_probe', 'prior_v2_transaction', 'read_only_sql', 'ready', 'restore_same_database_permission', 'website_pause', 'website_restore'))
 SAFE_ERROR_TYPES = frozenset(('OSError', 'FileNotFoundError', 'PermissionError', 'ProcessLookupError', 'BlockingIOError', 'IsADirectoryError', 'NotADirectoryError', 'UnicodeDecodeError', 'ValueError', 'TypeError', 'KeyError', 'SystemExit', 'InterruptedError', 'TimeoutError'))
 
 
@@ -319,10 +320,50 @@ def make_recovery(base):
             inventory.update({'helper-update/' + name: row for name, row in helper_records.items()})
             return records, fresh, inventory
 
+        def website_helpers(self):
+            verified = {}
+            for name, digest in self.w.HELPER_PINS.items():
+                if name not in ('collect-only-runner.py', 'ops-broker.py'):
+                    raw = self.w.read(BIN / name, maximum=262144)
+                    require(sha(raw) == digest, 'website_helper_changed')
+                    verified[name] = raw
+            return verified
+
+        def website_gate(self, healthy=True):
+            self.website_helpers()
+            return super(Continuation, self).website_gate(healthy)
+
+        def collector_quiet(self, states):
+            # The failed check is intentionally retained. The website helper's
+            # postboot inactive-only rule cannot validate this continuation.
+            for alias in ('probe', 'check', 'seed', 'run'):
+                value = states[alias]
+                expected_state = 'failed' if alias == 'check' else 'inactive'
+                expected_substate = 'failed' if alias == 'check' else 'dead'
+                require(value.get('LoadState') == 'loaded' and value.get('ActiveState') == expected_state and
+                        value.get('SubState') == expected_substate and value.get('MainPID') == value.get('ControlPID') == '0' and
+                        value.get('UnitFileState') in ('static', 'disabled'), 'collector_unit_metadata_changed')
+            for name in ('aifinance-collect-hourly.service', 'aifinance-collect-hourly.timer'):
+                keys = ('LoadState', 'ActiveState', 'SubState', 'FragmentPath', 'DropInPaths')
+                value = self.w.properties(name, keys)
+                require(value == dict(LoadState='not-found', ActiveState='inactive', SubState='dead',
+                                      FragmentPath='', DropInPaths=''), 'collector_timer_not_absent')
+                for root in (self.w.SYSTEM,) + TIMER_ROOTS:
+                    for path in (root / name, root / (name + '.d'), root / 'timers.target.wants' / name):
+                        self.w.absent(path, 'collector_timer_file_present')
+            rows = self.w.command([self.w.CTL, 'list-units', '--all', '--plain', '--no-legend', '--no-pager', 'aifinance*'])
+            for line in rows.splitlines():
+                fields = line.split()
+                require(len(fields) >= 4, 'invalid_aifinance_unit_list')
+                require(fields[0] in self.w.UNITS or fields[2] not in ('active', 'activating', 'reloading', 'deactivating'),
+                        'unreviewed_aifinance_service_active')
+
         def original_state(self, broker, runner):
             require(not self.started, 'continuation_attempted_gate_stays_closed')
             self.stage = 'current_boot_and_gate'
             base.boot(); self.u.no_controllers(); self.u.absent(self.u.TARGETS['complete'])
+            self.stage = 'current_website_helpers'
+            helpers = self.website_helpers()
             self.stage = 'current_collector_units'
             runner.upgrade_gate(); runner.validate_release(); runner.verify_units(); self.collector_units(runner)
             worker = broker.Broker(runner, self.upgrade); user = worker.identity()
@@ -330,7 +371,7 @@ def make_recovery(base):
             gate = broker.document(UPGRADE_RECORD)
             require(gate.get('restore_verified') is True, 'accepted_restore_required')
             states = broker.unit_states(); worker.idle(user, states); worker.no_timer(states); worker.db_only_network(user)
-            self.w.collector_idle()
+            self.collector_quiet(states)
             unit_snapshot = {}
             for alias in ('probe', 'check', 'seed', 'run'):
                 row = states[alias]; expected = dict(MainPID='0', ControlPID='0')
@@ -390,7 +431,8 @@ def make_recovery(base):
                 require(website['preserved_after'].get(str(path)) == dict(self.w.attributes(path.lstat()), sha256=sha(raw)),
                         'original_install_history_changed')
             self.stage = 'current_website_health'
-            self.fp = self.upgrade.helper('first-preview.py'); self.website_gate()
+            self.fp = module(helpers['first-preview.py'], BIN / 'first-preview.py', 'verified_continuation_website')
+            self.website_gate()
             snapshot = dict(schema=3, boot_id=base.BOOT, release=RELEASE, manifest_sha256=self.manifest_sha,
                 prior=prior, current=current, database=metadata, units=unit_snapshot,
                 helpers={k: self.record(self.u.TARGETS[k], self.u.MODES[k]) for k in ('runner', 'broker', 'policy')},
