@@ -425,5 +425,230 @@ class UpdateTests(unittest.TestCase):
                 with self.assertRaises(PermissionError): REAL_CONTROLLERS()
 
 
+v3 = load('collector_v3_update', REPO / 'deploy/native/updates/collector-boot-v3/update-ops-nss-proof.py')
+
+
+class WithheldFixture(Fixture):
+    def __enter__(self):
+        self.modules = ExitStack(); self.modules.enter_context(patch.dict(globals(), u=v3))
+        try:
+            super().__enter__()
+            self.change = super().prepared()
+            self.stack.enter_context(patch.object(v3, 'PRIOR', v3.OPS / 'collector-boot-v2'))
+            v3.PRIOR.mkdir(mode=0o700); archive = v3.PRIOR / 'helper-update'; archive.mkdir(mode=0o700)
+            continuation = v3.OPS / 'collector-boot-v3'; continuation.mkdir(mode=0o700)
+            self.stack.enter_context(patch.object(v3, 'UPDATE', continuation / 'helper-update'))
+            self.withheld = archive / 'complete.withheld'; self.plan_path = archive / 'plan.json'
+            os.rename(str(v3.TARGETS['complete']), str(self.withheld))
+            self.v2_stage = v3.TARGETS['complete'].with_name('.complete.json.nss-v1.next')
+            self.f.put(self.v2_stage, self.new['complete'])
+            plan = {'schema': 1, 'files': {key: {'old_sha256': v3.sha(self.old[key]),
+                'new_sha256': v3.sha(self.new[key]), 'mode': v3.MODES[key],
+                'old_identity': list(self.change['identities'][key]), 'staged_identity': [1, 2],
+                'security_attributes': {}} for key in v3.TARGETS},
+                'history_sha256': v3.sha(self.history), 'history_identity': list(self.change['history'][1])}
+            self.f.put(self.plan_path, v3.encoded(plan))
+            self.change['withheld'] = {'path': self.withheld, 'plan_path': self.plan_path,
+                'plan_raw': self.plan_path.read_bytes(), 'plan_identity': v3.read(self.plan_path, 0o600)[1],
+                'raw': self.change['old']['complete'], 'identity': self.change['identities']['complete'],
+                'labels': self.change['labels']['complete']}
+            for field in ('old', 'identities', 'labels'): self.change[field].pop('complete')
+            self.precondition.reset_mock()
+            self.preserved = {path: (v3.read(path, 0o600), v3.attrs(path))
+                              for path in (self.withheld, self.plan_path, self.v2_stage)}
+            return self
+        except BaseException:
+            self.__exit__(*sys.exc_info()); raise
+
+    def __exit__(self, *args):
+        super().__exit__(*args); self.modules.close()
+
+    def apply(self, prepared=None):
+        with v3.lock(self.runner):
+            return v3.apply_withheld(self.broker, self.runner, self.upgrade, self.manifest,
+                                     self.change if prepared is None else prepared)
+
+
+class WithheldUpdateTests(unittest.TestCase):
+    def preserved(self, fixture):
+        for path, value in fixture.preserved.items():
+            self.assertEqual((v3.read(path, 0o600), v3.attrs(path)), value)
+        self.assertFalse((v3.UPDATE / 'complete.before').exists())
+        self.assertFalse((v3.UPDATE / 'complete.withheld').exists())
+        self.assertFalse(v3.TARGETS['complete'].with_name('.complete.json.collector-v3.restore').exists())
+
+    def test_versioned_legacy_apply_is_unchanged_and_python36_compatible(self):
+        original = ast.parse((REPO / 'deploy/native/update-ops-nss-proof.py').read_text())
+        updated = ast.parse((REPO / 'deploy/native/updates/collector-boot-v3/update-ops-nss-proof.py').read_text(),
+                            **({'feature_version': (3, 6)} if sys.version_info >= (3, 8) else {}))
+        for node in original.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                replacement = next(value for value in updated.body if getattr(value, 'name', None) == node.name)
+                self.assertEqual(ast.dump(node), ast.dump(replacement), node.name)
+
+    def test_absent_gate_success_keeps_real_v2_evidence_and_publishes_last(self):
+        with WithheldFixture() as f:
+            original = v3.os.replace; seen = []
+            def replace(stage, target):
+                key = next(key for key, path in v3.TARGETS.items() if path == Path(target))
+                self.assertFalse(v3.TARGETS['complete'].exists())
+                if key == 'complete':
+                    for helper in ('policy', 'runner', 'broker'):
+                        self.assertEqual(v3.TARGETS[helper].read_bytes(), f.new[helper])
+                seen.append(key); original(stage, target)
+            with patch.object(v3.os, 'replace', side_effect=replace): result = f.apply()
+            self.assertTrue(result['ok'], result); self.assertEqual(seen, ['policy', 'runner', 'broker', 'complete'])
+            self.assertEqual(result['completion_gate'], 'new_verified'); self.preserved(f)
+            complete = json.loads((v3.UPDATE / 'plan.json').read_text())['files']['complete']
+            self.assertEqual(complete['initial_state'], 'absent')
+            self.assertNotIn('old_sha256', complete); self.assertNotIn('old_identity', complete)
+            self.assertNotIn('complete', f.change['old']); self.assertNotIn('complete', f.change['identities'])
+            for key in v3.TARGETS: self.assertEqual(v3.TARGETS[key].read_bytes(), f.new[key])
+
+    def test_staging_failure_before_callback_never_creates_or_restores_gate(self):
+        with WithheldFixture() as f:
+            original = v3.write_new
+            def write(path, data, mode=0o600, attributes=None):
+                if path.name == '.ops-broker.py.collector-v3.next':
+                    original(path, b'partial', mode, attributes); raise OSError('fixture staging failure')
+                return original(path, data, mode, attributes)
+            with patch.object(v3, 'write_new', side_effect=write): result = f.apply()
+            self.assertFalse(result['ok']); self.assertEqual(result['completion_gate'], 'withheld')
+            self.assertEqual(result['rollback'], 'old_set_verified'); self.assertFalse(v3.TARGETS['complete'].exists())
+            self.assertTrue(all(call.args[0] is f.broker for call in f.precondition.call_args_list))
+            for key in ('runner', 'broker', 'policy'): self.assertEqual(v3.TARGETS[key].read_bytes(), f.old[key])
+            self.preserved(f)
+
+    def test_failures_at_each_switch_callback_and_after_publication_keep_gate_closed(self):
+        for fail_at in ('policy', 'runner', 'broker', 'callback', 'complete', 'receipt'):
+            with WithheldFixture() as f:
+                original = v3.os.replace; write_new = v3.write_new; failed = [False]
+                f.broker.installation_complete = Mock(side_effect=AssertionError('old gate must never be verified'))
+                def replace(stage, target):
+                    original(stage, target)
+                    if not failed[0] and fail_at in v3.TARGETS and Path(target) == v3.TARGETS[fail_at]:
+                        failed[0] = True; raise OSError('fixture partial switch')
+                def preconditions(broker, runner, upgrade):
+                    if fail_at == 'callback' and broker is f.new_broker: raise ValueError('fixture callback failure')
+                def write(path, data, mode=0o600, attributes=None):
+                    if fail_at == 'receipt' and path == v3.UPDATE / 'complete.json': raise OSError('fixture receipt failure')
+                    return write_new(path, data, mode, attributes)
+                f.precondition.side_effect = preconditions
+                with patch.object(v3.os, 'replace', side_effect=replace), patch.object(v3, 'write_new', side_effect=write):
+                    result = f.apply()
+                self.assertFalse(result['ok'], fail_at); self.assertEqual(result['rollback'], 'old_set_verified', result)
+                self.assertEqual(result['completion_gate'], 'withheld'); self.assertFalse(v3.TARGETS['complete'].exists())
+                f.broker.installation_complete.assert_not_called()
+                for key in ('runner', 'broker', 'policy'): self.assertEqual(v3.TARGETS[key].read_bytes(), f.old[key])
+                self.preserved(f)
+
+    def test_unknown_concurrent_helper_bytes_or_inode_are_not_overwritten(self):
+        for identical in (False, True):
+            with WithheldFixture() as f:
+                original = v3.os.replace; injected = [False]
+                def replace(stage, target):
+                    original(stage, target)
+                    if not injected[0] and Path(target) == v3.TARGETS['policy']:
+                        injected[0] = True; other = v3.BIN / '.unknown-broker'
+                        f.f.put(other, f.old['broker'] if identical else b'unknown broker', 0o755)
+                        original(str(other), str(v3.TARGETS['broker']))
+                with patch.object(v3.os, 'replace', side_effect=replace): result = f.apply()
+                self.assertFalse(result['ok']); self.assertEqual(result['rollback'], 'rollback_refused_unknown_change')
+                self.assertEqual(v3.TARGETS['broker'].read_bytes(), f.old['broker'] if identical else b'unknown broker')
+                self.assertFalse(v3.TARGETS['complete'].exists()); self.preserved(f)
+
+    def test_changed_withheld_plan_or_reintroduced_gate_refused_before_mutation(self):
+        for kind in ('withheld_inode', 'withheld_bytes', 'withheld_mode', 'plan_inode', 'plan_bytes', 'plan_mode',
+                     'live_gate', 'extra_field', 'missing_field', 'bad_identity_type', 'wrong_path', 'fake_old_complete'):
+            with WithheldFixture() as f:
+                if kind in ('withheld_inode', 'plan_inode'):
+                    path = f.withheld if kind == 'withheld_inode' else f.plan_path
+                    other = path.with_name(path.name + '.replacement'); f.f.put(other, path.read_bytes())
+                    os.replace(str(other), str(path))
+                if kind == 'withheld_bytes': f.withheld.write_bytes(b'changed')
+                if kind == 'withheld_mode': f.withheld.chmod(0o644)
+                if kind == 'plan_bytes': f.plan_path.write_bytes(f.plan_path.read_bytes() + b' ')
+                if kind == 'plan_mode': f.plan_path.chmod(0o644)
+                if kind == 'live_gate': f.f.put(v3.TARGETS['complete'], f.old['complete'])
+                if kind == 'extra_field': f.change['withheld']['extra'] = True
+                if kind == 'missing_field': f.change['withheld'].pop('raw')
+                if kind == 'bad_identity_type': f.change['withheld']['identity'] = list(f.change['withheld']['identity'])
+                if kind == 'wrong_path': f.change['withheld']['path'] = v3.TARGETS['complete']
+                if kind == 'fake_old_complete': f.change['old']['complete'] = f.old['complete']
+                before = {path: path.read_bytes() for path in f.f.root.rglob('*') if path.is_file()}
+                result = f.apply()
+                self.assertFalse(result['ok'], kind); self.assertFalse(v3.UPDATE.exists(), kind)
+                self.assertEqual({path: path.read_bytes() for path in f.f.root.rglob('*') if path.is_file()}, before, kind)
+                f.precondition.assert_not_called(); f.controllers.assert_not_called()
+
+    def test_pinned_plan_must_match_archived_completion_hash_inode_and_attributes(self):
+        for field, value in [('old_sha256', '0' * 64), ('old_identity', [1, 2]), ('mode', 0o644),
+                             ('security_attributes', {'security.selinux': 'Y2hhbmdlZA=='})]:
+            with WithheldFixture() as f:
+                plan = json.loads(f.plan_path.read_text()); plan['files']['complete'][field] = value
+                f.plan_path.write_bytes(v3.encoded(plan)); f.change['withheld']['plan_raw'] = f.plan_path.read_bytes()
+                result = f.apply()
+                self.assertFalse(result['ok']); self.assertEqual(result['reason'], 'withheld_plan_mismatch')
+                self.assertFalse(v3.UPDATE.exists()); self.assertFalse(v3.TARGETS['complete'].exists())
+
+    def test_gate_reintroduced_during_staging_switch_or_callback_is_never_overwritten(self):
+        for when in ('staging', 'switch', 'callback'):
+            with WithheldFixture() as f:
+                write_new = v3.write_new; replace_file = v3.os.replace
+                def insert(): f.f.put(v3.TARGETS['complete'], b'unknown gate')
+                def write(path, data, mode=0o600, attributes=None):
+                    value = write_new(path, data, mode, attributes)
+                    if when == 'staging' and path == v3.UPDATE / 'plan.json': insert()
+                    return value
+                def replace(stage, target):
+                    replace_file(stage, target)
+                    if when == 'switch' and Path(target) == v3.TARGETS['policy']: insert()
+                def preconditions(broker, runner, upgrade):
+                    if when == 'callback' and broker is f.new_broker: insert()
+                f.precondition.side_effect = preconditions
+                with patch.object(v3, 'write_new', side_effect=write), patch.object(v3.os, 'replace', side_effect=replace):
+                    result = f.apply()
+                self.assertFalse(result['ok']); self.assertEqual(result['completion_gate'], 'unknown')
+                self.assertEqual(v3.TARGETS['complete'].read_bytes(), b'unknown gate'); self.preserved(f)
+
+    def test_published_gate_withdrawn_even_if_helper_metadata_changes(self):
+        with WithheldFixture() as f:
+            original = v3.write_new
+            def write(path, data, mode=0o600, attributes=None):
+                if path == v3.UPDATE / 'complete.json':
+                    v3.TARGETS['runner'].chmod(0o775); raise OSError('fixture receipt failure')
+                return original(path, data, mode, attributes)
+            with patch.object(v3, 'write_new', side_effect=write): result = f.apply()
+            self.assertFalse(result['ok']); self.assertEqual(result['rollback'], 'rollback_refused_unknown_change')
+            self.assertFalse(v3.TARGETS['complete'].exists()); self.assertEqual(result['completion_gate'], 'withheld')
+            self.assertEqual(v3.TARGETS['runner'].stat().st_mode & 0o777, 0o775); self.preserved(f)
+
+    def test_removed_or_replaced_gate_after_publication_cannot_report_success(self):
+        for when in ('verification', 'receipt'):
+            for replace in (False, True):
+                with WithheldFixture() as f:
+                    original = v3.write_new; verify = f.new_broker.installation_complete
+                    def change_gate():
+                        v3.TARGETS['complete'].unlink()
+                        if replace: f.f.put(v3.TARGETS['complete'], b'unknown replacement gate')
+                    def complete(policy):
+                        verify(policy)
+                        if when == 'verification': change_gate()
+                    def write(path, data, mode=0o600, attributes=None):
+                        value = original(path, data, mode, attributes)
+                        if when == 'receipt' and path == v3.UPDATE / 'complete.json': change_gate()
+                        return value
+                    f.new_broker.installation_complete = complete
+                    with patch.object(v3, 'write_new', side_effect=write): result = f.apply()
+                    self.assertFalse(result['ok'], (when, replace, result))
+                    if replace:
+                        self.assertEqual(result['completion_gate'], 'unknown')
+                        self.assertEqual(v3.TARGETS['complete'].read_bytes(), b'unknown replacement gate')
+                    else:
+                        self.assertEqual(result['completion_gate'], 'withheld')
+                        self.assertFalse(v3.TARGETS['complete'].exists())
+                    self.preserved(f)
+
+
 if __name__ == '__main__':
     unittest.main()

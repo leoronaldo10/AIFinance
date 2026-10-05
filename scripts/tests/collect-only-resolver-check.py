@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Versioned NSS-proof update fixtures; no root, mounts, DB, DNS or live actions."""
+"""Original NSS and v3 resolver fixtures; no root, mounts, DB, DNS or live actions."""
 import ast
 from contextlib import ExitStack, contextmanager
 import hashlib
@@ -184,6 +184,129 @@ class ResolverUpdateFixtures(legacy.CollectorFixtures):
             with self.assertRaises(ValueError): m.resolver_evidence(123)
             self.assertEqual(set(os.listdir('/proc/self/fd')), before)
 
+
+
+class ResolverV3Fixtures(ResolverUpdateFixtures):
+    @classmethod
+    def setUpClass(cls):
+        global m, SOURCE
+        cls.original_runner, cls.original_source = m, SOURCE
+        SOURCE = REPO / 'deploy/native/updates/collector-boot-v3/collect-only-runner.py'
+        spec = importlib.util.spec_from_file_location('resolver_v3_runner', str(SOURCE))
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        legacy.m = m
+
+    @classmethod
+    def tearDownClass(cls):
+        global m, SOURCE
+        m, SOURCE = cls.original_runner, cls.original_source
+        legacy.m = m
+
+    def assertResolverFailure(self, reason):
+        with self.assertRaises(ValueError) as caught:
+            m.resolver_evidence(123)
+        self.assertEqual(str(caught.exception), 'actual_read_only_hosts_binding_required')
+        self.assertEqual(caught.exception.resolver_reason, reason)
+
+    def test_bounded_read_preserves_short_chunks_and_strict_size_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'metadata'
+            content = ('first\n' + '\u00e9' * 30 + '\nlast\n').encode('utf-8')
+            path.write_bytes(content)
+            original = os.read
+            with patch.object(m.os, 'read', side_effect=lambda fd, count: original(fd, min(count, 7))):
+                self.assertEqual(m.read(path, len(content)), content.decode('utf-8'))
+            # procfs reports st_size=0; the streamed byte limit still applies.
+            original_stat = os.fstat
+            with patch.object(m.os, 'read', side_effect=lambda fd, count: original(fd, min(count, 7))), \
+                    patch.object(m.os, 'fstat', side_effect=lambda fd: SimpleNamespace(st_mode=original_stat(fd).st_mode, st_size=0)):
+                with self.assertRaises(ValueError):
+                    m.read(path, len(content) - 1)
+
+    def test_resolver_mounts_after_short_read_boundary_are_verified(self):
+        resolver_fixture_read = m.read
+        with resolver_fixture() as fixture:
+            path = fixture.root.parent / 'mountinfo'
+            path.write_text(''.join('%d 0 1:1 / /unused%d ro - x x rw\n' % (n, n)
+                                   for n in range(100, 400)) + fixture.mounts)
+            inode = path.stat().st_ino
+            original_read = os.read
+            original_metadata_read = m.read
+            def short_read(fd, count):
+                return original_read(fd, min(count, 113) if os.fstat(fd).st_ino == inode else count)
+            def metadata_read(selected, limit=131072):
+                if str(selected) == '/proc/123/mountinfo':
+                    return legacy_read(path, limit)
+                return original_metadata_read(selected, limit)
+            # Recover the real bounded reader, rather than fixture mount text.
+            legacy_read = resolver_fixture_read
+            with patch.object(m.os, 'read', side_effect=short_read), patch.object(m, 'read', side_effect=metadata_read):
+                self.assertTrue(m.resolver_evidence(123)['hosts_only'])
+                path.write_text(path.read_text().replace('/etc/hosts ro', '/etc/hosts rw'))
+                with self.assertRaises(ValueError): m.resolver_evidence(123)
+
+    def test_resolver_reasons_identify_required_mount_proofs(self):
+        mutations = (
+            ('mount_not_readonly', lambda f: setattr(f, 'readonly', False)),
+            ('mount_id_missing', lambda f: setattr(f, 'ids', False)),
+            ('mount_id_missing', lambda f: setattr(f, 'mounts', f.mounts.replace('72 ', '99 '))),
+            ('mount_id_missing', lambda f: setattr(f, 'mounts', f.mounts + f.mounts.splitlines()[1] + '\n')),
+            ('mount_path_mismatch', lambda f: setattr(f, 'mounts', f.mounts.replace('/etc/authselect/nsswitch.conf', '/private/path'))),
+            ('mount_not_readonly', lambda f: setattr(f, 'mounts', f.mounts.replace(' ro ', ' ro,rw '))),
+        )
+        for reason, mutate in mutations:
+            with self.subTest(reason=reason), resolver_fixture() as fixture:
+                mutate(fixture)
+                self.assertResolverFailure(reason)
+        with resolver_fixture() as fixture:
+            fixture.mounts += '99 0 1:1 /source /etc/authselect/nsswitch.conf ro - x x rw\n'
+            fixture.mounts = fixture.mounts.replace('72 0 1:1 /source /etc/authselect/nsswitch.conf ro',
+                                                    '72 0 1:1 /source /etc/authselect/nsswitch.conf rw')
+            self.assertResolverFailure('mount_not_readonly')
+
+    def test_resolver_reasons_identify_inode_content_and_trust_failures(self):
+        with resolver_fixture() as fixture:
+            path = fixture.root / 'etc/authselect/nsswitch.conf'
+            path.unlink(); path.write_text('hosts: files\n'); path.chmod(0o440)
+            self.assertResolverFailure('inode_mismatch')
+        with resolver_fixture() as fixture:
+            path = fixture.config / 'nsswitch.conf'
+            path.chmod(0o600); path.write_text('hosts: files dns\n'); path.chmod(0o440)
+            self.assertResolverFailure('content_mismatch')
+        with resolver_fixture() as fixture:
+            original = os.read
+            def changed(fd, count):
+                data = original(fd, count)
+                return b'private changed content' if len(fixture.fd_reads) == 2 else data
+            with patch.object(m.os, 'read', side_effect=changed):
+                self.assertResolverFailure('content_mismatch')
+        with resolver_fixture() as fixture:
+            fixture.nonroot.add(fixture.root.stat().st_ino)
+            self.assertResolverFailure('untrusted_path')
+        with resolver_fixture('/proc/self/root/etc/nsswitch.conf'):
+            self.assertResolverFailure('untrusted_path')
+
+    def test_resolver_reason_never_contains_raw_exception_data(self):
+        expected = {'mount_id_missing', 'mount_path_mismatch', 'mount_not_readonly',
+                    'inode_mismatch', 'content_mismatch', 'untrusted_path'}
+        self.assertEqual(set(m.RESOLVER_REASONS), expected)
+        secret = '/private/path DATABASE_URL=postgres://private:secret@host/db raw-content'
+        for reason in tuple(expected) + (secret, None, 7):
+            error = m.resolver_failure(reason)
+            self.assertEqual(str(error), 'actual_read_only_hosts_binding_required')
+            self.assertEqual(error.resolver_reason, reason if reason in expected else 'untrusted_path')
+            self.assertEqual(set(vars(error)), {'resolver_reason'})
+        with resolver_fixture() as fixture:
+            error = ValueError(secret); error.resolver_reason = secret
+            with patch.object(m, 'trusted', side_effect=error):
+                with self.assertRaises(ValueError) as caught:
+                    m.resolver_evidence(123)
+            self.assertIs(caught.exception, error)
+            self.assertEqual(caught.exception.resolver_reason, 'untrusted_path')
+        with patch.object(m.os, 'open', side_effect=OSError(secret)):
+            with self.assertRaises(OSError) as caught:
+                m.resolver_evidence(123)
+        self.assertEqual(caught.exception.resolver_reason, 'untrusted_path')
 
 
 if __name__ == '__main__': unittest.main()

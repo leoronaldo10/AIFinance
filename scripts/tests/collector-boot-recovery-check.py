@@ -495,5 +495,336 @@ class RecoveryChecks(unittest.TestCase):
         self.assertEqual(m.safe_error(m.Refused('current_boot_changed')), {'reason': 'current_boot_changed'})
 
 
+c = load('collector_boot_continuation', REPO / 'deploy/native/continue-collector-after-boot.py')
+cb = load('collector_boot_continuation_proof_fixture', REPO / 'scripts/tests/collector-boot-broker-check.py')
+
+
+class ContinuationFixture(FlowFixture):
+    def __enter__(self):
+        super(ContinuationFixture, self).__enter__()
+        for name, value in (('OPS', m.OPS), ('COLLECT', m.COLLECT), ('CONFIG', m.CONFIG),
+                            ('BIN', m.BIN), ('EVIDENCE', m.EVIDENCE), ('PRIOR', m.OPS / 'collector-boot-v2')):
+            self.stack.enter_context(patch.object(c, name, value))
+        self.stack.enter_context(patch.object(m, 'RUNNER_SHA_V2', 'a' * 64, create=True))
+        self.stack.enter_context(patch.object(m, 'BROKER_SHA_V2', 'b' * 64, create=True))
+        self.recovery.__class__ = c.make_recovery(m)
+        r = self.recovery; r.current_records = dict(r.records)
+        r.snapshot = {'prior': {n: {'sha256': m.sha(raw)} for n, raw in r.records.items()}}
+        r.manifest_sha = 'c' * 64; r.validator = cb.m; r.prior_counts = dict(COUNTS)
+        r.w.attributes.side_effect = w.m.attributes
+        r.b.reason.return_value = 'operation_refused'
+        self.stack.enter_context(patch.object(c, 'UPGRADE_RECORD', self.root / 'upgrade.json'))
+        c.PRIOR.mkdir(mode=0o700); (c.PRIOR / 'archive').mkdir(mode=0o700)
+        for name, raw in r.records.items(): self.f.f.put(c.PRIOR / 'archive' / name, raw)
+        self.assert_archive = lambda: self.check_archives()
+        return self
+
+    def check_archives(self):
+        for dirname, values in [('archive', self.recovery.records), ('attempt-before', self.recovery.current_records)]:
+            for name, raw in values.items():
+                if (c.EVIDENCE / dirname / name).read_bytes() != raw:
+                    raise AssertionError('both archives must be durable before mutation')
+
+    def prior_fixture(self):
+        r = self.recovery; r.b = self.f.broker
+        proof = cb.report('probe')
+        r.records = {'installed.json': self.u.encoded(dict(release=m.RELEASE, uid=USER.pw_uid)),
+                     'network.json': self.u.encoded(dict(uid=USER.pw_uid, hosts={})),
+                     'seed-attempt.json': self.u.encoded(dict(release=m.RELEASE, mode='seed', started=1000)),
+                     'output.json': b'', 'probe.json': self.u.encoded(proof),
+                     'probe-1000-0123456789ab.json': self.u.encoded(proof)}
+        for path in (c.PRIOR / 'archive').iterdir(): path.unlink()
+        for name, raw in r.records.items(): self.f.f.put(c.PRIOR / 'archive' / name, raw)
+        baseline = dict(attempt_started=1000, attempt_sha256=c.sha(r.records['seed-attempt.json']))
+        website = dict(preserved_after={str(c.COLLECT / n): {'sha256': c.sha(raw)} for n, raw in r.records.items()})
+        prior_manifest = dict(schema=2, boot_id=m.BOOT, release=m.RELEASE, payloads={
+            'recover-collector-after-boot.py': c.BASE_SHA, 'update-ops-nss-proof.py': m.UPDATER_SHA,
+            'recover-preview-after-boot.py': c.WEBSITE_SHA, 'collect-only-runner.py': m.RUNNER_SHA_V2,
+            'ops-broker.py': m.BROKER_SHA_V2})
+        prior_raw = self.u.encoded(prior_manifest)
+        failure_raw = self.u.encoded(dict(stage='fresh_read_only_nss_check', automatic_retry=False,
+            cleanup=dict(collector_stopped=True, database_read_revoked=True, collector_https_revoked=True, website_restored=False)))
+        r.manifest = dict(predecessor=dict(manifest_sha256=c.sha(prior_raw), failure_sha256=c.sha(failure_raw), website_sha256='e' * 64))
+        self.f.f.put(c.PRIOR / 'manifest.json', prior_raw); self.f.f.put(c.PRIOR / 'failure.json', failure_raw)
+        self.f.f.put(c.PRIOR / 'sql-before.json', self.u.encoded(dict(proof=dict(PROOF), counts=dict(COUNTS))))
+        self.f.f.put(c.PRIOR / 'fresh-probe.json', self.u.encoded(proof))
+        helper = c.PRIOR / 'helper-update'; helper.mkdir(mode=0o700)
+        self.f.f.put(helper / 'manifest.json', prior_raw)
+        policy = self.f.old_policy
+        complete = dict(schema=1, status='complete', broker_sha256=self.u.OLD_BROKER, app_release=m.RELEASE)
+        old = dict(self.f.old)
+        new = dict(runner=m.RUNNER_SHA_V2, broker=m.BROKER_SHA_V2,
+            policy=c.sha(self.u.encoded(dict(policy, runner_sha256=m.RUNNER_SHA_V2, broker_sha256=m.BROKER_SHA_V2))),
+            complete=c.sha(self.u.encoded(dict(complete, broker_sha256=m.BROKER_SHA_V2))))
+        for key, raw in old.items(): self.f.f.put(helper / (key + '.before'), raw)
+        self.f.f.put(helper / 'complete.withheld', old['complete'])
+        stage = c.OPS / '.complete.json.nss-v1.next'
+        self.f.f.put(stage, self.u.encoded(dict(complete, broker_sha256=m.BROKER_SHA_V2)))
+        withheld_id = self.u.read(helper / 'complete.withheld', 0o600)[1]
+        stage_id = self.u.read(stage, 0o600)[1]
+        plan = dict(schema=1, files={key: dict(old_sha256=c.sha(raw), new_sha256=new[key], mode=self.u.MODES[key],
+            old_identity=list(withheld_id if key == 'complete' else self.u.read(self.u.TARGETS[key], self.u.MODES[key])[1]),
+            staged_identity=list(stage_id), security_attributes={}) for key, raw in old.items()},
+            history_sha256=c.sha(self.f.history), history_identity=list(self.u.read(self.u.HISTORY, 0o600)[1]))
+        self.f.f.put(helper / 'plan.json', self.u.encoded(plan))
+        return baseline, website
+
+    def current_fixture(self):
+        baseline, website = self.prior_fixture(); r = self.recovery
+        for path in c.COLLECT.iterdir():
+            if path.is_file(): path.unlink()
+        for name, raw in r.records.items(): self.f.f.put(c.COLLECT / name, raw)
+        self.f.f.put(c.COLLECT / 'probe-2000-fedcba987654.json', self.u.encoded(cb.report('probe')))
+        self.f.f.put(c.UPGRADE_RECORD, b'{"restore_verified":true}\n')
+        db = c.CONFIG / 'database.env'; dbmeta = w.m.attributes(db.lstat())
+        baseline.update(db_device=dbmeta['device'], db_inode=dbmeta['inode'], collector_gid=USER.pw_gid,
+                        check_start_monotonic='10', check_exit_monotonic='20')
+        website['preserved_after'][str(db)] = dict(dbmeta)
+        for path in (c.OPS / 'install.json', c.UPGRADE_RECORD):
+            website['preserved_after'][str(path)] = dict(w.m.attributes(path.lstat()), sha256=c.sha(path.read_bytes()))
+        states = {name: dict(ActiveState='inactive', SubState='dead', Result='success', MainPID='0', ControlPID='0',
+                  ExecMainCode='0', ExecMainStatus='0', ExecMainStartTimestampMonotonic='0', ExecMainExitTimestampMonotonic='0')
+                  for name in ('probe', 'check', 'seed', 'run')}
+        states['check'].update(ActiveState='failed', SubState='failed', Result='signal', ExecMainCode='2', ExecMainStatus='15',
+                               ExecMainStartTimestampMonotonic='210', ExecMainExitTimestampMonotonic='220')
+        r.b.Broker = Mock(return_value=self.worker); r.b.unit_states = Mock(return_value=states)
+        r.b.document = Mock(return_value={'restore_verified': True})
+        self.worker.identity.return_value = USER; self.worker.recovery_baseline.return_value = baseline
+        self.worker.journal_metadata.return_value = []
+        self.worker.environment_fd.side_effect = lambda **kw: (os.open(str(db), os.O_RDONLY), db.lstat())
+        self.u.TARGETS['complete'].unlink()
+        r.website_evidence = Mock(return_value=(r.web_receipt, website))
+        r.manifest['predecessor']['website_sha256'] = r.web_receipt['sha256']
+        r.w.metadata.return_value = dbmeta
+        r.w.read.side_effect = lambda path, **kw: path.read_bytes()
+        m.WEBSITE.mkdir(mode=0o700)
+        for name in ('01-evidence_create.json', '05-complete.json'): self.f.f.put(m.WEBSITE / name, b'{}')
+        self.stack.enter_context(patch.object(m, 'boot'))
+        r.collector_units = Mock(); r.snapshot = None
+        del r.original_state
+        return states
+
+
+class ContinuationChecks(unittest.TestCase):
+    def test_v3_real_transaction_late_failures_restore_helpers_and_revoke_held_db(self):
+        for failing in ('callback', 'completion_rename', 'completion_evidence'):
+            with self.subTest(failing=failing), t.WithheldFixture() as f, ExitStack() as stack:
+                u = t.v3; evidence = u.UPDATE.parent; evidence.rmdir()
+                for module_ in (m, c):
+                    for key, value in (('EVIDENCE', evidence), ('OPS', u.OPS), ('RUNNER_SHA', u.NEW_RUNNER), ('BROKER_SHA', u.NEW_BROKER)):
+                        stack.enter_context(patch.object(module_, key, value))
+                f.broker.RUNNER_SHA = u.OLD_RUNNER; f.new_broker.RUNNER_SHA = u.NEW_RUNNER
+                r = object.__new__(c.make_recovery(m)); m.Recovery.__init__(r, u, Mock(), f.broker, f.runner, f.upgrade)
+                r.snapshot = {}; opened = []; cleaned = []
+                def original(*args): c.require(not r.started, 'continuation_attempted_gate_stays_closed')
+                r.original_state = original
+                def recover(*args):
+                    self.assertFalse(u.TARGETS['complete'].exists()); r.started = True; r.stage = 'ready'
+                    r.db_fd = os.open(str(t.legacy.m.CONFIG / 'database.env'), os.O_RDONLY)
+                    r.db_info = os.fstat(r.db_fd); opened.append(r.db_fd)
+                    u.write_new(evidence / 'ready.json', b'{"status":"fixture-ready"}\n')
+                    if failing == 'callback': raise c.Refused('fixture_callback_failed')
+                r.recover = recover
+                def cleanup():
+                    self.assertFalse(u.TARGETS['complete'].exists())
+                    self.assertEqual(os.fstat(r.db_fd).st_ino, r.db_info.st_ino)
+                    os.fchmod(r.db_fd, 0o400); cleaned.append(True)
+                    r.cleanup_result = dict(database_read_revoked=True, website_restored=True)
+                    return r.cleanup_result
+                r.cleanup = cleanup
+                real_write = u.write_new; real_replace = u.os.replace
+                def write(path, *args, **kwargs):
+                    if failing == 'completion_evidence' and path == u.UPDATE / 'complete.json': raise OSError('fixture-secret')
+                    return real_write(path, *args, **kwargs)
+                def replace(source, destination):
+                    real_replace(source, destination)
+                    if failing == 'completion_rename' and Path(destination) == u.TARGETS['complete']: raise OSError('fixture-secret')
+                with patch.object(u, 'write_new', side_effect=write), patch.object(u.os, 'replace', side_effect=replace), u.lock(f.runner):
+                    result = r.apply(f.manifest, f.change)
+                self.assertFalse(result['ok']); self.assertEqual(result['completion_gate'], 'withheld')
+                self.assertEqual(result['rollback'], 'old_set_verified'); self.assertEqual(cleaned, [True])
+                self.assertFalse(u.TARGETS['complete'].exists()); self.assertIsNone(r.db_fd)
+                self.assertTrue((evidence / 'ready.json').exists()); self.assertTrue((evidence / 'failure.json').exists())
+                for key in ('runner', 'broker', 'policy'): self.assertEqual(u.TARGETS[key].read_bytes(), f.old[key])
+                self.assertEqual(u.HISTORY.read_bytes(), f.history); self.assertNotIn('fixture-secret', json.dumps(result))
+                for descriptor in opened:
+                    with self.assertRaises(OSError): os.fstat(descriptor)
+                for path, before in f.preserved.items(): self.assertEqual((u.read(path, 0o600), u.attrs(path)), before)
+
+    def test_v3_source_pins_and_canonical_private_manifest(self):
+        locations = {'continue-collector-after-boot.py': 'continue-collector-after-boot.py',
+                     'recover-collector-after-boot.py': 'recover-collector-after-boot.py',
+                     'recover-preview-after-boot.py': 'recover-preview-after-boot.py',
+                     'update-ops-nss-proof.py': 'updates/collector-boot-v3/update-ops-nss-proof.py',
+                     'collect-only-runner.py': 'updates/collector-boot-v3/collect-only-runner.py',
+                     'ops-broker.py': 'updates/collector-boot-v3/ops-broker.py'}
+        data = {name: (REPO / 'deploy/native' / filename).read_bytes() for name, filename in locations.items()}
+        with t.Fixture() as f:
+            source = f.f.root / 'continuation-source'; source.mkdir(mode=0o700)
+            for name, raw in data.items(): f.f.put(source / name, raw)
+            manifest = dict(schema=3, boot_id=m.BOOT, release=c.RELEASE, payloads={n: c.sha(raw) for n, raw in data.items()},
+                            predecessor=dict(manifest_sha256='a' * 64, failure_sha256='b' * 64, website_sha256='c' * 64))
+            raw = t.u.encoded(manifest); f.f.put(source / 'manifest.json', raw)
+            with patch.object(c, 'SOURCE_PATTERN', re.escape(str(source))):
+                self.assertEqual(c.source_inputs(source, c.sha(raw), m.BOOT), (manifest, data))
+                with self.assertRaisesRegex(c.Refused, 'manifest_digest'): c.source_inputs(source, '0' * 64, m.BOOT)
+                for changed in (dict(schema=True), dict(boot_id='stale'), dict(predecessor={})):
+                    bad = t.u.encoded(dict(manifest, **changed)); f.f.put(source / 'manifest.json', bad)
+                    with self.assertRaises(c.Refused): c.source_inputs(source, c.sha(bad), m.BOOT)
+                bad = json.dumps(manifest).encode(); f.f.put(source / 'manifest.json', bad)
+                with self.assertRaisesRegex(c.Refused, 'canonical_manifest'): c.source_inputs(source, c.sha(bad), m.BOOT)
+                f.f.put(source / 'manifest.json', raw); f.f.put(source / 'ops-broker.py', data['ops-broker.py'] + b'\n')
+                with self.assertRaisesRegex(c.Refused, 'source_payload'): c.source_inputs(source, c.sha(raw), m.BOOT)
+
+    def test_check_failure_projection_uses_only_exported_codes(self):
+        for error in (c.Refused('prior_manifest_changed'), ValueError('fixture-secret'), PermissionError(13, 'fixture-secret')):
+            result = c.safe_error(error)
+            self.assertIn(result['reason'], c.SAFE_REASON_CODES)
+            if 'error_type' in result: self.assertIn(result['error_type'], c.SAFE_ERROR_TYPES)
+        for stage in ('check', 'entry', 'prior_v2_inventory', 'prior_v2_transaction'):
+            self.assertIn(stage, c.SAFE_STAGE_CODES)
+
+    def test_current_failed_state_is_read_only_and_snapshot_detects_drift(self):
+        with ContinuationFixture() as f:
+            f.current_fixture(); r = f.recovery
+            before = {str(p): (p.read_bytes(), p.stat().st_ino) for p in f.root.rglob('*') if p.is_file()}
+            r.original_state(r.b, f.r)
+            self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_ino) for p in f.root.rglob('*') if p.is_file()})
+            self.assertEqual(r.snapshot['units']['check']['ExecMainStatus'], '15')
+            f.f.f.put(c.COLLECT / 'output.json', b'')
+            with self.assertRaisesRegex(c.Refused, 'snapshot_changed'): r.original_state(r.b, f.r)
+
+    def test_current_unknown_receipts_units_and_database_metadata_refused(self):
+        for kind in ('seed_receipt', 'run_receipt', 'launch', 'check', 'probe', 'probe_metadata', 'seed_start', 'db_ctime', 'db_mtime'):
+            with self.subTest(kind=kind), ContinuationFixture() as f:
+                states = f.current_fixture(); r = f.recovery
+                if kind == 'seed_receipt': f.f.f.put(c.COLLECT / 'seed.json', b'{}')
+                if kind == 'run_receipt': f.f.f.put(c.COLLECT / 'run-attempt.json', b'{}')
+                if kind == 'launch': f.f.f.put(c.COLLECT / 'launch.json', b'{}')
+                if kind == 'check': states['check']['ExecMainStatus'] = '0'
+                if kind == 'probe': states['probe']['Result'] = 'signal'
+                if kind == 'probe_metadata': states['probe'].update(ExecMainCode='1', ExecMainStartTimestampMonotonic='100', ExecMainExitTimestampMonotonic='200')
+                if kind == 'seed_start': states['seed']['ExecMainStartTimestampMonotonic'] = '1'
+                if kind.startswith('db_'):
+                    metadata = dict(r.w.metadata.return_value); metadata['ctime_ns' if kind == 'db_ctime' else 'mtime_ns'] -= 1
+                    r.w.metadata.return_value = metadata
+                with self.assertRaises(c.Refused): r.original_state(r.b, f.r)
+
+    def test_historical_count_change_refused_before_permissions_or_probe(self):
+        with ContinuationFixture() as f:
+            f.recovery.prior_counts = dict(COUNTS, articles=1)
+            with self.assertRaisesRegex(c.Refused, 'historical_downstream'): f.recovery.recover(f.b, f.r)
+            f.r.run_unit.assert_not_called(); self.assertTrue((c.COLLECT / 'seed-attempt.json').exists())
+            self.assertFalse((c.EVIDENCE / 'fresh-probe.json').exists())
+
+    def test_imported_run_handles_and_restores_interruption_signals(self):
+        original = {sig: c.signal.getsignal(sig) for sig in (c.signal.SIGINT, c.signal.SIGTERM, c.signal.SIGHUP)}
+        def checked(argv):
+            for sig in original: self.assertIs(c.signal.getsignal(sig), c.interrupted)
+            c.signal.getsignal(c.signal.SIGTERM)(c.signal.SIGTERM, None)
+        with patch.object(c, 'checked_run', side_effect=checked): result = c.run(['check'])
+        self.assertEqual(result['reason'], 'continuation_interrupted')
+        self.assertEqual({sig: c.signal.getsignal(sig) for sig in original}, original)
+
+    def test_v3_syntax_and_immutable_v2_source(self):
+        ast.parse((REPO / 'deploy/native/continue-collector-after-boot.py').read_text(),
+                  **({'feature_version': (3, 6)} if sys.version_info >= (3, 8) else {}))
+        self.assertEqual(c.sha((REPO / 'deploy/native/recover-collector-after-boot.py').read_bytes()), c.BASE_SHA)
+        self.assertEqual(c.sha((REPO / 'deploy/native/update-ops-nss-proof.py').read_bytes()), m.UPDATER_SHA)
+
+    def test_exact_prior_evidence_is_read_only_and_preserves_chain(self):
+        with ContinuationFixture() as f:
+            baseline, website = f.prior_fixture()
+            before = {str(p): (p.read_bytes(), p.stat().st_ino) for p in c.PRIOR.rglob('*') if p.is_file()}
+            records, fresh, inventory = f.recovery.prior_evidence(USER, baseline, website)
+            self.assertEqual(records, f.recovery.records); self.assertEqual(fresh['mode'], 'probe')
+            self.assertEqual(set(inventory), set(str(Path(p).relative_to(c.PRIOR)) for p in before))
+            self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_ino) for p in c.PRIOR.rglob('*') if p.is_file()})
+
+    def test_prior_provenance_tampering_is_refused(self):
+        for kind in ('manifest', 'failure', 'archive', 'proof', 'fresh', 'plan', 'withheld', 'stage', 'extra', 'symlink'):
+            with self.subTest(kind=kind), ContinuationFixture() as f:
+                baseline, website = f.prior_fixture()
+                helper = c.PRIOR / 'helper-update'
+                if kind == 'manifest': f.f.f.put(c.PRIOR / 'manifest.json', b'{}')
+                if kind == 'failure': f.f.f.put(c.PRIOR / 'failure.json', b'{}')
+                if kind == 'archive': f.f.f.put(c.PRIOR / 'archive/output.json', b'changed')
+                if kind == 'proof': f.f.f.put(c.PRIOR / 'sql-before.json', f.u.encoded(dict(proof=dict(PROOF, sources=1), counts=dict(COUNTS))))
+                if kind == 'fresh': f.f.f.put(c.PRIOR / 'fresh-probe.json', f.u.encoded(dict(cb.report('probe'), elapsed_seconds=1)))
+                if kind == 'plan':
+                    value = c.document(c.read(helper / 'plan.json')); value['files']['runner']['new_sha256'] = '0' * 64
+                    f.f.f.put(helper / 'plan.json', f.u.encoded(value))
+                if kind == 'withheld':
+                    raw = (helper / 'complete.withheld').read_bytes(); (helper / 'complete.withheld').unlink(); f.f.f.put(helper / 'complete.withheld', raw)
+                if kind == 'stage': f.f.f.put(c.OPS / '.complete.json.nss-v1.next', b'{}')
+                if kind == 'extra': f.f.f.put(c.PRIOR / 'ready.json', b'{}')
+                if kind == 'symlink':
+                    (c.PRIOR / 'fresh-probe.json').unlink(); (c.PRIOR / 'fresh-probe.json').symlink_to(c.PRIOR / 'manifest.json')
+                with self.assertRaises((c.Refused, OSError, cb.m.Refused)):
+                    f.recovery.prior_evidence(USER, baseline, website)
+
+    def test_v3_flow_archives_both_receipt_generations_and_only_runs_probe_check(self):
+        with ContinuationFixture() as f:
+            original = dict(f.recovery.records)
+            changed = dict(f.probe, elapsed_seconds=31)
+            f.recovery.current_records['probe.json'] = f.u.encoded(changed)
+            f.f.f.put(c.COLLECT / 'probe.json', f.recovery.current_records['probe.json'])
+            f.recovery.recover(f.b, f.r)
+            f.check_archives(); self.assertEqual(f.events, ['run_probe', 'replace_probe', 'run_check'])
+            self.assertEqual(f.recovery.records, original)
+            ready = c.document(c.read(c.EVIDENCE / 'ready.json'))
+            self.assertEqual(ready['schema'], 3)
+            self.assertEqual(ready['archive_sha256']['probe.json'], c.sha(original['probe.json']))
+            self.assertEqual(ready['continuation']['attempt_before_sha256']['probe.json'], c.sha(f.recovery.current_records['probe.json']))
+            self.assertFalse((c.COLLECT / 'seed-attempt.json').exists())
+            self.assertEqual(f.worker.sql_proof.call_count, 2)
+            f.r.configure_network.assert_not_called(); f.r.first_operation.assert_not_called(); f.r.enable_hourly.assert_not_called()
+
+    def test_v3_failures_before_rearm_preserve_attempt_and_fail_closed(self):
+        for stage in ('probe', 'check', 'counts', 'restore'):
+            with self.subTest(stage=stage), ContinuationFixture() as f:
+                before = c.read(c.COLLECT / 'seed-attempt.json')
+                if stage in ('probe', 'check'): f.fail = stage
+                if stage == 'counts': f.recovery.counts.side_effect = [dict(COUNTS), dict(COUNTS, articles=1)]
+                if stage == 'restore': f.recovery.restore_website.side_effect = [ValueError('fixture-secret'), None]
+                with self.assertRaises((ValueError, c.Refused)): f.recovery.recover(f.b, f.r)
+                self.assertEqual(c.read(c.COLLECT / 'seed-attempt.json'), before)
+                self.assertFalse((c.EVIDENCE / 'ready.json').exists())
+                self.assertTrue(f.recovery.cleanup_result['website_restored'])
+                self.assertNotIn('fixture-secret', c.read(c.EVIDENCE / 'failure.json').decode())
+
+    def test_v3_restore_health_wait_precedes_strict_listener_gate(self):
+        with ContinuationFixture() as f:
+            r = f.recovery; events = []
+            r.website_evidence = Mock(return_value=(r.web_receipt, {}))
+            r.website_gate.side_effect = lambda healthy=True: events.append('final_gate' if healthy else 'prestart_gate')
+            f.website.command.side_effect = lambda *a, **kw: events.append('start')
+            r.fp.health.side_effect = lambda *a: events.append('health_wait')
+            del r.restore_website
+            r.restore_website()
+            self.assertEqual(events, ['prestart_gate', 'start', 'health_wait', 'final_gate'])
+
+    def test_safe_entry_and_resolver_diagnostics_never_emit_secrets(self):
+        secret = 'private-fixture-secret'
+        error = ValueError(secret); error.resolver_reason = 'mount_id_missing'
+        self.assertEqual(c.safe_error(error)['resolver_reason'], 'mount_id_missing')
+        error.resolver_reason = secret
+        self.assertNotIn(secret, json.dumps(c.safe_error(error)))
+        for failure in (error, SystemExit(2), PermissionError(13, secret)):
+            with patch.object(c, 'checked_run', side_effect=failure):
+                result = c.run(['check'])
+                self.assertFalse(result['ok']); self.assertNotIn(secret, json.dumps(result))
+
+    def test_cleanup_reports_independent_safe_reasons(self):
+        with ContinuationFixture() as f:
+            r = f.recovery; r.worker = f.worker; r.app_stop_attempted = True
+            r.restore_website.side_effect = ValueError('private-fixture-secret')
+            result = r.cleanup()
+            self.assertFalse(result['website_restored'])
+            self.assertIn('reason', result['website_restored_reason'])
+            self.assertNotIn('private-fixture-secret', json.dumps(result))
+            self.assertTrue(result['collector_https_revoked'])
+
+
 if __name__ == '__main__':
     unittest.main()
