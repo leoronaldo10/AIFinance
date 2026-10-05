@@ -401,6 +401,68 @@ class RecoveryChecks(unittest.TestCase):
             ports['8000'] = []; ports['55432'] = [('00000000', 'db')]
             with self.assertRaisesRegex(m.Refused, 'listener_boundary'): r.website_gate(healthy=None)
 
+    def test_legacy_website_helper_modes_use_real_approved_reader_and_exact_hashes(self):
+        helpers = {name: digest for name, digest in w.m.HELPER_PINS.items()
+                   if name not in ('ops-broker.py', 'collect-only-runner.py')}
+        self.assertEqual(len(helpers), 5)
+        for mode in (0o400, 0o444, 0o600, 0o644, 0o700, 0o755):
+            with self.subTest(mode=oct(mode)), FlowFixture() as f, ExitStack() as stack:
+                r = f.recovery; r.w = w.m; r.website_gate = m.Recovery.website_gate.__get__(r)
+                stack.enter_context(patch.object(m, 'boot'))
+                stack.enter_context(patch.object(m, 'BIN', f.u.BIN))
+                # All file content, access modes, opens, O_NOFOLLOW, lengths,
+                # nlink and inode comparisons are real fixture filesystem work.
+                # The shared nonroot fixture only supplies root UID/GID views.
+                for name in helpers:
+                    f.f.f.put(f.u.BIN / name, (REPO / 'deploy/native' / name).read_bytes(), mode)
+                next_gate = stack.enter_context(patch.object(w.m, 'properties', side_effect=RuntimeError('reached-unit-gates')))
+                with self.assertRaisesRegex(RuntimeError, 'reached-unit-gates'):
+                    r.website_gate()
+                next_gate.assert_called_once()
+                self.assertEqual(m.CONTEXT['object'], 'website_units_guard_and_listeners')
+                # Readability never substitutes for the fixed reviewed digest.
+                name = 'first-preview.py'; path = f.u.BIN / name
+                f.f.f.put(path, path.read_bytes() + b'\n# unreviewed\n', mode)
+                next_gate.reset_mock()
+                with self.assertRaisesRegex(m.Refused, 'website_helper_changed'):
+                    r.website_gate()
+                next_gate.assert_not_called(); self.assertEqual(m.CONTEXT['object'], name)
+
+    def test_legacy_helper_real_reader_rejects_unsafe_metadata_links_and_replacement(self):
+        helpers = {name: digest for name, digest in w.m.HELPER_PINS.items()
+                   if name not in ('ops-broker.py', 'collect-only-runner.py')}
+        for bad in ('group_write', 'world_write', 'nonroot_owner', 'nonroot_group', 'symlink', 'hardlink', 'inode_swap'):
+            with self.subTest(bad=bad), FlowFixture() as f, ExitStack() as stack:
+                r = f.recovery; r.w = w.m; r.website_gate = m.Recovery.website_gate.__get__(r)
+                stack.enter_context(patch.object(m, 'boot'))
+                stack.enter_context(patch.object(m, 'BIN', f.u.BIN))
+                for name in helpers:
+                    f.f.f.put(f.u.BIN / name, (REPO / 'deploy/native' / name).read_bytes(), 0o644)
+                name = 'first-preview.py'; path = f.u.BIN / name
+                if bad == 'group_write': path.chmod(0o664)
+                if bad == 'world_write': path.chmod(0o646)
+                if bad == 'nonroot_owner': f.f.f.metadata(path, st_uid=986)
+                if bad == 'nonroot_group': f.f.f.metadata(path, st_gid=986)
+                if bad == 'symlink':
+                    target = path.with_name('fixture-target.py'); path.rename(target); path.symlink_to(target)
+                if bad == 'hardlink': os.link(str(path), str(path.with_name('fixture-hardlink.py')))
+                if bad == 'inode_swap':
+                    actual_fstat = w.m.os.fstat; swapped = [False]
+                    def fstat(descriptor):
+                        info = actual_fstat(descriptor)
+                        if not swapped[0] and info.st_ino == path.lstat().st_ino:
+                            swapped[0] = True
+                            replacement = path.with_name('fixture-replacement.py')
+                            f.f.f.put(replacement, path.read_bytes(), 0o644)
+                            os.replace(str(replacement), str(path))
+                        return info
+                    stack.enter_context(patch.object(w.m.os, 'fstat', side_effect=fstat))
+                next_gate = stack.enter_context(patch.object(w.m, 'properties', side_effect=AssertionError('unsafe-helper-reached-units')))
+                with self.assertRaises((w.m.Refused, OSError)):
+                    r.website_gate()
+                next_gate.assert_not_called()
+                self.assertEqual(m.CONTEXT['object'], name)
+
     def test_collector_effective_graph_requires_exact_observed_mounts_no_activation_hooks(self):
         with FlowFixture() as f, ExitStack() as stack:
             f.recovery.w = w.m

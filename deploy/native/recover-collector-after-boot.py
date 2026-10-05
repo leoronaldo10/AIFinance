@@ -179,7 +179,9 @@ class Recovery:
         boot(); self.r.validate_release()
         for name, digest in self.w.HELPER_PINS.items():
             if name not in ('ops-broker.py', 'collect-only-runner.py'):
-                require(sha(read(BIN / name, 0o755, 262144)) == digest, 'website_helper_changed')
+                CONTEXT.update(object=name)
+                require(sha(self.w.read(BIN / name, maximum=262144)) == digest, 'website_helper_changed')
+        CONTEXT.update(object='website_units_guard_and_listeners')
         root = dict(LoadState='loaded', ActiveState='active', FragmentPath='/run/systemd/generator/-.mount',
                     SourcePath='/etc/fstab', Where='/', DropInPaths='')
         require(self.w.properties('-.mount', tuple(root)) == root, 'reviewed_active_root_mount_required')
