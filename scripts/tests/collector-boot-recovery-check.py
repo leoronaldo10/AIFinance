@@ -755,7 +755,11 @@ class ContinuationChecks(unittest.TestCase):
                     value = c.document(c.read(helper / 'plan.json')); value['files']['runner']['new_sha256'] = '0' * 64
                     f.f.f.put(helper / 'plan.json', f.u.encoded(value))
                 if kind == 'withheld':
-                    raw = (helper / 'complete.withheld').read_bytes(); (helper / 'complete.withheld').unlink(); f.f.f.put(helper / 'complete.withheld', raw)
+                    withheld = helper / 'complete.withheld'; replacement = helper / 'complete.replacement'
+                    # Keep the original allocated so filesystems cannot reuse its inode.
+                    f.f.f.put(replacement, withheld.read_bytes())
+                    self.assertNotEqual(withheld.stat().st_ino, replacement.stat().st_ino)
+                    os.replace(str(replacement), str(withheld))
                 if kind == 'stage': f.f.f.put(c.OPS / '.complete.json.nss-v1.next', b'{}')
                 if kind == 'extra': f.f.f.put(c.PRIOR / 'ready.json', b'{}')
                 if kind == 'symlink':
