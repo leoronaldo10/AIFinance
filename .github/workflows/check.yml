@@ -61,6 +61,10 @@ jobs:
         run: |
           node scripts/migrate.ts
           node scripts/seed.ts --topics-only
+      - name: Actual PostgreSQL 17 upgrade rollback and restore regression
+        env:
+          UPGRADE_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: node --test --test-concurrency=1 scripts/tests/collect-only-upgrade-pg.test.ts scripts/tests/ops-recovery-pg.test.ts scripts/tests/collector-boot-recovery-pg.test.ts
       - name: Smoke check of the built site
         # The site itself runs with collection and model calls off (the tests below use local stubs).
         env:
@@ -120,4 +124,4 @@ jobs:
         run: >-
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges
           -v "$PWD:/repo:ro" -w /repo python:3.6.8-stretch
-          sh -c 'python -B scripts/tests/python36-check.py && python -B scripts/tests/inspect-check.py && python -B scripts/tests/test_release_extraction.py && python -B scripts/tests/launcher-check.py && python -B scripts/tests/prepare-native-check.py && python -B scripts/tests/first-install-check.py && python -B scripts/tests/inspect-prerequisites-check.py && python -B scripts/tests/isolation-probe-check.py && python -B scripts/tests/egress-guard-check.py && python -B scripts/tests/provision-database-check.py && python -B scripts/tests/install-preview-files-check.py && python -B scripts/tests/first-preview-check.py'
+          sh -c 'python -B scripts/tests/python36-check.py && python -B scripts/tests/inspect-check.py && python -B scripts/tests/test_release_extraction.py && python -B scripts/tests/launcher-check.py && python -B scripts/tests/prepare-native-check.py && python -B scripts/tests/first-install-check.py && python -B scripts/tests/inspect-prerequisites-check.py && python -B scripts/tests/isolation-probe-check.py && python -B scripts/tests/egress-guard-check.py && python -B scripts/tests/provision-database-check.py && python -B scripts/tests/install-preview-files-check.py && python -B scripts/tests/first-preview-check.py && python -B scripts/tests/collect-only-upgrade-check.py && python -B scripts/tests/collect-only-runner-check.py && python -B scripts/tests/ops-gateway-check.py && python -B scripts/tests/install-ops-check.py && python -B scripts/tests/ops-broker-check.py && python -B scripts/tests/repair-ops-ssh-check.py && python -B scripts/tests/accept-egress-after-boot-check.py && python -B scripts/tests/recover-preview-after-boot-check.py && python -B scripts/tests/collect-only-resolver-check.py && python -B scripts/tests/update-ops-nss-proof-check.py && python -B scripts/tests/collector-boot-broker-check.py && python -B scripts/tests/collector-boot-recovery-check.py && bash -n deploy/native/accept-egress-after-boot.sh'

@@ -56,7 +56,7 @@ export async function loadAnalyzeInput(articleId: string): Promise<AnalyzeInputA
            tr.body_text AS translation_zh
     FROM articles a JOIN sources s ON s.id = a.source_id
     LEFT JOIN translations tr ON tr.article_id = a.id AND tr.lang = 'zh' AND tr.revision >= a.revision
-    WHERE a.id = ${articleId}`;
+    WHERE a.id = ${articleId} AND NOT a.collect_only`;
   if (!row) return null;
   return {
     id: row.id, revision: row.revision, title: row.title, url: row.url, author: row.author, publishedAt: row.published_at, discoveredAt: row.discovered_at,

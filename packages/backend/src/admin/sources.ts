@@ -67,6 +67,8 @@ export async function sourceDetail(id: string) {
 
 /** Fetches a source (saved or draft) and returns what it would collect, without storing anything. */
 export async function previewSource(draft: Pick<SourceRow, "id" | "kind" | "config"> & Partial<SourceRow>) {
+  const [saved] = await sql`SELECT collect_only FROM sources WHERE id=${draft.id}`;
+  if (draft.collect_only || saved?.collect_only) throw new Conflict("仅采集信源请使用专用批次");
   const source = { name: draft.id, enabled: true, cursor: null, tier: "T2", participation_mode: "editorial", ...draft } as SourceRow;
   assertSupportedConfig(source.kind, source.config);
   const started = Date.now();
@@ -106,6 +108,7 @@ export async function updateSource(id: string, input: { patch: unknown; version:
   return sql.begin(async (tx) => {
     const [before] = await tx`SELECT * FROM sources WHERE id = ${id} FOR UPDATE`;
     if (!before) return null;
+    if (before.collect_only) throw new Conflict("仅采集信源由固定配置管理，不可启用普通采集或修改");
     if (new Date(before.updated_at as Date).toISOString() !== input.version) throw new Conflict("信源已被其他操作修改，请刷新后再改");
     if (patch.config) assertSupportedConfig(before.kind as SourceRow["kind"], patch.config);
     const keys = Object.keys(patch) as Array<keyof typeof patch>;
@@ -184,8 +187,9 @@ export async function createSource(input: unknown, actor: string) {
 }
 
 export async function fetchNow(id: string, actor: string) {
-  const [s] = await sql<{ id: string; kind: string }[]>`SELECT id, kind FROM sources WHERE id = ${id}`;
+  const [s] = await sql<{ id: string; kind: string; collect_only: boolean }[]>`SELECT id, kind, collect_only FROM sources WHERE id = ${id}`;
   if (!s) return null;
+  if (s.collect_only) throw new Conflict("仅采集信源请使用专用批次，不可进入普通 worker");
   const jobId =
     s.kind === "mp_account"
       ? await enqueue(QUEUES.mpCheck, { sourceId: id, reason: "manual" }, { singletonKey: `mp:${id}` })

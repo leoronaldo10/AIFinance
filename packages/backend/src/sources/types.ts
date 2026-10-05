@@ -2,6 +2,7 @@ import type { MaterialInput } from "../content/materials.ts";
 
 export interface SourceRow {
   id: string;
+  collect_only?: boolean;
   name: string;
   kind: "rss" | "web_list" | "json_list" | "x_search" | "mp_account" | "external";
   config: Record<string, any>;

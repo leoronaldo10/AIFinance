@@ -13,7 +13,12 @@ on:
         description: Build by default; verify only checks restricted SSH access
         type: choice
         default: build
-        options: [build, verify, inspect, stage, deploy, rollback]
+        options: [build, verify, inspect, stage, deploy, rollback, ops-diagnose, ops-restart-preview, ops-probe, ops-recover-pre-seed, ops-seed, ops-run, ops-disable, ops-enable-hourly]
+      admin_view_accepted:
+        description: Only for ops-enable-hourly, after accepting the first batch in admin
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -70,7 +75,8 @@ jobs:
     if: >-
       always() && github.ref == 'refs/heads/release/aifinance-preview' &&
       (github.event_name == 'push' || ((inputs.operation == 'stage' || inputs.operation == 'deploy') && needs.build.result == 'success') ||
-      inputs.operation == 'verify' || inputs.operation == 'inspect' || inputs.operation == 'rollback')
+      inputs.operation == 'verify' || inputs.operation == 'inspect' || inputs.operation == 'rollback' ||
+      contains(fromJSON('["ops-diagnose","ops-restart-preview","ops-probe","ops-recover-pre-seed","ops-seed","ops-run","ops-disable","ops-enable-hourly"]'), inputs.operation))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # MUST be created/restricted by an administrator BEFORE adding any secret.
@@ -87,14 +93,24 @@ jobs:
         env:
           REVISION: ${{ inputs.revision }}
           OPERATION: ${{ github.event_name == 'push' && 'verify' || inputs.operation }}
+          ADMIN_VIEW_ACCEPTED: ${{ inputs.admin_view_accepted }}
           SSH_HOST: ${{ secrets.AIFINANCE_SSH_HOST }}
           SSH_PORT: ${{ secrets.AIFINANCE_SSH_PORT }}
           SSH_KEY: ${{ secrets.AIFINANCE_SSH_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.AIFINANCE_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$OPERATION" = stage || "$OPERATION" = deploy || "$OPERATION" = rollback ]] || exit 2
-          [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          case "$OPERATION" in
+            verify|inspect|stage|deploy|rollback|ops-diagnose|ops-restart-preview|ops-probe|ops-recover-pre-seed|ops-seed|ops-run|ops-disable|ops-enable-hourly) ;;
+            *) exit 2 ;;
+          esac
+          if [[ "$OPERATION" = ops-* ]]; then
+            [[ -z "$REVISION" ]] || exit 2
+          else
+            [[ "$OPERATION" = verify || "$OPERATION" = inspect || "$REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          fi
+          [[ "$OPERATION" != ops-enable-hourly || "$ADMIN_VIEW_ACCEPTED" = true ]] || exit 2
+          [[ "$ADMIN_VIEW_ACCEPTED" != true || "$OPERATION" = ops-enable-hourly ]] || exit 2
           [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
           [[ "$SSH_PORT" -gt 0 && "$SSH_PORT" -le 65535 && -n "$SSH_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || exit 2
           scratch=$(mktemp -d)
@@ -103,7 +119,10 @@ jobs:
           printf '%s\n' "$SSH_KEY" > "$scratch/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$scratch/known_hosts"
           options=(-T -p "$SSH_PORT" -i "$scratch/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$scratch/known_hosts" -o ConnectTimeout=15)
-          if [[ "$OPERATION" = verify ]]; then
+          if [[ "$OPERATION" = ops-* ]]; then
+            # Fixed enum only; no revision, uploaded code or checkout in this job.
+            timeout --signal=TERM --kill-after=15s 540s ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "ops-v1 ${OPERATION#ops-}"
+          elif [[ "$OPERATION" = verify ]]; then
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" verify
           elif [[ "$OPERATION" = inspect ]]; then
             ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" inspect

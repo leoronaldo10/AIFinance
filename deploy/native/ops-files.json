@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "installer_sha256": "97886547a24e22554c3d744eeedf16cf3ea4731f55480c4a70cc4686a65c5f07",
+  "broker_sha256": "2620884dbba3acad9abc68db50ca2d09aa434b2d6f5e82f2ab28144228559fcc",
+  "gateway_sha256": "05d4aba1b7e1a93a30b0e2314aaafca2fb51d1904a46b70b4e24c0dd9c43e71a",
+  "runner_sha256": "7555b956d26f93c2829683008a3f78f71e1e122d21f6c2fc25bcf3d222769cdf"
+}
