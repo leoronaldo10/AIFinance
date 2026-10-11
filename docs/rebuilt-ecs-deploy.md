@@ -2,6 +2,9 @@
 
 新增只读现状、同版本 bootstrap 回退和通道审批见
 [首次布局适配与接入审批草案](rebuilt-bootstrap-access.md)。现状未满足启用 policy 的条件。
+已补齐的 EnvironmentFile 与相对 ExecStart 对应的精确代码准备见
+[同版本 bootstrap 清单](rebuilt-bootstrap-runbook.md)：只改 WorkingDirectory，
+暂时保持 dev，未在服务器执行，也不启用本部署 gateway。
 
 本改动提供代码、夹具和 GitHub CI 验证，不代表目标机已安装或验收。基于
 `release/aifinance-preview@14f53d08f35b37f4716009ed1b35f1c2318d5eaf`，复用现有

@@ -7,61 +7,30 @@
 
 现状报告位于服务器 `/opt/aifinance/recovery/DEPLOY_ACCESS_INVENTORY.md`，
 不是此前的 `/var/backups` 路径。本助手未直接读取服务器文件。
-两个服务均以 `aifinance-deploy` 运行，WorkingDirectory 直接指向
-`/opt/aifinance/staging/d57ba047369e666025347719caee1a4c642abe62`。
-unit 位于 `/etc/systemd/system`，无 DropIn、无 EnvironmentFile；
-`/usr/local/bin/node` 为 v24.21.0；staging 属部署用户；releases/current 不存在。
-API health 为 ok=true、db=ok、release=dev。
+实例 ID 已补齐为 `i-2zedybs3fftu1d9vnx39`。两个服务均以 `aifinance-deploy`
+运行，WorkingDirectory 为 `/opt/aifinance/staging/d57ba047369e666025347719caee1a4c642abe62`。
+API ExecStart 为 `/usr/local/bin/node --experimental-strip-types apps/api/src/main.ts`，
+web 为 `/usr/local/bin/node --experimental-strip-types apps/web/server.ts`。
+二者均由 systemd 的 EnvironmentFile 加载该 staging 下的 `.env`，不是 Node
+`--env-file`。这更正了上一报告“无 EnvironmentFile”的信息；不读取配置正文。
+unit 位于 `/etc/systemd/system`，无 DropIn；Node v24.21.0；staging 属部署用户。
+RELEASE_SHA 和 schema.sha256 存在，但其值仍须前置校验，不能从文件名推断。
+releases/current 不存在，health 为 ok=true、db=ok、release=dev。
 
-这意味着 gateway 当前必须拒绝发布：没有切换布局，不能证明旧版身份，
-也不能用健康接口确认实际运行的 SHA。不能只把 `accepted` 改成 true。
-Node 版本满足版本门槛，但文件及祖先目录可信权限仍需验收。
+## A. 代码布局 bootstrap：精确最小方案
 
-无 EnvironmentFile **不等于无环境配置**。下一次已授权只读核查只需提供：
-ExecStart 的可执行路径、参数结构（值脱敏）、是否含 `--env-file`、是否调用
-包装器、包装器/程序是否加载 dotenv 或分组 credentials、相关文件路径与权限。
-不要输出 `systemctl show Environment`、完整进程环境、配置正文或含秘密的命令行。
-还要确认相对配置路径是否依赖旧 WorkingDirectory；新版制品不包含 `.env`。
-若需把配置改成稳定外部绝对路径，必须另列具体差异审批，不能顺手复制秘密进制品。
+见 [同版本 bootstrap 执行与回退清单](rebuilt-bootstrap-runbook.md) 及
+`deploy/native/rebuilt-bootstrap.py`。本轮只准备脚本并做夹具测试，没有执行服务器操作。
 
-## A. 代码布局 bootstrap：先让原版本通过切换链接运行
+两份 drop-in 都仅增加 WorkingDirectory=/opt/aifinance/switch/current，
+继承原相对 ExecStart、固定 EnvironmentFile 路径及其余安全设置。
+不复制 `.env`，不修改 staging，不启用 policy，不引入 launcher，不改数据库。
+脚本先核对标记、SQL 与可信运行源码清单，再让同一版本经链接启动；健康响应
+继续保持 dev。本阶段成功不等于后续 SHA 发布门禁已验收。
 
-1. **留存恢复基线。** 管理员在服务器上以 root-only 权限保存原两个 unit、
-   实际配置加载方式和待变更文件的原状态/摘要，位置建议为 recovery 下独立操作目录。
-   不上传可能含秘密的备份。保留 staging 代码、原启动方式和已有管理恢复通道；
-   不改变数据库、不运行 migrate/seed。
-2. **验明旧版。** 核实目录中的真实代码对应 `d57ba047...`，构建产物、依赖、
-   `RELEASE_SHA` 和完整 SQL 清单一致。缺少标记时不能仅凭目录名补写；
-   先用可信制品/版本证据证明代码，再单独批准补充元数据。
-   `schema.sha256` 须按 package.sh 的排序/格式生成并核对全部 SQL；另由管理员
-   核实数据库结构与基线一致。磁盘清单不是数据库已迁移的证明。
-3. **只新增所需目录。** 建议 `/opt/aifinance/releases`、`incoming`、
-   `state/rebuilt`、`switch` 由部署用户拥有；state/rebuilt 为 0700。
-   `/opt/aifinance/switch/current` 首先指向原 staging 目录。
-   使用独立 switch 父目录可避免让部署用户写 `/opt/aifinance` 本身及 bin。
-   所有父目录须无符号链接；`/opt/aifinance/bin`、入口、解包器、policy
-   及其祖先保持 root 所有且不可由应用写入。不要对整棵目录递归 chown。
-4. **生成两个精确 unit 差异。** 优先每个 unit 新增一个专用 root-owned drop-in，
-   WorkingDirectory 改成 switch/current（web 若真实启动需要，可用其 apps/web）。
-   ExecStart 必须实际加载该链接下的代码，不能继续含固定 staging 入口。
-   如需替换 ExecStart，须显式清空原值并保留已核实的启动参数和配置来源。
-   尚缺真实 ExecStart，当前不能给出可直接应用的最终 diff。
-5. **版本身份随链接更新。** 如现启动方式不支持，另审查小型 root-owned launcher：
-   固定 API/web 两种入口、固定 Node 路径，解析已验明版本目录并读取完整 SHA，
-   在加载既有配置后将 `AIHOT_RELEASE` 设为该 SHA，再 exec 对应 Node 入口。
-   不接受任意路径、shell 文本或凭据参数；不能把旧 SHA 永久写死进 unit。
-   此 launcher 尚未实现；不能声称现有 gateway 会替应用自动设置环境变量。
-6. **同版本重启验收。** 单独批准维护窗口后 daemon-reload，并重启这两个服务。
-   确认仍是旧 SHA、API ok/db/release 正确、Web 正常、3000/3001/55432 仅回环。
-   通过后再把实际六项 unit 属性、路径、清单摘要写入 policy；最后才批准
-   accepted=true 与 database.verified=true。首次发布新 SHA 是下一项独立审批。
-
-**回退：** 在启用 policy 前失败，不调用 gateway 发布；保持/恢复 policy 禁用，
-仅移除本次新增的 drop-in（或恢复本次备份的原文件），daemon-reload 后按原方式
-重启两个服务。原 staging 保留且没有数据库变更，因此可回到原 release=dev 的
-已知服务状态；这不算新布局验收成功。新增目录和回执先保留证据，不递归清理。
-若已启用 policy 后再撤销布局，先停用接入、禁用 policy，再恢复原 units。
-bootstrap 的人工 unit 回退不同于 gateway 对已验收版本的链接回滚。
+发生失败时删除本次专属 drop-in、daemon-reload、重启原服务；原健康恢复后
+才移除新链接。原 unit 被外部修改或 systemd job 仍在进行时停止，保留恢复证据。
+具体目录权限、重启中断、安装文件清单、阶段二要求在 runbook 中列明。
 
 ## B. 接入身份权限：两条候选通道都尚未接通
 
@@ -74,7 +43,7 @@ bootstrap 的人工 unit 回退不同于 gateway 对已验收版本的链接回�
 实例 ARN 和单个管理员建立的命令 ARN，不给 RunCommand/CreateCommand/
 ModifyCommand/DeleteCommand/ModifyInvocationAttribute 或泛化 RAM 管理权限。
 必须核实该身份全部有效策略，不能靠一条窄 Allow 抵消其他宽 Allow。
-主机名 `iZ2zedybs3fftu1d9vnx39Z` 不能代替已核实的 ECS InstanceId；二者不可猜测转换。
+已核实 InstanceId 为 `i-2zedybs3fftu1d9vnx39`；RAM 使用该实例 ID，不能使用主机名。
 
 但 [InvokeCommand API](https://www.alibabacloud.com/help/en/ecs/developer-reference/api-ecs-2014-05-26-invokecommand)
 还允许 Launcher、WorkingDir、Parameters、ContainerId/Name、调度等输入；
@@ -121,10 +90,10 @@ OIDC 信任/角色配置、参数白名单适配、执行 ID 与操作 ID 的对
 
 | 审批项 | 具体边界 / 完成条件 |
 | --- | --- |
-| A1 只读补全 | 脱敏 ExecStart、环境加载路径、旧版/结构证据、父目录权限；不读秘密正文 |
-| A2 布局准备 | 上述四个子目录、初始链接、基线元数据；保留 staging；不改数据库 |
-| A3 启动切换 | 先给两个实际 unit diff 与 launcher diff，再批准重启窗口和人工回退 |
-| A4 启用入口 | root 管理代码/policy、精确联合 restart 权限；同版本健康通过后才 accepted |
+| A1 前置检查 | 已有 ExecStart/EnvironmentFile 由脚本比对；只读校验标记/源码/结构清单/权限；不读秘密正文 |
+| A2 同版本布局 | 仅 root-owned switch/current 与恢复记录；不补写版本标记，不创建发布目录；保留 staging |
+| A3 启动切换 | 两个仅改 WorkingDirectory 的 drop-in；批准应用重启及失败恢复原配置；本阶段无 launcher |
+| A4 后续发布门禁 | 另批动态 SHA 身份、配置稳定路径、发布目录及最小重启权限，完整验收后才 accepted |
 | B1 通道选择 | 云助手先解决 Launcher/容器等参数边界；SSH 先证实受控来源路径 |
 | B2 身份配置 | 精确实例/命令/用户 RAM+OIDC 或固定 SSH 身份；无长期 AK、无聊天私钥、无宽 root |
 | B3 接入验收 | 单独批准只读 verify/status；测试错误用户/实例/命令及危险参数被拒；不发布 |

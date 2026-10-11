@@ -8,6 +8,11 @@ deployment protocol; it does not install anything on the server or migrate its l
 
 - Rebuilt gateway: 31 tests passed using temporary releases, real restricted
   extraction, and mocked systemd/HTTP. These are not real ECS acceptance tests.
+- Same-version bootstrap: 17 additional tests pass with temporary files and mocked
+  systemd/HTTP. They cover unchanged env loading, source/SQL identity, minimal
+  drop-ins, health failure rollback, interrupted installation, conflicts and locks.
+  No bootstrap operation was run on ECS. See `rebuilt-bootstrap-runbook.md` for the
+  exact separately approvable installation/restart/rollback scope.
 - Typecheck, web build, 19 web tests and preview regression passed.
 - Legacy deployment regression passed with the normal CI umask 022; the inherited
   restrictive-umask fixture failure is separate from this implementation.
