@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "accepted": false,
+  "baseline": "d57ba047369e666025347719caee1a4c642abe62",
+  "database": {"host": "127.0.0.1", "port": 55432, "verified": false},
+  "current_link": null,
+  "releases_dir": null,
+  "node": null,
+  "schema_sha256": null,
+  "units": {
+    "api": {"User": "aifinance-deploy", "WorkingDirectory": null, "ExecStart": null, "FragmentPath": null, "DropInPaths": null, "EnvironmentFiles": null},
+    "web": {"User": "aifinance-deploy", "WorkingDirectory": null, "ExecStart": null, "FragmentPath": null, "DropInPaths": null, "EnvironmentFiles": null}
+  }
+}

@@ -1,0 +1,124 @@
+name: Rebuilt ECS release (approval required)
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full reviewed SHA for build/deploy/rollback
+        type: string
+        required: false
+      operation:
+        type: choice
+        default: build
+        options: [build, verify, inspect, status, resume, logs-api, logs-web, deploy, rollback]
+      operation_id:
+        description: 32 lowercase hex digits; retain for retries/status; new ID for a new release attempt
+        type: string
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: aifinance-native-preview
+  cancel-in-progress: false
+jobs:
+  build:
+    if: inputs.operation == 'build' || inputs.operation == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REVISION: ${{ inputs.revision }}
+      OPERATION: ${{ inputs.operation }}
+      COLLECT_ENABLED: "false"
+      MODEL_CALLS_ENABLED: "false"
+      FEISHU_CONTENT_PUSH_ENABLED: "false"
+      FEISHU_INTERNAL_ENABLED: "false"
+      INDEXNOW_SUBMIT_ENABLED: "false"
+    steps:
+      - name: Validate explicit revision
+        run: '[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Only reviewed release history may deploy
+        if: inputs.operation == 'deploy'
+        run: |
+          [[ "$GITHUB_REF" = refs/heads/release/aifinance-preview ]] || exit 2
+          git merge-base --is-ancestor "$REVISION" refs/remotes/origin/release/aifinance-preview
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build and test without SSH secrets
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run test:preview
+          npm run test:deploy
+          npm run test:rebuilt
+          npm run build -w @aihot/web
+          node --test apps/web/tests/*.test.ts
+          bash deploy/native/package.sh "$REVISION" "$RUNNER_TEMP/release"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aifinance-${{ inputs.revision }}
+          path: ${{ runner.temp }}/release/
+          retention-days: 7
+          if-no-files-found: error
+
+  access:
+    needs: [build]
+    if: >-
+      always() && !cancelled() && github.ref == 'refs/heads/release/aifinance-preview' &&
+      (((inputs.operation == 'deploy') && needs.build.result == 'success') ||
+      contains(fromJSON('["verify","inspect","status","resume","logs-api","logs-web","rollback"]'), inputs.operation))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: aifinance-preview
+    steps:
+      # This credential-bearing runner never checks out or runs uploaded code.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.operation == 'deploy'
+        with:
+          name: aifinance-${{ inputs.revision }}
+          path: ${{ runner.temp }}/release
+      - name: Invoke rebuilt-v1 only (no legacy fallback)
+        env:
+          REVISION: ${{ inputs.revision }}
+          OPERATION: ${{ inputs.operation }}
+          OPERATION_ID: ${{ inputs.operation_id }}
+          SSH_HOST: ${{ secrets.AIFINANCE_SSH_HOST }}
+          SSH_PORT: ${{ secrets.AIFINANCE_SSH_PORT }}
+          SSH_KEY: ${{ secrets.AIFINANCE_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.AIFINANCE_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in
+            deploy|rollback)
+              [[ "$REVISION" =~ ^[0-9a-f]{40}$ && "$OPERATION_ID" =~ ^[0-9a-f]{32}$ ]] || exit 2 ;;
+            resume) [[ -z "$REVISION" && "$OPERATION_ID" =~ ^[0-9a-f]{32}$ ]] || exit 2 ;;
+            status) [[ -z "$REVISION" && ( -z "$OPERATION_ID" || "$OPERATION_ID" =~ ^[0-9a-f]{32}$ ) ]] || exit 2 ;;
+            verify|inspect|logs-api|logs-web) [[ -z "$REVISION" && -z "$OPERATION_ID" ]] || exit 2 ;;
+            *) exit 2 ;;
+          esac
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || exit 2
+          [[ "$SSH_PORT" -gt 0 && "$SSH_PORT" -le 65535 && -n "$SSH_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || exit 2
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          umask 077
+          printf '%s\n' "$SSH_KEY" > "$scratch/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$scratch/known_hosts"
+          options=(-T -p "$SSH_PORT" -i "$scratch/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$scratch/known_hosts" -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+          remote() { timeout --signal=TERM --kill-after=15s 510s ssh "${options[@]}" "aifinance-deploy@$SSH_HOST" "rebuilt-v1 $*"; }
+          case "$OPERATION" in
+            deploy)
+              checksum=$(sha256sum "$RUNNER_TEMP/release/$REVISION.tar.gz" | cut -d ' ' -f1)
+              [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || exit 2
+              remote upload "$REVISION" "$checksum" < "$RUNNER_TEMP/release/$REVISION.tar.gz"
+              remote deploy "$REVISION" "$checksum" "$OPERATION_ID" ;;
+            rollback) remote rollback "$REVISION" "$OPERATION_ID" ;;
+            resume) remote resume "$OPERATION_ID" ;;
+            status) if [[ -n "$OPERATION_ID" ]]; then remote status "$OPERATION_ID"; else remote status; fi ;;
+            logs-api|logs-web) remote logs "${OPERATION#logs-}" ;;
+            *) remote "$OPERATION" ;;
+          esac

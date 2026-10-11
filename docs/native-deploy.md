@@ -1,5 +1,7 @@
 # 原生预览：SSH 排查与 GitHub Actions 发布准备
 
+重建后的 Ubuntu ECS（3000/3001、aifinance-api/web）请先看[待审批适配](rebuilt-ecs-deploy.md)。下面保留旧预览布局，不应直接套用到重建机。
+
 这是可审阅的方案与模板，不是已配置、已部署的服务。[首次原生准备检查](native-prepare.md) 明确区分本地测试与目标机验收；依赖安装与数据库创建不在发布脚本中；[首次安装阶段](native-first-install.md) 仅实现另行审批的独立 Node 安装，PG/数据库/首次启动仍需目标数据与明确审批。保留 `docker-compose.preview.yml`；没有 Docker 的 ECS 使用另一套 systemd 预览方案，**不能将 Docker internal 网络保证套到 systemd 上**。两种方式不要共用数据库或数据目录。本流程不依赖用户电脑开机，构建在 GitHub Actions，服务由 ECS systemd 运行；云端诊断会话不是持久运维通道。
 
 ## 当前事实与上线前阻碍
