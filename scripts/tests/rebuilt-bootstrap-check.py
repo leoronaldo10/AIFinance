@@ -94,6 +94,21 @@ class Bootstrap(unittest.TestCase):
         self.assertFalse(m.SWITCH.exists())
         self.assertFalse(any('restart' in c for c in self.calls))
 
+    def test_status_distinguishes_absence_partial_and_invalid_receipts(self):
+        self.assertEqual(m.status(), {'phase': 'not_initialized', 'receipt_exists': False})
+        self.assertFalse(m.STATE.exists())
+        with self.assertRaisesRegex(m.Refused, 'receipt_not_initialized'): m.load()
+        m.directory(m.STATE); m.directory(m.TX)
+        with self.assertRaisesRegex(m.Refused, 'receipt_missing_in_existing_transaction'): m.status()
+        m.write(m.TX / 'state.json', b'{bad')
+        with self.assertRaisesRegex(m.Refused, 'receipt_invalid_json'): m.status()
+        m.write(m.TX / 'state.json', b'[]')
+        with self.assertRaisesRegex(m.Refused, 'invalid_receipt_shape'): m.status()
+
+    def test_layout_without_receipt_is_not_mistaken_for_fresh_install(self):
+        m.SWITCH.mkdir()
+        with self.assertRaisesRegex(m.Refused, 'layout_exists_without_receipt'): m.status()
+
     def test_apply_only_changes_cwd_and_preserves_env_and_original_units(self):
         before = {u: (m.SYSTEM / u).read_bytes() for u in m.g.UNITS.values()}
         record = m.apply()

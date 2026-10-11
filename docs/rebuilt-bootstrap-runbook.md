@@ -56,7 +56,8 @@ ExecStart、FragmentPath、DropInPaths、EnvironmentFiles，并核对原 unit �
   或组/其他用户写入。权限不符合只报告拒绝，不自动改权限或读取内容。
 
 源码或标记不匹配时禁止通过编辑 expected SHA/清单“使检查通过”；应复核原部署
-来源。脚本错误只输出固定原因码，不打印命令输出、unit 内容或秘密。
+来源。错误输出 JSON 原因码；文件系统失败附 errno/路径，可信性失败附具体路径及
+uid/gid/mode。只报告文件元数据，不打印命令输出、unit 内容或秘密。
 
 ## 可合并为一次批准的服务器步骤
 
@@ -86,7 +87,9 @@ ExecStart、FragmentPath、DropInPaths、EnvironmentFiles，并核对原 unit �
 `apply` 重复全部前置检查、持久记录原状态和 unit 备份，再创建链接/drop-in，
 daemon-reload 并检查有效配置，联合重启且**只重启这两个应用服务**。
 健康验证检查两服务、Web、API 的 ok/db/release 与回环监听。
-首次 apply 有现存回执即拒绝，避免重复重启；status 仅报告既有回执，不声称新健康检查。
+首次 apply 有现存回执即拒绝，避免重复重启；status 仅报告状态，不声称新健康检查。
+全新无事务且无布局时，status 返回 `not_initialized`、`receipt_exists:false`，
+不会写入回执或创建目录。仅已有 STATE 的情形要求它为可信 root-only 0700 空目录。
 成功为 `same_version_ready`；不创建 releases/incoming/state/rebuilt，不授予部署 sudo，
 不改 EnvironmentFile、不迁移数据、不启用 accepted，也不配置接入身份。
 
@@ -129,3 +132,38 @@ SIGTERM/SIGHUP/中断会尝试恢复；SIGKILL/断电无法执行清理，下次
 
 本阶段没有建立 SSH/云助手/OIDC 通道。接入身份与云助手参数边界仍按
 [接入审批草案](rebuilt-bootstrap-access.md) 单独处理。
+
+## 首次失败报告的复核与更新方式
+
+旧 `invalid_state_or_file` 混淆文件缺失与 JSON 损坏等错误；
+`untrusted_policy_or_helper` 不指出具体路径，这是已确认的诊断缺陷。
+不是 load/save 初始化死锁：check 不调用 load；首次 apply 创建 STATE/TX 后
+保存回执；原子保存不要求 state.json 预先存在。原 c80f386 的完整 CLI 在隔离容器
+中可复现首次 status 的笼统错误，但首次 check/apply/status/rollback 全部成功。
+服务器 check/apply 的真实拒绝点仍待新错误信息定位，不能声称现场已经修好。
+
+| 新输出 | 含义与处理 |
+| --- | --- |
+| not_initialized | 无 TX/布局，未开始；check 成功后才可执行已批准 apply |
+| receipt_not_initialized | 无事务时请求 rollback；不需要回滚，不创建回执 |
+| receipt_missing_in_existing_transaction | TX 存在但回执缺失，可能初始化中断或人为创建；停止并检查 root-only 证据 |
+| receipt_invalid_json / invalid_receipt_shape / invalid_receipt | 已有回执损坏或字段不合法，拒绝自动继续 |
+| untrusted_path / bootstrap_dependency_untrusted | 具体文件或祖先的属主、权限或类型不符合原规则；不放松校验 |
+| filesystem_error / trusted_path_unavailable | 路径及 errno 指向缺失或不可访问对象；不以空文件替代 |
+
+最少现场诊断：新版 status/check 的 JSON 输出，以及所指路径和祖先的文件类型、
+uid/gid、八进制权限、是否符号链接（可用 namei/stat 获取）。已有 STATE 是否 0700、
+是否有 TX、TX 中的文件名也可报告。不要提供 .env、unit 备份或 state.json 正文。
+
+已安装 c80f386 时，不重建安装目录、不触碰布局或恢复记录：核对旧三文件摘要，
+保留旧脚本的 root-only 副本，仅将审阅后的新 rebuilt-bootstrap.py 原子替换到原位置，
+保持 root:root 0644。helper 和基线清单字节未变，仍逐项校验；新摘要以固定提交的
+rebuilt-bootstrap-files.sha256 为准。更新后只先运行 status/check；失败立即停止，
+不自动 apply、填 state.json、补 RELEASE_SHA 或改可信策略。
+状态确属未初始化且 check 成功时，原已批准的同版本 apply/回退范围仍适用；
+修复没有新增服务器、网络、权限或服务变更范围。
+
+旧 17 项测试在临时目录调用函数，替换了 root 可信性和服务查询，没有覆盖完整
+CLI 的初始 status/error 输出与真实祖先检查。现在 CI 必跑无网络、无宿主目录挂载
+的临时 root 容器测试：真实 UID、属主权限、固定路径、load/save/main/trusted 与
+原子文件操作，只有 systemctl/curl/ss/Node 版本命令为替身；不是 ECS 或真实 systemd 验收。

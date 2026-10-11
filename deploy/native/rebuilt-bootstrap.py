@@ -25,10 +25,17 @@ g = importlib.util.module_from_spec(spec)
 if __name__ == '__main__':
     dependency = HERE / 'rebuilt-gateway.py'
     for path in (dependency, *dependency.parents):
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError as error:
+            print(json.dumps({'error': 'bootstrap_dependency_unavailable', 'path': str(path),
+                              'errno': error.errno}), file=sys.stderr)
+            sys.exit(1)
         if info.st_uid != 0 or info.st_mode & 0o022 or not (
                 stat.S_ISREG(info.st_mode) if path == dependency else stat.S_ISDIR(info.st_mode)):
-            sys.exit('Untrusted bootstrap dependency; administrator installation required.')
+            print(json.dumps({'error': 'bootstrap_dependency_untrusted', 'path': str(path),
+                              'uid': info.st_uid, 'mode': oct(stat.S_IMODE(info.st_mode))}), file=sys.stderr)
+            sys.exit(1)
 spec.loader.exec_module(g)
 ROOT = Path('/opt/aifinance')
 OLD = ROOT / 'staging' / g.BASELINE
@@ -46,6 +53,33 @@ ENTRIES = {'api': 'apps/api/src/main.ts', 'web': 'apps/web/server.ts'}
 run = g.run
 require = g.require
 Refused = g.Refused
+
+
+class Diagnostic(Refused):
+    def __init__(self, code, path=None, **metadata):
+        super().__init__(code)
+        self.details = {'error': code, **metadata}
+        if path is not None:
+            self.details['path'] = str(path)
+
+
+def trusted(path, directory=False):
+    # Preserve the gateway's trust rules; only improve the rejected-path report.
+    try:
+        g.trusted(path, directory=directory)
+    except (Refused, OSError) as error:
+        for candidate in (path, *path.parents):
+            try:
+                info = candidate.lstat()
+            except OSError as missing:
+                raise Diagnostic('trusted_path_unavailable', candidate, errno=missing.errno) from None
+            is_dir = directory if candidate == path else True
+            kind_ok = stat.S_ISDIR(info.st_mode) if is_dir else stat.S_ISREG(info.st_mode)
+            if info.st_uid != 0 or info.st_mode & 0o022 or not kind_ok:
+                raise Diagnostic('untrusted_path', candidate, uid=info.st_uid, gid=info.st_gid,
+                                 mode=oct(stat.S_IMODE(info.st_mode)),
+                                 expected='directory' if is_dir else 'regular_file') from None
+        raise error
 
 
 def drop(alias):
@@ -91,7 +125,7 @@ def directory(path, mode=0o700):
             os.chown(path, 0, 0)
         path.chmod(mode)
         g.sync_dir(path.parent)
-    g.trusted(path, directory=True)
+    trusted(path, directory=True)
     require(path.stat().st_mode & 0o777 == mode, 'directory_mode')
 
 
@@ -117,19 +151,59 @@ def write(path, data, mode=0o600):
 
 
 def load():
-    g.trusted(STATE, directory=True)
-    g.trusted(TX, directory=True)
-    g.trusted(TX / 'state.json')
-    value = json.loads(read(TX / 'state.json', 65536))
-    require(value.get('version') == 1 and value.get('baseline') == g.BASELINE,
+    if absent(TX):
+        raise Diagnostic('receipt_not_initialized', TX / 'state.json')
+    trusted(STATE, directory=True)
+    trusted(TX, directory=True)
+    require(STATE.stat().st_mode & 0o777 == 0o700 and TX.stat().st_mode & 0o777 == 0o700,
+            'state_directory_mode')
+    if absent(TX / 'state.json'):
+        raise Diagnostic('receipt_missing_in_existing_transaction', TX / 'state.json')
+    trusted(TX / 'state.json')
+    require((TX / 'state.json').stat().st_mode & 0o777 == 0o600, 'receipt_mode')
+    try:
+        value = json.loads(read(TX / 'state.json', 65536))
+    except ValueError:
+        raise Diagnostic('receipt_invalid_json', TX / 'state.json') from None
+    require(isinstance(value, dict) and set(value) ==
+            {'version', 'baseline', 'phase', 'units', 'schema', 'health_release'}, 'invalid_receipt_shape')
+    require(value['version'] == 1 and value['baseline'] == g.BASELINE and
+            value['phase'] in ('prepared', 'restarting', 'same_version_ready', 'restoring',
+                               'rolled_back', 'recovery_required') and
+            isinstance(value['units'], dict) and set(value['units']) == set(ENTRIES) and
+            all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v) for v in value['units'].values()) and
+            isinstance(value['schema'], str) and re.fullmatch(r'[0-9a-f]{64}', value['schema']) and
+            value['health_release'] in ('dev', g.BASELINE),
             'invalid_receipt')
     return value
 
 
+def state_parent():
+    if not absent(STATE):
+        trusted(STATE, directory=True)
+        require(STATE.stat().st_mode & 0o777 == 0o700, 'state_directory_mode')
+
+
+def status():
+    state_parent()
+    if not absent(TX):
+        return load()
+    require(absent(SWITCH) and all(absent(drop(a).parent) for a in ENTRIES),
+            'layout_exists_without_receipt')
+    require(absent(STATE) or not any(STATE.iterdir()), 'unknown_state_entries')
+    # Observation only, not a fabricated or persisted deployment receipt.
+    return {'phase': 'not_initialized', 'receipt_exists': False}
+
+
 def policy_disabled():
     if not absent(g.POLICY):
-        g.trusted(g.POLICY)
-        require(json.loads(read(g.POLICY, 65536)).get('accepted') is False,
+        trusted(g.POLICY)
+        try:
+            value = json.loads(read(g.POLICY, 65536))
+        except ValueError:
+            raise Diagnostic('policy_invalid_json', g.POLICY) from None
+        require(isinstance(value, dict), 'policy_invalid_shape')
+        require(value.get('accepted') is False,
                 'disable_deployment_policy_first')
 
 
@@ -138,7 +212,7 @@ def source_check():
     require(OLD.is_dir() and OLD.stat().st_uid == pwd.getpwnam('aifinance-deploy').pw_uid,
             'baseline_owner')
     require(read(OLD / 'RELEASE_SHA', 64).decode().strip() == g.BASELINE, 'baseline_identity')
-    g.trusted(MANIFEST)
+    trusted(MANIFEST)
     raw = read(MANIFEST)
     require(digest(raw) == MANIFEST_DIGEST, 'source_manifest_changed')
     lines = raw.decode().splitlines()
@@ -189,9 +263,9 @@ def properties(alias, switched=False):
     # executable/argv fields and refuse multiple commands or extra arguments.
     pattern = r'\{ path=' + re.escape(str(NODE)) + r' ; argv\[\]=' + re.escape(expected) + r' ; ignore_errors=no ; [^{}]*\}'
     require(re.fullmatch(pattern, values['ExecStart']) is not None, 'unit_exec')
-    g.trusted(Path(values['FragmentPath']))
+    trusted(Path(values['FragmentPath']))
     if switched:
-        g.trusted(drop(alias))
+        trusted(drop(alias))
     return digest(read(SYSTEM / g.UNITS[alias], 65536))
 
 
@@ -226,9 +300,10 @@ def wait_health(expected):
 
 def preflight():
     policy_disabled()
-    g.trusted(ROOT, directory=True)
-    g.trusted(SYSTEM, directory=True)
-    g.trusted(NODE)
+    state_parent()
+    trusted(ROOT, directory=True)
+    trusted(SYSTEM, directory=True)
+    trusted(NODE)
     require(run([str(NODE), '--version']).strip() == 'v24.21.0', 'node_changed')
     require(absent(SWITCH), 'switch_already_exists')
     for alias in ENTRIES:
@@ -244,15 +319,15 @@ def restore(record):
     policy_disabled()
     idle()  # Never race a restart left pending by a killed process.
     if not absent(SWITCH):
-        g.trusted(SWITCH, directory=True)
+        trusted(SWITCH, directory=True)
     for alias in ENTRIES:
         require(digest(read(SYSTEM / g.UNITS[alias], 65536)) == record['units'][alias],
                 'original_unit_changed')
         if not absent(drop(alias)):
-            g.trusted(drop(alias))
+            trusted(drop(alias))
             require(read(drop(alias)) == content(), 'dropin_changed')
         if not absent(drop(alias).parent):
-            g.trusted(drop(alias).parent, directory=True)
+            trusted(drop(alias).parent, directory=True)
             require(set(drop(alias).parent.iterdir()) <= {drop(alias)}, 'other_dropin_files')
     if not absent(CURRENT):
         require(CURRENT.is_symlink() and os.readlink(CURRENT) == str(OLD), 'current_changed')
@@ -282,7 +357,9 @@ def restore(record):
 
 
 def apply():
-    require(absent(TX), 'receipt_exists_use_status_or_rollback')
+    if not absent(TX):
+        load()  # Distinguish a valid previous receipt from damaged partial state.
+        raise Refused('receipt_exists_use_status_or_rollback')
     record = preflight()
     directory(STATE)
     directory(TX)
@@ -347,12 +424,12 @@ def main():
     os.environ.update(g.ENV)
     os.umask(0o077)
     for path in (Path(__file__).resolve(), HERE / 'rebuilt-gateway.py', MANIFEST):
-        g.trusted(path)
+        trusted(path)
     action = sys.argv[1]
     if action == 'check':
         record = preflight()
     elif action == 'status':
-        record = load()
+        record = status()
     else:
         fd = lock()
         try:
@@ -365,7 +442,8 @@ def main():
         finally:
             os.close(fd)
     # Only non-sensitive fields. dev is deliberately preserved in phase one.
-    print(json.dumps({k: record[k] for k in ('baseline', 'phase', 'health_release')}))
+    print(json.dumps({k: record[k] for k in ('baseline', 'phase', 'health_release', 'receipt_exists')
+                      if k in record}))
 
 
 def interrupted(signum, frame):
@@ -378,6 +456,14 @@ if __name__ == '__main__':
     try:
         main()
     except (Refused, OSError, ValueError, KeyError) as error:
-        code = str(error) if isinstance(error, Refused) and re.fullmatch(r'[a-z0-9_]+', str(error)) else 'invalid_state_or_file'
-        print('Bootstrap refused: ' + code + '; use root-only receipt and approved rollback.', file=sys.stderr)
+        if isinstance(error, Diagnostic):
+            details = error.details
+        elif isinstance(error, OSError):
+            details = {'error': 'filesystem_error', 'errno': error.errno}
+            if error.filename:
+                details['path'] = str(error.filename)
+        else:
+            code = str(error) if isinstance(error, Refused) and re.fullmatch(r'[a-z0-9_]+', str(error)) else 'invalid_metadata'
+            details = {'error': code}
+        print(json.dumps(details), file=sys.stderr)
         sys.exit(1)

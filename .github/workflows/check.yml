@@ -66,6 +66,10 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Preview safety regression
         run: npm run test:preview && npm run test:deploy && npm run test:rebuilt
+      - name: Bootstrap first-run CLI with real root-owned files
+        # Ephemeral filesystem; no host mounts, network, SSH or production credentials.
+        # CHOWN only creates the deployment UID fixture inside the disposable container.
+        run: python3 -B scripts/tests/run-rebuilt-bootstrap-cli.py
       - name: Release readable by a different runtime UID
         # Root is used only to create/drop identities in disposable /tmp test fixtures.
         # This job has no SSH credentials and never connects to the deployment host.
