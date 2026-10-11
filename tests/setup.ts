@@ -7,14 +7,26 @@ process.env.EDITORIAL_AUTOMATIC_FIXTURES = "true";
 // local stubs by the tests that need them, and the push valves stay off. The files share
 // one database and its paid-service budgets, so they run one at a time (package.json).
 import http from "node:http";
+import "./local-network-guard.ts";
 
 const database = new URL(process.env.DATABASE_URL ?? "postgres://unset/unset").pathname.slice(1);
 if (!/_(test|ci)$/.test(database)) {
   throw new Error(`Invariant tests write rows: point DATABASE_URL at a throwaway database named *_test or *_ci (got "${database}")`);
 }
 process.env.AIHOT_CREDENTIALS_DIR = "/nonexistent-test-credentials";
-process.env.SESSION_SECRET ??= "test-session-secret-0123456789";
-process.env.IMG_PROXY_SIGN_SECRET ??= "test-img-secret-0123456789";
+// Never inherit provider credentials or endpoints from a developer shell. Fixtures
+// install their own dummy keys and local endpoints after importing this module.
+for (const prefix of ["LLM", "DEEPSEEK", "DASHSCOPE", "ZHIPU", "XIAOMI_MIMO", "EMBEDDING", "SOCIALDATA", "DAJIALA", "JINA", "FEISHU"]) {
+  for (const key of Object.keys(process.env)) if (key.startsWith(`${prefix}_`)) delete process.env[key];
+  if (prefix !== "FEISHU") process.env[`${prefix}_BASE_URL`] = "http://127.0.0.1:1/v1";
+}
+process.env.SESSION_SECRET = "test-session-secret-0123456789";
+process.env.IMG_PROXY_SIGN_SECRET = "test-img-secret-0123456789";
+process.env.COLLECT_ENABLED = "false";
+// This switch is scoped to test processes guarded above; production/CI service
+// defaults remain false. Explicit valve-off regression tests still switch it off.
+process.env.MODEL_CALLS_ENABLED = "true";
+process.env.FEISHU_INTERNAL_ENABLED = "false";
 process.env.FEISHU_CONTENT_PUSH_ENABLED = "false";
 process.env.INDEXNOW_SUBMIT_ENABLED = "false";
 process.env.LOG_LEVEL ??= "error";
