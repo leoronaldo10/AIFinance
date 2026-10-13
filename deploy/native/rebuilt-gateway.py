@@ -4,6 +4,9 @@
 No provisioning, database connection, credential read, shell evaluation or arbitrary
 service arguments. All deployment paths require a root-owned acceptance policy.
 """
+import base64
+import binascii
+import termios
 import fcntl
 import hashlib
 import json
@@ -51,7 +54,7 @@ def parse(command):
     patterns = (r'rebuilt-v1 (verify|inspect|status)',
                 r'rebuilt-v1 (status|resume) ' + ID,
                 r'rebuilt-v1 logs (api|web)',
-                r'rebuilt-v1 upload ' + SHA + ' ' + DIGEST,
+                r'rebuilt-v1 (upload|artifact-status) ' + SHA + ' ' + DIGEST,
                 r'rebuilt-v1 deploy ' + SHA + ' ' + DIGEST + ' ' + ID,
                 r'rebuilt-v1 rollback ' + SHA + ' ' + ID)
     require(any(re.fullmatch(p, command) for p in patterns), 'command_denied')
@@ -534,8 +537,63 @@ def logs(alias):
             'visibility': 'current_account_only; empty does not prove no logs'}
 
 
-def main():
-    args = parse(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+class TerminalUpload:
+    """Canonical PTY-safe, stop-and-wait ASCII; never interpret terminal bytes as tar."""
+    def __init__(self, stream, send):
+        self.stream, self.send = stream, send
+        self.sequence = 0
+        self.count = 0
+        self.done = False
+        send({'terminal': 'rebuilt-pty-v1', 'ack': 0})
+
+    def read(self, size):
+        require(size > 0, 'archive_limit')
+        if self.done:
+            return b''
+        line = self.stream.readline(1040)
+        require(line.endswith(b'\n') and len(line) <= 1034, 'terminal_line')
+        if line == b'.\n':
+            self.done = True
+            return b''
+        require(re.fullmatch(rb'[0-9]{8}:[A-Za-z0-9+/]+={0,2}\n', line), 'terminal_encoding')
+        require(int(line[:8]) == self.sequence + 1, 'terminal_sequence')
+        try:
+            data = base64.b64decode(line[9:-1], validate=True)
+        except (ValueError, binascii.Error):
+            raise Refused('terminal_encoding')
+        require(base64.b64encode(data) == line[9:-1] and 0 < len(data) <= min(size, 768),
+                'terminal_encoding')
+        self.count += len(data)
+        require(self.count <= LIMIT, 'archive_limit')
+        self.sequence += 1
+        self.send({'terminal': 'rebuilt-pty-v1', 'ack': self.sequence})
+        return data
+
+
+def terminal_command(argv):
+    require(len(argv) >= 3 and argv[0] == '--terminal' and
+            not os.environ.get('SSH_ORIGINAL_COMMAND'), 'terminal_command')
+    command = ' '.join(argv[1:])
+    args = parse(command)
+    require(argv[1:] == command.split(' ') and args[0] in
+            ('verify', 'upload', 'artifact-status', 'deploy', 'rollback', 'status', 'resume'), 'terminal_command')
+    return command
+
+
+def terminal_input():
+    require(sys.stdin.isatty(), 'terminal_required')
+    attrs = termios.tcgetattr(sys.stdin.fileno())
+    # Keep canonical lines bounded below MAX_CANON, disable echo before ready ACK.
+    attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+    attrs[3] |= termios.ICANON
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+    return TerminalUpload(sys.stdin.buffer,
+                          lambda value: print(json.dumps(value), flush=True))
+
+
+def main(terminal=False):
+    args = parse(terminal_command(sys.argv[1:]) if terminal else
+                 os.environ.get('SSH_ORIGINAL_COMMAND', ''))
     os.environ.clear()
     os.environ.update(ENV)
     os.umask(0o077)
@@ -547,15 +605,24 @@ def main():
     directory = state_dir()
     if args[0] == 'logs':
         return logs(args[1])
-    fd = lock(directory, shared=args[0] in ('status', 'inspect'))
+    fd = lock(directory, shared=args[0] in ('status', 'inspect', 'artifact-status'))
     try:
         if args[0] in ('status', 'inspect'):
             opid = args[1] if len(args) == 2 else active_id(directory)
             return {'protocol': 'rebuilt-v1', 'current': current_sha(p),
                     'operation': receipt(directory, opid) if opid else None}
+        if args[0] == 'artifact-status':
+            require(approved(p, args[1], args[2]), 'artifact_not_approved')
+            incoming = ROOT / 'incoming'
+            require(incoming.is_dir() and incoming.resolve() == incoming, 'incoming_not_provisioned')
+            target = incoming / (args[1] + '.tar.gz')
+            present = target.exists() or target.is_symlink()
+            require(not present or file_digest(target) == args[2], 'archive_conflict')
+            return {'protocol': 'rebuilt-v1', 'revision': args[1], 'sha256': args[2],
+                    'present': present}
         if args[0] == 'upload':
             require(approved(p, args[1], args[2]), 'artifact_not_approved')
-            return upload(args[1], args[2], sys.stdin.buffer)
+            return upload(args[1], args[2], terminal_input() if terminal else sys.stdin.buffer)
         services_idle()
         if args[0] == 'resume':
             record = receipt(directory, args[1])
@@ -575,7 +642,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(Refused('operation_timeout')))
     signal.alarm(480)
     try:
-        result = main()
+        result = main(terminal=len(sys.argv) > 1)
         print(json.dumps(result, sort_keys=True))
         sys.exit(0 if result.get('phase', 'succeeded') == 'succeeded' else 1)
     except Refused as error:

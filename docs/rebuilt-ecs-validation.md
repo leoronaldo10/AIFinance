@@ -1,3 +1,7 @@
+> 新增离线代理适配验证见 [固定代理适配](rebuilt-proxy-adapter.md)：14项适配测试、
+> 原网关43项、bootstrap/launcher24项和readonly来源70项通过。包含真实本地PTY，
+> 不代表ECS/云API或远程大制品验收。以下未提交等措辞是原阶段历史记录。
+
 # Rebuilt ECS deployment review
 
 > 2026-10-13 更新：现场报告同版本 bootstrap 已验收，随后增加 root 管理的

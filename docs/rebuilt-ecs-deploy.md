@@ -11,7 +11,7 @@ WorkingDirectory=switch/current，EnvironmentFile 仍是原 staging/.env。
 这些是现场报告，不是本轮直接连接验证。备案仍 pending，只承诺 localhost
 3000/3001 和 PostgreSQL 55432 回环；公网端口、域名、HTTPS 不在本轮范围。
 
-本轮仅本地代码/测试。PR #4 历史 head 为 bc62c6b，新增变更未提交或推送。
+本轮仅本地代码/测试。PR #4 保持draft；后续离线代理适配见 [固定代理适配](rebuilt-proxy-adapter.md)。
 现有代理仅获准固定只读，不因为 RAM 限制实例和用户就具有技术上的命令只读边界。
 临时 STS 已有明确到期时间，不假定仍有效或自动续签；长期凭据及扩权没有批准。
 
@@ -92,8 +92,9 @@ SQL清单和实际迁移文件必须与已验收基线一致；网关不查询/�
 - 同版SHA启动验收、失败时恢复95 drop-in的管理员路径、短停窗口；之后才accepted。
 - 另列首发SHA/摘要/操作ID、回退SHA、维护窗口和STS期限；不批准公网或长期AK。
 
-现有代理尚需审查固定upload（二进制stdin）、deploy/rollback/status/resume调用，
-包括如何安全传递SSH_ORIGINAL_COMMAND、限时与返回码；本轮没有实现新远端能力。
+固定upload现新增PTY安全Base64离线适配与artifact-status查询，deploy/rollback/status/resume
+有离线协议检查与真实网关fixture集成。live入口仍锁定；大制品吞吐与API发送编排未验收，
+详见 [固定代理适配](rebuilt-proxy-adapter.md)。本轮没有启用新远端能力。
 旧deploy-rebuilt.yml仍是SSH通道，不因有只读代理就自动可用；不假定dispatch写权限。
 
 ## 断线和环境重建
