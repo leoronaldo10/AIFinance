@@ -114,3 +114,30 @@ configured, and authorized the independent fix branch and draft PR #4. The first
 Check run passed Docker/Python 3.6 and failed at backend fixtures; its log download
 was denied and was not retried. The owner supplied failure text for diagnosis.
 No merge, deployment or real service access is authorized by this report.
+
+## Operation timeout follow-up (2026-10-13, code only)
+
+The gateway suite now contains 55 tests (12 new regressions). Signals are injected
+at exact health/retry, spawn, failed-spawn and cleanup boundaries. Local child
+processes verify PID ownership, process-group termination, pipe closure and reaping;
+mocked cleanup failures verify bounded waits and fail-closed propagation. Receipt
+fixtures verify no replay after uncertain restart/rollback, including a new ID,
+revoked approval, damaged target and interrupted extraction. Three older recovery
+expectations now require operator review when the preceding restart was uncertain.
+Normal confirmed health-failure rollback remains covered.
+
+Independent review identified and drove fixes for both the spawn ownership race
+and signal loss when spawn itself fails, plus cleanup errors escaping into normal
+business recovery. The test environment uses only temporary paths and mocked host
+services; none of these checks verifies real ECS/systemd behavior. Local validation
+includes rebuilt, legacy deployment and preview regression, typecheck, web build and
+19 web tests. The legacy deployment fixtures need a test-shell umask of 022; an
+initial run inherited 077 and failed fixture traversal checks, then was rerun with
+022. This changes only that local test process, not server or system permissions.
+The legacy broker output-limit test also hit its existing 50ms startup deadline
+once; its isolated rerun passed without code changes, and the deployment suite
+was rerun. No test was skipped to conceal a failure.
+
+The representative 54,867,366-byte package exceeds unchanged 1MiB client admission.
+The transfer proposal in rebuilt-proxy-adapter.md is design only and remains an
+explicit future authorization gate. No transfer fallback was enabled.

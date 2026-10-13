@@ -45,6 +45,15 @@ class Interrupted(BaseException):
     pass
 
 
+class OperationTimeout(Interrupted):
+    pass
+
+
+def operation_timeout(*_):
+    # Never classify the operation deadline as a retryable health/command failure.
+    raise OperationTimeout('operation_timeout_query_status')
+
+
 def require(condition, reason):
     if not condition:
         raise Refused(reason)
@@ -115,36 +124,75 @@ def trusted(path, directory=False):
 
 
 def run(argv, limit=32768, timeout=15):
-    # Output is bounded while reading, including failing commands. Never echo stderr.
-    with open(os.devnull, 'wb') as error:
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=error, env=ENV)
-        import selectors
-        selector = selectors.DefaultSelector()
+    # Each command owns a process group, including children holding the output pipe.
+    import selectors
+    process = None
+    selector = selectors.DefaultSelector()
+    try:
+        # Record terminal signals until ownership of the new PID is established.
+        # Blocking the mask here would also block those signals in the child.
+        pending = []
+        handlers = {}
+        try:
+            for signum in (signal.SIGALRM, signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                handlers[signum] = signal.signal(signum, lambda sig, frame: pending.append((sig, frame)))
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+            if pending:
+                signum, frame = pending[0]
+                handler = handlers[signum]
+                if callable(handler):
+                    handler(signum, frame)
+                raise Interrupted('command_spawn_interrupted_query_status')
+
         selector.register(process.stdout, selectors.EVENT_READ)
         output = bytearray()
         end = time.monotonic() + timeout
+        while True:
+            remaining = end - time.monotonic()
+            require(remaining > 0, 'command_timeout')
+            require(selector.select(remaining), 'command_timeout')
+            chunk = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            require(len(output) <= limit, 'command_output_limit')
         try:
-            while True:
-                remaining = end - time.monotonic()
-                require(remaining > 0, 'command_timeout')
-                require(selector.select(remaining), 'command_timeout')
-                chunk = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(output)))
-                if not chunk:
-                    break
-                output.extend(chunk)
-                require(len(output) <= limit, 'command_output_limit')
-            try:
-                code = process.wait(timeout=max(.01, end-time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise Refused('command_timeout')
-            require(code == 0, 'command_failed')
-            return output.decode('utf-8')
-        finally:
+            code = process.wait(timeout=max(.01, end-time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise Refused('command_timeout') from None
+        require(code == 0, 'command_failed')
+        return output.decode('utf-8')
+    finally:
+        # Defer terminal signals through bounded cleanup; a second signal must not
+        # interrupt reaping. This cannot cancel jobs already accepted by systemd.
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK,
+                                        {signal.SIGALRM, signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+        try:
             selector.close()
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            process.stdout.close()
+            if process is not None:
+                cleanup_failed = False
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+                try:
+                    process.stdout.close()
+                except OSError:
+                    cleanup_failed = True
+                try:
+                    process.wait(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    cleanup_failed = True
+                if cleanup_failed:
+                    raise Interrupted('command_cleanup_unknown_query_status') from None
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
 
 def properties(unit):
@@ -380,7 +428,12 @@ def switch(p, sha, opid, previous):
 
 
 def restart():
-    run(['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'restart', *UNITS.values()], timeout=45)
+    try:
+        run(['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'restart', *UNITS.values()], timeout=45)
+    except (Refused, OSError, UnicodeError):
+        # Even failure may follow a partially accepted systemd job. Do not issue
+        # another restart/rollback on the strength of a missing success response.
+        raise Interrupted('restart_outcome_unknown_query_status') from None
 
 
 def services_idle():
@@ -433,6 +486,23 @@ def publish(p, directory, action, sha, digest, opid):
                 require(healthy(sha), 'completed_release_unhealthy')
             return record
         require(current_sha(p, allow_missing=True) in (record['previous'], sha), 'interrupted_layout_changed')
+        if record['phase'] in ('checking', 'rolling_back'):
+            # These phases are persisted BEFORE dispatch. A fresh invocation cannot
+            # know whether a restart ran, even when list-jobs is now empty.
+            expected = sha if record['phase'] == 'checking' else record['previous']
+            try:
+                if record['phase'] == 'checking':
+                    require(approved(p, sha, digest) if action == 'deploy' else
+                            sha in p['rollback_targets'], 'release_approval_revoked')
+                else:
+                    require(record['fallback_allowed'], 'fallback_unavailable')
+                validate_release(p, expected)
+                require(current_sha(p) == expected and healthy(expected), 'outcome_unconfirmed')
+            except (Refused, OSError):
+                save(directory, record, 'recovery_required')
+            else:
+                save(directory, record, 'succeeded' if record['phase'] == 'checking' else 'rolled_back')
+            return record
     else:
         old = current_sha(p)
         if action == 'rollback':
@@ -472,13 +542,17 @@ def publish(p, directory, action, sha, digest, opid):
                 stage.mkdir(mode=0o700)
                 helper = ROOT / 'bin/extract-release.py'
                 trusted(helper)
+                interrupted_stage = False
                 try:
                     run(['/usr/bin/python3', '-I', '-B', str(helper), str(archive), str(stage)], timeout=60)
                     os.rename(stage, target)
                     sync_dir(target.parent)
                     atomic(marker, {'sha256': digest})
+                except (Interrupted, KeyboardInterrupt):
+                    interrupted_stage = True
+                    raise
                 finally:
-                    if stage.is_dir() and not stage.is_symlink():
+                    if not interrupted_stage and stage.is_dir() and not stage.is_symlink():
                         shutil.rmtree(stage)
         if action == 'rollback':
             require(sha in p['rollback_targets'], 'rollback_not_approved')
@@ -637,9 +711,9 @@ def main(terminal=False):
 if __name__ == '__main__':
     def interrupted(*_):
         raise Interrupted()
-    for signum in (signal.SIGTERM, signal.SIGHUP):
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(signum, interrupted)
-    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(Refused('operation_timeout')))
+    signal.signal(signal.SIGALRM, operation_timeout)
     signal.alarm(480)
     try:
         result = main(terminal=len(sys.argv) > 1)
@@ -647,6 +721,9 @@ if __name__ == '__main__':
         sys.exit(0 if result.get('phase', 'succeeded') == 'succeeded' else 1)
     except Refused as error:
         print(json.dumps({'ok': False, 'reason': str(error)}))
+        sys.exit(1)
+    except OperationTimeout:
+        print('{"ok":false,"reason":"operation_timeout_query_status"}')
         sys.exit(1)
     except Interrupted:
         print('{"ok":false,"reason":"operation_interrupted_query_status"}')

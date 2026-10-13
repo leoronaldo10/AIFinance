@@ -6,6 +6,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,7 @@ spec = importlib.util.spec_from_file_location('rebuilt', REPO/'deploy/native/reb
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 REAL_RUN = m.run
+REAL_RESTART = m.restart
 REAL_HEALTH = m.healthy
 OLD = m.BASELINE
 NEW = 'b'*40
@@ -303,14 +306,14 @@ class Fixture(unittest.TestCase):
         with self.assertRaisesRegex(m.Refused, '^command_timeout$'):
             REAL_RUN([sys.executable, '-c', 'import os,time;os.close(1);time.sleep(2)'], timeout=.05)
 
-    def test_missing_new_release_during_interrupted_check_restores_old(self):
+    def test_missing_new_release_during_uncertain_restart_requires_review(self):
         target = self.make(NEW)
         with patch.object(m, 'restart', side_effect=KeyboardInterrupt()), self.assertRaises(KeyboardInterrupt):
             self.publish()
         import shutil
         shutil.rmtree(target)
-        self.assertEqual(self.publish()['phase'], 'rolled_back')
-        self.assertEqual(m.current_sha(self.p), OLD)
+        self.assertEqual(self.publish()['phase'], 'recovery_required')
+        self.assertEqual(m.current_sha(self.p, allow_missing=True), NEW)
 
     def test_damaged_new_release_does_not_block_pending_rollback(self):
         target = self.make(NEW)
@@ -438,8 +441,8 @@ class Fixture(unittest.TestCase):
         with patch.object(m, 'restart', side_effect=m.Interrupted):
             with self.assertRaises(m.Interrupted): self.publish()
         self.p['rollback_targets'] = [OLD]
-        self.assertEqual(self.publish()['phase'], 'rolled_back')
-        self.assertEqual(m.current_sha(self.p), OLD)
+        self.assertEqual(self.publish()['phase'], 'recovery_required')
+        self.assertEqual(m.current_sha(self.p), NEW)
 
     def test_health_rejects_missing_or_bad_database_status(self):
         for db in (None, 'error', False):
@@ -496,14 +499,199 @@ class Fixture(unittest.TestCase):
         self.assertFalse(m.receipt(self.state, ID)['fallback_allowed'])
         self.assertEqual(m.current_sha(self.p), NEW)
 
-    def test_non_utf8_new_marker_on_resume_restores_previous(self):
+    def test_non_utf8_new_marker_on_uncertain_resume_requires_review(self):
         self.make(NEW)
         with patch.object(m, 'restart', side_effect=m.Interrupted):
             with self.assertRaises(m.Interrupted): self.publish()
         self.assertEqual(m.receipt(self.state, ID)['phase'], 'checking')
         (m.release_path(self.p, NEW)/'RELEASE_SHA').write_bytes(b'\xff')
-        self.assertEqual(self.publish()['phase'], 'rolled_back')
+        self.assertEqual(self.publish()['phase'], 'recovery_required')
+        self.assertEqual(m.current_sha(self.p), NEW)
+
+    def test_operation_alarm_escapes_health_retries_and_sleep(self):
+        previous = signal.signal(signal.SIGALRM, m.operation_timeout)
+        try:
+            for location in ('listeners', 'run', 'sleep'):
+                with self.subTest(location=location):
+                    def expired(*args, **kwargs):
+                        signal.raise_signal(signal.SIGALRM)
+                    with patch.object(m, 'listeners', side_effect=expired if location == 'listeners' else None) as listen, patch.object(m, 'run', side_effect=expired if location == 'run' else m.Refused('command_failed')) as run, patch.object(m.time, 'sleep', side_effect=expired if location == 'sleep' else AssertionError('retry after alarm')) as sleep:
+                        with self.assertRaises(m.OperationTimeout): REAL_HEALTH(NEW)
+                        self.assertEqual(listen.call_count, 1)
+                        self.assertLessEqual(run.call_count, 1)
+                        self.assertEqual(sleep.call_count, int(location == 'sleep'))
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_operation_timeout_preserves_receipt_without_fallback(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', side_effect=[True, m.OperationTimeout()]), patch.object(m, 'restart') as restart:
+            with self.assertRaises(m.OperationTimeout): self.publish()
+            restart.assert_called_once()
+        self.assertEqual(m.receipt(self.state, ID)['phase'], 'checking')
+        self.assertEqual(m.current_sha(self.p), NEW)
+        # Unknown outcome cannot authorize another switch/restart, even on resume.
+        with patch.object(m, 'healthy', return_value=False), patch.object(m, 'switch', side_effect=AssertionError('replayed switch')), patch.object(m, 'restart', side_effect=AssertionError('replayed restart')):
+            self.assertEqual(self.publish()['phase'], 'recovery_required')
+            self.assertEqual(self.publish()['phase'], 'recovery_required')
+            with self.assertRaisesRegex(m.Refused, 'unfinished'): self.publish(OLD, OTHER)
+
+    def test_restart_errors_are_uncertain_and_never_trigger_rollback(self):
+        self.make(NEW)
+        for error in (m.Refused('command_timeout'), m.Refused('command_output_limit'), m.Refused('command_failed'), OSError('dispatch failed')):
+            with self.subTest(error=str(error)):
+                opid = ('%032x' % (100 + len(list(self.state.glob('*.json')))))
+                # Restore a new fixture operation; no uncertain receipt is discarded.
+                with patch.object(m, 'active_id', return_value=None), patch.object(m, 'healthy', side_effect=[True, False]), patch.object(m, 'restart', side_effect=REAL_RESTART), patch.object(m, 'run', side_effect=error) as command:
+                    with self.assertRaises(m.Interrupted): self.publish(opid=opid)
+                    command.assert_called_once()
+                self.assertEqual(m.receipt(self.state, opid)['phase'], 'checking')
+                with patch.object(m, 'healthy', return_value=False), patch.object(m, 'restart', side_effect=AssertionError('replayed restart')):
+                    self.assertEqual(self.publish(opid=opid)['phase'], 'recovery_required')
+
+    def test_uncertain_rollback_only_converges_from_readonly_health(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', side_effect=[True, False]), patch.object(m, 'restart', side_effect=[None, m.OperationTimeout()]):
+            with self.assertRaises(m.OperationTimeout): self.publish()
+        self.assertEqual(m.receipt(self.state, ID)['phase'], 'rolling_back')
+        with patch.object(m, 'healthy', return_value=False), patch.object(m, 'switch', side_effect=AssertionError('replayed switch')), patch.object(m, 'restart', side_effect=AssertionError('replayed restart')):
+            self.assertEqual(self.publish()['phase'], 'recovery_required')
         self.assertEqual(m.current_sha(self.p), OLD)
+
+    def test_timeout_during_rollback_health_does_not_claim_recovery_failure(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', side_effect=[True, False, m.OperationTimeout()]), patch.object(m, 'restart') as restart:
+            with self.assertRaises(m.OperationTimeout): self.publish()
+            self.assertEqual(restart.call_count, 2)
+        self.assertEqual(m.receipt(self.state, ID)['phase'], 'rolling_back')
+        with patch.object(m, 'restart', side_effect=AssertionError('replayed restart')):
+            self.assertEqual(self.publish()['phase'], 'rolled_back')
+
+    def test_alarm_cleans_process_group_including_pipe_holding_descendant(self):
+        pidfile = self.root/'descendant.pid'
+        code = """import os, signal, sys
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))
+    os.write(1, b'ready')
+    signal.pause()
+else:
+    os.waitpid(child, 0)
+"""
+        real_read, real_popen = os.read, subprocess.Popen
+        children = []
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs); children.append(child); return child
+        def read(fd, size):
+            data = real_read(fd, size)
+            if data == b'ready': m.operation_timeout()
+            return data
+        try:
+            with patch.object(m.subprocess, 'Popen', side_effect=spawn), patch.object(m.os, 'read', side_effect=read):
+                with self.assertRaises(m.OperationTimeout):
+                    REAL_RUN([sys.executable, '-c', code, str(pidfile)])
+            self.assertIsNotNone(children[0].returncode)
+            self.assertTrue(children[0].stdout.closed)
+            pid = int(pidfile.read_text())
+            # An orphan may briefly be a zombie awaiting init, but must not execute.
+            deadline = time.monotonic() + 2
+            while True:
+                try: state = Path('/proc/%d/stat' % pid).read_text().split()[2]
+                except FileNotFoundError: break
+                if state == 'Z': break
+                self.assertLess(time.monotonic(), deadline, 'descendant still running')
+                time.sleep(.01)
+        finally:
+            for child in children:
+                try: os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                child.wait(timeout=2)
+
+    def test_alarm_arriving_during_cleanup_is_deferred_until_child_reaped(self):
+        previous = signal.signal(signal.SIGALRM, m.operation_timeout)
+        real_killpg, real_popen = os.killpg, subprocess.Popen
+        children = []
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs); children.append(child); return child
+        def killpg(pid, sig):
+            signal.raise_signal(signal.SIGALRM)
+            real_killpg(pid, sig)
+        try:
+            with patch.object(m.subprocess, 'Popen', side_effect=spawn), patch.object(m.os, 'killpg', side_effect=killpg):
+                with self.assertRaises(m.OperationTimeout):
+                    REAL_RUN([sys.executable, '-c', 'print("done")'])
+            self.assertIsNotNone(children[0].returncode)
+            self.assertTrue(children[0].stdout.closed)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_cleanup_wait_is_bounded_and_uncertain_failure_is_terminal(self):
+        from unittest.mock import MagicMock
+        process = MagicMock()
+        process.stdout.fileno.return_value = 100
+        process.wait.side_effect = subprocess.TimeoutExpired('fixture', 2)
+        with patch.object(m.subprocess, 'Popen', return_value=process), patch('selectors.DefaultSelector') as selector, patch.object(m.os, 'read', return_value=b''), patch.object(m.os, 'killpg'):
+            selector.return_value.select.return_value = [True]
+            with self.assertRaises(m.Interrupted): REAL_RUN(['fixture'])
+            self.assertEqual(process.wait.call_args.kwargs, {'timeout': 2})
+            process.stdout.close.assert_called_once()
+
+    def test_alarm_during_spawn_waits_for_pid_ownership_then_reaps(self):
+        previous = signal.signal(signal.SIGALRM, m.operation_timeout)
+        real_popen = subprocess.Popen
+        children = []
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            signal.raise_signal(signal.SIGALRM)
+            return child
+        try:
+            with patch.object(m.subprocess, 'Popen', side_effect=spawn):
+                with self.assertRaises(m.OperationTimeout):
+                    REAL_RUN([sys.executable, '-c', 'import time;time.sleep(60)'])
+            self.assertIsNotNone(children[0].returncode)
+            self.assertTrue(children[0].stdout.closed)
+            self.assertIs(signal.getsignal(signal.SIGALRM), m.operation_timeout)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+            for child in children:
+                if child.poll() is None: child.kill()
+                child.wait(timeout=2)
+
+    def test_group_kill_failure_still_reaps_and_aborts_business_recovery(self):
+        from unittest.mock import MagicMock
+        process = MagicMock()
+        process.stdout.fileno.return_value = 100
+        process.wait.return_value = 0
+        with patch.object(m.subprocess, 'Popen', return_value=process), patch('selectors.DefaultSelector') as selector, patch.object(m.os, 'read', return_value=b''), patch.object(m.os, 'killpg', side_effect=PermissionError('fixture')):
+            selector.return_value.select.return_value = [True]
+            with self.assertRaises(m.Interrupted): REAL_RUN(['fixture'])
+            self.assertEqual(process.wait.call_args.kwargs, {'timeout': 2})
+            process.stdout.close.assert_called_once()
+
+    def test_pending_alarm_takes_precedence_over_spawn_failure(self):
+        previous = signal.signal(signal.SIGALRM, m.operation_timeout)
+        def spawn(*args, **kwargs):
+            signal.raise_signal(signal.SIGALRM)
+            raise OSError('spawn failed after alarm')
+        try:
+            with patch.object(m.subprocess, 'Popen', side_effect=spawn):
+                with self.assertRaises(m.OperationTimeout): REAL_RUN(['fixture'])
+            self.assertIs(signal.getsignal(signal.SIGALRM), m.operation_timeout)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_extraction_timeout_preserves_stage_and_blocks_retry(self):
+        self.p['approved_artifacts'][NEW] = 'f'*64
+        with patch.object(m, 'file_digest', return_value='f'*64), patch.object(m, 'trusted'), patch.object(m, 'run', side_effect=m.OperationTimeout()):
+            with self.assertRaises(m.OperationTimeout):
+                m.publish(self.p, self.state, 'deploy', NEW, 'f'*64, ID)
+        self.assertTrue((Path(self.p['releases_dir'])/('.rebuilt-stage-'+ID)).is_dir())
+        self.assertEqual(m.receipt(self.state, ID)['phase'], 'prepared')
+        with patch.object(m, 'file_digest', return_value='f'*64), patch.object(m, 'run', side_effect=AssertionError('replayed extractor')):
+            with self.assertRaisesRegex(m.Refused, 'incomplete_stage_review_required'):
+                m.publish(self.p, self.state, 'deploy', NEW, 'f'*64, ID)
 
 
 if __name__ == '__main__':
