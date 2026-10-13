@@ -97,7 +97,7 @@ def connection_plan(action, args, credentials, expiration, seconds):
 
 
 def input_frame(channel, sequence, output_sequence, payload):
-    # AxtMessage.ts: little endian, channel before instance, UTF8 payload <=1024
+    # AxtMessage.ts: little endian, channel before instance; bounded ASCII payload <=1034
     if (not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', channel) or
             not 1 <= sequence <= 0xffffffff or not 0 <= output_sequence <= 0xffffffff or
             not isinstance(payload, bytes) or len(payload) > 1034):

@@ -1,6 +1,9 @@
 > 新增离线代理适配验证见 [固定代理适配](rebuilt-proxy-adapter.md)：14项适配测试、
 > 原网关43项、bootstrap/launcher24项和readonly来源70项通过。包含真实本地PTY，
 > 不代表ECS/云API或远程大制品验收。以下未提交等措辞是原阶段历史记录。
+> 独立reviewer复查并重跑14项通过；本轮亦通过typecheck、Web build/19项、preview、
+> 旧deploy（CI同款umask022）与隔离root CLI。默认umask077会触发原first-install
+> fixture的祖先遍历检查失败；未改该既有fixture或放宽生产权限检查。
 
 # Rebuilt ECS deployment review
 
