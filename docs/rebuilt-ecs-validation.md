@@ -1,8 +1,31 @@
 # Rebuilt ECS deployment review
 
+> 2026-10-13 更新：现场报告同版本 bootstrap 已验收，随后增加 root 管理的
+> 90-home-compat.conf，固定只读代理连接也已验收；本轮未连接 ECS。备案仍 pending，
+> 网站保持 localhost。下文原安装/接入状态是历史记录，当前本地发布准备、兼容性和
+> 待批准步骤以 [受限发布准备](rebuilt-ecs-deploy.md) 为准；新代码尚未安装或推送。
+
+
 Base: `14f53d08f35b37f4716009ed1b35f1c2318d5eaf` on
 `release/aifinance-preview`. This change adds a separate, disabled-by-default
 deployment protocol; it does not install anything on the server or migrate its layout.
+
+## 2026-10-13 本地准备验证（未提交、未部署）
+
+独立reviewer复查后修复两项恢复风险：非UTF8 RELEASE_SHA解码错误统一为Refused；
+policy固定switch/current和releases路径以匹配launcher。当前网关43项、bootstrap/launcher
+24项通过。下列41项及完整应用检查为修复前准备阶段记录，不冒充本轮重跑。
+
+- 网关 41 项、bootstrap/启动入口 24 项通过；覆盖失效回退点、断线续作、批准撤销、
+  SHA/摘要准入、旧回执拒绝、unit时间/PID归一化、配置摘要/HOME变化和真实SHA启动。
+- 隔离root CLI通过：正确HOME drop-in保留，非root属主/错误内容在变更前拒绝。
+  systemd/HTTP仍为替身，不是实际ECS回退验收。
+- typecheck、preview 5项、旧deploy回归通过（历史跨UID解包项非root跳过1项）；
+  Web构建和前端19项通过。
+- 临时本地PostgreSQL 17迁移/seed、后端171/171、页面及机器出口smoke通过；
+  临时应用进程已终止，数据库容器已停止并自动删除，不涉及生产数据。
+- 本次不访问ECS、不读取生产秘密、不修改RAM/sudo/服务配置、不触发远端工作流。
+
 
 ## Local validation
 

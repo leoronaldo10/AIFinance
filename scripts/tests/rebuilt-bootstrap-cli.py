@@ -74,7 +74,7 @@ if a[0]=='show':
  d=Path(str(path)+'.d/90-rebuilt-bootstrap.conf')
  if d.exists(): fields['WorkingDirectory']='/opt/aifinance/switch/current'
  fields['EnvironmentFiles']=fields.pop('EnvironmentFile')+' (ignore_errors=no)'
- fields['FragmentPath']=str(path); fields['DropInPaths']=str(d) if d.exists() else ''
+ fields['FragmentPath']=str(path); fields['DropInPaths']=' '.join(str(p) for p in sorted(d.parent.glob('*.conf')))
  fields['ExecStart']='{ path=/usr/local/bin/node ; argv[]='+fields['ExecStart']+' ; ignore_errors=no ; pid=1 ; status=0/0 }'
  print('\\n'.join(k+'='+v for k,v in fields.items()))
 elif a[0]=='daemon-reload': assert len(a)==1
@@ -116,7 +116,21 @@ assert cli('status')['phase'] == 'same_version_ready'
 assert TX.stat().st_uid == 0 and TX.stat().st_mode & 0o777 == 0o700
 assert (TX / 'state.json').stat().st_mode & 0o777 == 0o600
 if not original: cli('apply', False, 'receipt_exists_use_status_or_rollback')
+if not original:
+    compat = [Path('/etc/systemd/system') / ('aifinance-'+role+'.service.d/90-home-compat.conf') for role in ('api','web')]
+    for path in compat: put(path, '[Service]\nEnvironment="HOME=/opt/aifinance"\n')
+    os.chown(compat[0], 1001, 1001)
+    cli('rollback', False, 'untrusted_path')
+    os.chown(compat[0], 0, 0)
+    compat[0].write_text('[Service]\nEnvironment="HOME=/tmp"\n')
+    cli('rollback', False, 'home_compat_changed')
+    compat[0].write_text('[Service]\nEnvironment="HOME=/opt/aifinance"\n')
 assert cli('rollback')['phase'] == 'rolled_back'
+if not original:
+    for path in compat:
+        assert path.read_text() == '[Service]\nEnvironment="HOME=/opt/aifinance"\n'
+        path.unlink(); path.parent.rmdir()
+    print('CLI: root HOME drop-in preserved; changed/untrusted drop-in refused PASS', flush=True)
 assert not SWITCH.exists()
 assert (OLD / '.env').read_text() == 'SECRET=CLI-SECRET-SENTINEL\n'
 print('CLI: first check/apply/status/rollback with real root-owned files PASS', flush=True)

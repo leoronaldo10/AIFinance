@@ -66,7 +66,7 @@ class Bootstrap(unittest.TestCase):
                           ' ; ignore_errors=no ; start_time=n/a ; stop_time=n/a ; pid=0 ; code=(null) ; status=0/0 }',
                       'EnvironmentFiles': str(m.OLD / '.env') + ' (ignore_errors=no)',
                       'FragmentPath': str(m.SYSTEM / unit),
-                      'DropInPaths': str(m.drop(alias)) if switched else ''}
+                      'DropInPaths': ' '.join(str(p) for p in sorted(([m.drop(alias)] if switched else []) + ([m.home_compat(alias)] if m.home_compat(alias) else [])))}
             result.update(self.override)
             return result
         def run(argv, **kw):
@@ -236,10 +236,97 @@ class Bootstrap(unittest.TestCase):
         finally: os.close(fd)
 
 
+    def test_restore_preserves_exact_home_compat(self):
+        record = m.apply()
+        for alias in m.ENTRIES:
+            p = m.drop(alias).parent/'90-home-compat.conf'
+            p.write_bytes(b'[Service]\nEnvironment="HOME=/opt/aifinance"\n')
+        m.restore(record)
+        self.assertEqual(m.load()['phase'], 'rolled_back')
+        for alias in m.ENTRIES:
+            self.assertTrue(m.home_compat(alias).exists())
+            self.assertFalse(m.drop(alias).exists())
+        m.restore(m.load())
+
+    def test_restore_refuses_modified_unknown_or_untrusted_home_before_mutation(self):
+        record = m.apply()
+        path = m.drop('api').parent/'90-home-compat.conf'
+        for content in (b'[Service]\nEnvironment="HOME=/tmp"\n', b'[Service]\nEnvironment="HOME=/opt/aifinance"\nExecStart=/bin/sh\n'):
+            path.write_bytes(content)
+            with self.assertRaisesRegex(m.Refused, 'home_compat_changed'): m.restore(record)
+            self.assertTrue(m.drop('api').exists())
+        path.write_bytes(b'[Service]\nEnvironment="HOME=/opt/aifinance"\n')
+        with patch.object(m, 'trusted', side_effect=m.Refused('untrusted')), self.assertRaises(m.Refused): m.restore(record)
+        path.rename(path.parent/'unknown.conf')
+        with self.assertRaisesRegex(m.Refused, 'other_dropin_files'): m.restore(record)
+        self.assertTrue(m.drop('api').exists())
+
+
+class Launcher(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('launch', REPO/'deploy/native/rebuilt-launch.py')
+        self.m = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.m)
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.release = self.root/'staging'/self.m.BASELINE
+        self.release.mkdir(parents=True)
+        (self.root/'switch').mkdir(); (self.root/'switch/current').symlink_to(self.release)
+        (self.release/'RELEASE_SHA').write_text(self.m.BASELINE+'\n')
+        for entry in self.m.ENTRIES.values():
+            p=self.release/entry; p.parent.mkdir(parents=True,exist_ok=True);p.write_text('fixture')
+        for p in [patch.object(self.m,'ROOT',self.root), patch.object(self.m,'trusted'),
+                  patch.object(self.m.os,'getuid',return_value=999),patch.object(self.m.os,'geteuid',return_value=999),
+                  patch.object(self.m.pwd,'getpwuid',return_value=types.SimpleNamespace(pw_name='aifinance-deploy')),
+                  patch.object(self.m.Path,'cwd',return_value=self.release),
+                  patch.dict(os.environ,{'HOME':'/opt/aifinance','SECRET_CANARY':'retained','AIHOT_RELEASE':'false'},clear=True),
+                  patch.object(self.m.sys,'argv',['launch','api']),patch.object(self.m.os,'execve')]:
+            p.start(); self.addCleanup(p.stop)
+
+    def test_both_roles_preserve_loaded_environment_and_use_true_sha(self):
+        for role in ('api','web'):
+            with patch.object(self.m.sys,'argv',['launch',role]):self.m.main()
+            node,args,env=self.m.os.execve.call_args.args
+            self.assertEqual(node,'/usr/local/bin/node')
+            self.assertEqual(args,[node,'--experimental-strip-types',self.m.ENTRIES[role]])
+            self.assertEqual(env['AIHOT_RELEASE'],self.m.BASELINE)
+            self.assertEqual(env['HOME'],'/opt/aifinance')
+            self.assertEqual(env['SECRET_CANARY'],'retained')
+        # Same startup logic for the new release tree; no .env file read by launcher.
+        new=self.root/'releases'/('b'*40);new.parent.mkdir();self.release.rename(new)
+        (new/'RELEASE_SHA').write_text('b'*40)
+        current=self.root/'switch/current';current.unlink();current.symlink_to(new)
+        with patch.object(self.m.Path,'cwd',return_value=new):self.m.main()
+        self.assertEqual(self.m.os.execve.call_args.args[2]['AIHOT_RELEASE'],'b'*40)
+
+    def test_wrong_identity_role_home_marker_or_switch_never_executes(self):
+        cases=[patch.object(self.m.os,'geteuid',return_value=0),
+               patch.object(self.m.sys,'argv',['launch','migrate']),
+               patch.dict(os.environ,{'HOME':'/tmp'}),
+               patch.object(self.m,'trusted',side_effect=ValueError('untrusted'))]
+        for case in cases:
+            with case,self.assertRaises(ValueError):self.m.main()
+        marker=self.release/'RELEASE_SHA'
+        for value in ('c'*40, 'b'*65):
+            marker.write_text(value)
+            with self.assertRaises(ValueError):self.m.main()
+        marker.unlink();marker.symlink_to(self.root/'missing')
+        with self.assertRaises(OSError):self.m.main()
+        marker.unlink();marker.write_text(self.m.BASELINE)
+        current=self.root/'switch/current';current.unlink();current.symlink_to(self.root)
+        with self.assertRaises(ValueError):self.m.main()
+        self.m.os.execve.assert_not_called()
+
+    def test_entry_escape_refused(self):
+        entry=self.release/self.m.ENTRIES['api'];entry.unlink()
+        outside=self.root/'outside';outside.write_text('bad');entry.symlink_to(outside)
+        with self.assertRaises(ValueError):self.m.main()
+        self.m.os.execve.assert_not_called()
+
 class Manifest(unittest.TestCase):
     def test_installation_checksums_and_dropin_samples_match_implementation(self):
         root = REPO / 'deploy/native'
-        for line in (root / 'rebuilt-bootstrap-files.sha256').read_text().splitlines():
+        lines = (root / 'rebuilt-bootstrap-files.sha256').read_text().splitlines() + (root / 'rebuilt-release-files.sha256').read_text().splitlines()
+        for line in lines:
             expected, name = line.split('  ', 1)
             self.assertEqual(hashlib.sha256((root / name).read_bytes()).hexdigest(), expected)
         for alias in ('api', 'web'):

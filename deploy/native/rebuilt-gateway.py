@@ -12,6 +12,7 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -151,14 +152,40 @@ def properties(unit):
     return values
 
 
+def unit_snapshot(unit):
+    values = properties(unit)
+    # Ignore systemd's volatile execution result fields, never executable/argv.
+    match = re.fullmatch(r'\{ path=([^;{}]+) ; argv\[\]=([^;{}]+) ; ignore_errors=no ; [^{}]*\}', values['ExecStart'])
+    require(match is not None, 'unit_exec_format')
+    values['ExecStart'] = {'path': match[1].strip(), 'argv': shlex.split(match[2])}
+    raw = run(['/usr/bin/systemctl', 'show', unit, '--property=Environment', '--value'])
+    homes = [item.split('=', 1)[1] for item in shlex.split(raw) if item.startswith('HOME=')]
+    require(homes == ['/opt/aifinance'], 'unit_home')
+    values['HOME'] = homes[0]
+    paths = [values['FragmentPath'], *values['DropInPaths'].split()]
+    hashes = {}
+    for name in paths:
+        path = Path(name)
+        trusted(path)
+        hashes[name] = hashlib.sha256(read(path)).hexdigest()
+    values['files_sha256'] = hashes
+    return values
+
+
+def approved(p, sha, digest):
+    return p['approved_artifacts'].get(sha) == digest
+
+
 def policy():
     trusted(POLICY)
     value = document(POLICY)
     require(set(value) == {'version', 'accepted', 'baseline', 'database', 'current_link',
-                           'releases_dir', 'node', 'schema_sha256', 'units'}, 'policy_keys')
-    require(value['version'] == 1 and value['accepted'] is True and value['baseline'] == BASELINE,
+                           'releases_dir', 'node', 'schema_sha256', 'units', 'approved_artifacts', 'rollback_targets', 'helpers_sha256'}, 'policy_keys')
+    require(value['version'] == 2 and value['accepted'] is True and value['baseline'] == BASELINE,
             'layout_not_accepted')
     require(value['database'] == {'host': '127.0.0.1', 'port': 55432, 'verified': True}, 'database_not_attested')
+    require(value['current_link'] == str(ROOT / 'switch/current') and
+            value['releases_dir'] == str(ROOT / 'releases'), 'launcher_layout_mismatch')
     for key in ('current_link', 'releases_dir'):
         p = Path(value[key])
         require(p.is_absolute() and p != ROOT and p.is_relative_to(ROOT) and '..' not in p.parts,
@@ -169,15 +196,27 @@ def policy():
     current = Path(value['current_link'])
     require(not current.is_relative_to(releases) and not releases.is_relative_to(current), 'layout_overlap')
     require(re.fullmatch(DIGEST, value['schema_sha256']) is not None, 'schema_not_attested')
+    require(value['node'] == '/usr/local/bin/node', 'node_path_changed')
     trusted(Path(value['node']))
+    helpers = [ROOT / 'bin' / name for name in ('rebuilt-gateway.py', 'extract-release.py', 'rebuilt-launch.py')]
+    require(isinstance(value['helpers_sha256'], dict) and set(value['helpers_sha256']) == {str(p) for p in helpers}, 'helper_manifest_invalid')
+    for path in helpers:
+        trusted(path)
+        require(hashlib.sha256(read(path, 1024*1024)).hexdigest() == value['helpers_sha256'][str(path)], 'helper_changed')
+    require(isinstance(value['approved_artifacts'], dict) and all(
+        re.fullmatch(SHA, k) and isinstance(v, str) and re.fullmatch(DIGEST, v)
+        for k, v in value['approved_artifacts'].items()), 'artifact_approval_invalid')
+    require(isinstance(value['rollback_targets'], list) and all(
+        isinstance(v, str) and re.fullmatch(SHA, v) for v in value['rollback_targets']), 'rollback_approval_invalid')
     require(set(value['units']) == set(UNITS), 'unit_policy_missing')
     for alias, unit in UNITS.items():
         expected = value['units'][alias]
-        require(set(expected) == set(PROPERTIES) and expected['User'] == 'aifinance-deploy', 'unit_policy_invalid')
+        require(set(expected) == set(PROPERTIES) | {'HOME', 'files_sha256'} and expected['User'] == 'aifinance-deploy', 'unit_policy_invalid')
         # Do not infer an indirect launcher's behavior. Unit cwd must use the approved switch link.
-        require(expected['WorkingDirectory'] in (str(current), str(current / 'apps/web')),
+        require(expected['WorkingDirectory'] == str(current),
                 'unit_not_bound_to_switch')
-        require(properties(unit) == expected, 'unit_changed_since_acceptance')
+        require(expected['ExecStart'] == {'path': '/usr/bin/python3', 'argv': ['/usr/bin/python3', '-I', '-B', str(ROOT / 'bin/rebuilt-launch.py'), alias]}, 'unit_launcher_changed')
+        require(unit_snapshot(unit) == expected, 'unit_changed_since_acceptance')
         trusted(Path(expected['FragmentPath']))
         for dropin in expected['DropInPaths'].split():
             trusted(Path(dropin))
@@ -266,7 +305,11 @@ def release_path(p, sha):
 def validate_release(p, sha):
     target = release_path(p, sha)
     require(target.resolve(strict=True) == target, 'release_path_invalid')
-    require(read(target / 'RELEASE_SHA', 64).decode().strip() == sha, 'release_identity')
+    try:
+        identity = read(target / 'RELEASE_SHA', 64).decode().strip()
+    except UnicodeError:
+        raise Refused('release_identity') from None
+    require(identity == sha, 'release_identity')
     manifest = read(target / 'schema.sha256')
     require(hashlib.sha256(manifest).hexdigest() == p['schema_sha256'], 'schema_changed')
     # Verify actual migration bytes, not just the upload's claimed manifest.
@@ -309,7 +352,7 @@ def healthy(sha):
             run(['/usr/bin/systemctl', 'is-active', '--quiet', *UNITS.values()])
             data = json.loads(run(['/usr/bin/curl', '--noproxy', '*', '--max-time', '3', '-fsS',
                                    'http://127.0.0.1:3001/api/health'], limit=4096, timeout=5))
-            require(isinstance(data, dict) and data.get('ok') is True and data.get('release') == sha,
+            require(isinstance(data, dict) and data.get('ok') is True and data.get('db') == 'ok' and data.get('release') == sha,
                     'health_revision_mismatch')
             run(['/usr/bin/curl', '--noproxy', '*', '--max-time', '3', '-fsS', '-o', '/dev/null',
                  'http://127.0.0.1:3000/'], timeout=5)
@@ -349,12 +392,12 @@ def services_idle():
 
 def receipt(directory, opid):
     value = document(directory / (opid + '.json'))
-    require(set(value) == {'id', 'action', 'revision', 'digest', 'previous', 'phase', 'updated'} and
+    require(set(value) == {'id', 'action', 'revision', 'digest', 'previous', 'phase', 'updated', 'fallback_allowed'} and
             value['id'] == opid and value['action'] in ('deploy', 'rollback') and
             re.fullmatch(SHA, value['revision']) and re.fullmatch(SHA, value['previous']) and
             ((value['action'] == 'rollback' and value['digest'] == '') or
              (value['action'] == 'deploy' and re.fullmatch(DIGEST, value['digest']))) and
-            value['phase'] in PHASES and type(value['updated']) is int, 'receipt_invalid')
+            value['phase'] in PHASES and type(value['fallback_allowed']) is bool and type(value['updated']) is int, 'receipt_invalid')
     return value
 
 
@@ -389,16 +432,31 @@ def publish(p, directory, action, sha, digest, opid):
         require(current_sha(p, allow_missing=True) in (record['previous'], sha), 'interrupted_layout_changed')
     else:
         old = current_sha(p)
-        validate_release(p, old)
-        require(healthy(old), 'baseline_not_healthy')
+        if action == 'rollback':
+            require(sha in p['rollback_targets'], 'rollback_not_approved')
+            validate_release(p, sha)
+            # Never require a broken current version to be healthy to recover.
+            fallback_allowed = healthy(old)
+            if fallback_allowed:
+                try:
+                    validate_release(p, old)
+                except (Refused, OSError):
+                    fallback_allowed = False
+        else:
+            require(approved(p, sha, digest), 'artifact_not_approved')
+            validate_release(p, old)
+            require(healthy(old), 'baseline_not_healthy')
+            fallback_allowed = True
         record = dict(id=opid, action=action, revision=sha, digest=digest, previous=old,
-                      phase='prepared', updated=int(time.time()))
+                      phase='prepared', updated=int(time.time()), fallback_allowed=fallback_allowed)
         save(directory, record, 'prepared')
     atomic(directory / 'active.json', {'id': opid})
-    validate_release(p, record['previous'])
+    if record['fallback_allowed']:
+        validate_release(p, record['previous'])
     target = release_path(p, sha)
     if record['phase'] == 'prepared':
         if action == 'deploy':
+            require(approved(p, sha, digest), 'artifact_not_approved')
             archive = ROOT / 'incoming' / (sha + '.tar.gz')
             require(file_digest(archive) == digest, 'archive_digest')
             marker = directory / ('artifact-' + sha + '.json')
@@ -419,10 +477,13 @@ def publish(p, directory, action, sha, digest, opid):
                 finally:
                     if stage.is_dir() and not stage.is_symlink():
                         shutil.rmtree(stage)
+        if action == 'rollback':
+            require(sha in p['rollback_targets'], 'rollback_not_approved')
         validate_release(p, sha)
         save(directory, record, 'switching')
     if record['phase'] in ('switching', 'checking'):
         try:
+            require(approved(p, sha, digest) if action == 'deploy' else sha in p['rollback_targets'], 'release_approval_revoked')
             validate_release(p, sha)
         except (Refused, OSError):
             # A damaged/missing new release must not prevent restoring the verified old one.
@@ -442,6 +503,9 @@ def publish(p, directory, action, sha, digest, opid):
         except (Refused, OSError):
             save(directory, record, 'rolling_back')
     if record['phase'] == 'rolling_back':
+        if not record['fallback_allowed']:
+            save(directory, record, 'recovery_required')
+            return record
         try:
             switch(p, record['previous'], opid, sha)
             restart()
@@ -490,6 +554,7 @@ def main():
             return {'protocol': 'rebuilt-v1', 'current': current_sha(p),
                     'operation': receipt(directory, opid) if opid else None}
         if args[0] == 'upload':
+            require(approved(p, args[1], args[2]), 'artifact_not_approved')
             return upload(args[1], args[2], sys.stdin.buffer)
         services_idle()
         if args[0] == 'resume':

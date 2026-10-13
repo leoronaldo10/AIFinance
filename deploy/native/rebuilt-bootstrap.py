@@ -251,12 +251,24 @@ def source_check():
     return digest(actual)
 
 
+def home_compat(alias):
+    path = drop(alias).parent / '90-home-compat.conf'
+    if absent(path):
+        return None
+    trusted(path)
+    require(read(path, 4096) == b'[Service]\nEnvironment="HOME=/opt/aifinance"\n',
+            'home_compat_changed')
+    return path
+
+
 def properties(alias, switched=False):
     values = g.properties(g.UNITS[alias])
     require(values['User'] == 'aifinance-deploy', 'unit_user')
     require(values['WorkingDirectory'] == str(CURRENT if switched else OLD), 'unit_cwd')
     require(values['FragmentPath'] == str(SYSTEM / g.UNITS[alias]), 'unit_fragment')
-    require(values['DropInPaths'] == (str(drop(alias)) if switched else ''), 'unit_dropins')
+    compat = home_compat(alias)
+    expected_drops = ([drop(alias)] if switched else []) + ([compat] if compat else [])
+    require(values['DropInPaths'].split() == [str(p) for p in sorted(expected_drops)], 'unit_dropins')
     require(values['EnvironmentFiles'] == str(OLD / '.env') + ' (ignore_errors=no)', 'unit_env_path')
     expected = str(NODE) + ' --experimental-strip-types ' + ENTRIES[alias]
     # systemctl's ExecStart also contains runtime timestamps; inspect only the
@@ -328,7 +340,8 @@ def restore(record):
             require(read(drop(alias)) == content(), 'dropin_changed')
         if not absent(drop(alias).parent):
             trusted(drop(alias).parent, directory=True)
-            require(set(drop(alias).parent.iterdir()) <= {drop(alias)}, 'other_dropin_files')
+            compat = home_compat(alias)
+            require(set(drop(alias).parent.iterdir()) <= {drop(alias), compat}, 'other_dropin_files')
     if not absent(CURRENT):
         require(CURRENT.is_symlink() and os.readlink(CURRENT) == str(OLD), 'current_changed')
     record['phase'] = 'restoring'
@@ -337,7 +350,7 @@ def restore(record):
         if not absent(drop(alias)):
             drop(alias).unlink()
             g.sync_dir(drop(alias).parent)
-        if not absent(drop(alias).parent):
+        if not absent(drop(alias).parent) and home_compat(alias) is None:
             # Refuse to delete other administrators' files.
             drop(alias).parent.rmdir()
             g.sync_dir(SYSTEM)

@@ -37,7 +37,8 @@ class Fixture(unittest.TestCase):
         self.state.chmod(0o700)
         self.manifest = hashlib.sha256(b'SELECT 1;').hexdigest()+'  database/migrations/001.sql\n'
         self.p = {'current_link': str(self.root/'current'), 'releases_dir': str(self.root/'releases'),
-                  'schema_sha256': hashlib.sha256(self.manifest.encode()).hexdigest()}
+                  'schema_sha256': hashlib.sha256(self.manifest.encode()).hexdigest(),
+                  'approved_artifacts': {}, 'rollback_targets': [OLD, NEW]}
         self.make(OLD)
         Path(self.p['current_link']).symlink_to(m.release_path(self.p, OLD))
         self.restart_count = 0
@@ -155,8 +156,9 @@ class Fixture(unittest.TestCase):
 
     def test_missing_baseline_or_healthy_baseline_cannot_be_bypassed(self):
         self.make(NEW)
+        self.p['approved_artifacts'][NEW] = 'f'*64
         with patch.object(m, 'healthy', return_value=False), self.assertRaisesRegex(m.Refused, 'baseline'):
-            self.publish()
+            m.publish(self.p, self.state, 'deploy', NEW, 'f'*64, ID)
         self.assertFalse((self.state/(ID+'.json')).exists())
         self.assertEqual(self.restart_count, 0)
 
@@ -169,6 +171,7 @@ class Fixture(unittest.TestCase):
         import shutil
         shutil.rmtree(target)
         digest = m.file_digest(archive)
+        self.p['approved_artifacts'][NEW] = digest
         def extract(argv, **kw):
             self.assertEqual(argv[:3], ['/usr/bin/python3', '-I', '-B'])
             self.assertEqual(argv[3], str(self.root/'bin/extract-release.py'))
@@ -205,20 +208,37 @@ class Fixture(unittest.TestCase):
         path.write_text(json.dumps(template))
         with patch.object(m, 'POLICY', path), patch.object(m, 'trusted'), self.assertRaisesRegex(m.Refused, 'accepted'):
             m.policy()
-        template.update(self.p, accepted=True, node='/usr/bin/node')
+        (self.root/'switch').mkdir()
+        template.update(self.p, accepted=True, node='/usr/local/bin/node', current_link=str(self.root/'switch/current'))
         template['database']['verified'] = True
+        template['helpers_sha256'] = {}
+        for name in ('rebuilt-gateway.py', 'extract-release.py', 'rebuilt-launch.py'):
+            helper = self.root/'bin'/name; helper.write_text('fixture')
+            template['helpers_sha256'][str(helper)] = hashlib.sha256(b'fixture').hexdigest()
         for alias in m.UNITS:
             template['units'][alias] = dict.fromkeys(m.PROPERTIES, '')
-            template['units'][alias].update(User='aifinance-deploy', WorkingDirectory=self.p['current_link'], FragmentPath='/etc/systemd/system/'+m.UNITS[alias])
+            template['units'][alias].update(HOME='/opt/aifinance', files_sha256={})
+            template['units'][alias]['ExecStart'] = {'path':'/usr/bin/python3','argv':['/usr/bin/python3','-I','-B',str(self.root/'bin/rebuilt-launch.py'),alias]}
+            template['units'][alias].update(User='aifinance-deploy', WorkingDirectory=template['current_link'], FragmentPath='/etc/systemd/system/'+m.UNITS[alias])
         path.write_text(json.dumps(template))
         actual = copy.deepcopy(template['units']['api']);actual['User'] = 'root'
-        with patch.object(m, 'POLICY', path), patch.object(m, 'trusted'), patch.object(m, 'properties', return_value=actual), self.assertRaisesRegex(m.Refused, 'unit_changed'):
+        with patch.object(m, 'POLICY', path), patch.object(m, 'trusted'), patch.object(m, 'unit_snapshot', return_value=actual), self.assertRaisesRegex(m.Refused, 'unit_changed'):
             m.policy()
         def expected_properties(unit):
             return template['units'][next(alias for alias, name in m.UNITS.items() if name == unit)]
         # Diagnosis and a pending rollback must not be gated on a running API.
-        with patch.object(m, 'POLICY', path), patch.object(m, 'trusted'), patch.object(m, 'properties', side_effect=expected_properties), patch.object(m, 'run', return_value='v24.19.0\n'), patch.object(m, 'listeners', side_effect=AssertionError('live health in policy')):
+        with patch.object(m, 'POLICY', path), patch.object(m, 'trusted'), patch.object(m, 'unit_snapshot', side_effect=expected_properties), patch.object(m, 'run', return_value='v24.19.0\n'), patch.object(m, 'listeners', side_effect=AssertionError('live health in policy')):
             self.assertTrue(m.policy()['accepted'])
+            for key, bad in (('current_link', str(self.root/'current')), ('releases_dir', str(self.root/'releases-v2'))):
+                correct = template[key]
+                template[key] = bad; path.write_text(json.dumps(template))
+                with self.assertRaisesRegex(m.Refused, 'launcher_layout_mismatch'): m.policy()
+                template[key] = correct; path.write_text(json.dumps(template))
+            template['version'] = 1; path.write_text(json.dumps(template))
+            with self.assertRaisesRegex(m.Refused, 'layout_not_accepted'): m.policy()
+            template['version'] = 2; path.write_text(json.dumps(template))
+            (self.root/'bin/rebuilt-launch.py').write_text('changed')
+            with self.assertRaisesRegex(m.Refused, 'helper_changed'): m.policy()
 
     def test_command_wrapper_limits_output_and_never_echoes_failed_stderr(self):
         self.assertEqual(REAL_RUN([sys.executable, '-c', 'print("ok")']), 'ok\n')
@@ -237,7 +257,7 @@ class Fixture(unittest.TestCase):
             self.assertEqual(argv[0], '/usr/bin/curl')
             self.assertIn('--noproxy', argv)
             self.assertIn(argv[-1], ('http://127.0.0.1:3001/api/health','http://127.0.0.1:3000/'))
-            return json.dumps({'ok':True,'release':NEW}) if argv[-1].endswith('health') else ''
+            return json.dumps({'ok':True,'db':'ok','release':NEW}) if argv[-1].endswith('health') else ''
         with patch.object(m, 'listeners'), patch.object(m, 'run', side_effect=command), patch.object(m.time, 'sleep'):
             self.assertTrue(REAL_HEALTH(NEW))
             self.assertFalse(REAL_HEALTH(OLD))
@@ -378,6 +398,112 @@ class Fixture(unittest.TestCase):
             self.publish()
         self.assertEqual(m.receipt(self.state, ID)['phase'], 'checking')
         self.assertEqual(self.publish()['phase'], 'succeeded')
+
+    def test_unhealthy_current_can_rollback_to_approved_target_and_retry(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', side_effect=lambda sha: sha == NEW):
+            self.assertEqual(self.publish()['phase'], 'succeeded')
+            self.assertFalse(m.receipt(self.state, ID)['fallback_allowed'])
+            self.assertEqual(self.publish()['phase'], 'succeeded')
+        self.assertEqual(self.restart_count, 1)
+
+    def test_failed_emergency_rollback_never_returns_to_known_broken_current(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', return_value=False):
+            self.assertEqual(self.publish()['phase'], 'recovery_required')
+        self.assertEqual(m.current_sha(self.p), NEW)
+        self.assertEqual(self.restart_count, 1)
+        self.assertEqual(self.publish()['phase'], 'recovery_required')
+        with self.assertRaisesRegex(m.Refused, 'unfinished'): self.publish(OLD, OTHER)
+
+    def test_emergency_rollback_interruption_resumes_without_broken_source(self):
+        self.make(NEW)
+        with patch.object(m, 'healthy', return_value=False), patch.object(m, 'restart', side_effect=m.Interrupted):
+            with self.assertRaises(m.Interrupted): self.publish()
+        (m.release_path(self.p, OLD)/'schema.sha256').write_text('broken')
+        self.assertEqual(self.publish()['phase'], 'succeeded')
+
+    def test_unapproved_target_or_digest_never_creates_receipt(self):
+        self.make(NEW)
+        self.p['rollback_targets'] = [OLD]
+        with self.assertRaisesRegex(m.Refused, 'rollback_not_approved'): self.publish()
+        self.p['approved_artifacts'][NEW] = 'a'*64
+        with self.assertRaisesRegex(m.Refused, 'artifact_not_approved'):
+            m.publish(self.p, self.state, 'deploy', NEW, 'b'*64, ID)
+        self.assertFalse((self.state/(ID+'.json')).exists())
+        self.assertEqual(self.restart_count, 0)
+
+    def test_revoked_rollback_during_resume_refuses_switch(self):
+        self.make(NEW)
+        with patch.object(m, 'restart', side_effect=m.Interrupted):
+            with self.assertRaises(m.Interrupted): self.publish()
+        self.p['rollback_targets'] = [OLD]
+        self.assertEqual(self.publish()['phase'], 'rolled_back')
+        self.assertEqual(m.current_sha(self.p), OLD)
+
+    def test_health_rejects_missing_or_bad_database_status(self):
+        for db in (None, 'error', False):
+            with patch.object(m, 'listeners'), patch.object(m, 'run', return_value=json.dumps({'ok':True,'release':NEW,'db':db})), patch.object(m.time, 'sleep'):
+                self.assertFalse(REAL_HEALTH(NEW))
+
+    def test_unit_snapshot_ignores_runtime_fields_but_detects_config_and_home(self):
+        unit = self.root/'api.service'; unit.write_text('[Service]\n')
+        drop = self.root/'90-home-compat.conf'; drop.write_text('[Service]\nEnvironment="HOME=/opt/aifinance"\n')
+        props = dict.fromkeys(m.PROPERTIES, '')
+        props.update(FragmentPath=str(unit), DropInPaths=str(drop), ExecStart='{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -I -B /opt/aifinance/bin/rebuilt-launch.py api ; ignore_errors=no ; pid=1 ; start_time=old }')
+        with patch.object(m, 'trusted'), patch.object(m, 'properties', side_effect=lambda _: dict(props)), patch.object(m, 'run', return_value='HOME=/opt/aifinance SECRET=not-output'):
+            before = m.unit_snapshot('fixture')
+            self.assertNotIn('SECRET', json.dumps(before))
+            props['ExecStart'] = props['ExecStart'].replace('pid=1', 'pid=2').replace('start_time=old', 'start_time=new')
+            self.assertEqual(before, m.unit_snapshot('fixture'))
+            drop.write_text('[Service]\nEnvironment="HOME=/tmp"\n')
+            self.assertNotEqual(before, m.unit_snapshot('fixture'))
+            props['ExecStart'] = props['ExecStart'].replace(' api ', ' web ')
+            self.assertNotEqual(before['ExecStart'], m.unit_snapshot('fixture')['ExecStart'])
+            with patch.object(m, 'run', return_value='HOME=/tmp'), self.assertRaisesRegex(m.Refused, 'unit_home'): m.unit_snapshot('fixture')
+            with patch.object(m, 'trusted', side_effect=m.Refused('untrusted')), self.assertRaises(m.Refused): m.unit_snapshot('fixture')
+            props['ExecStart'] += ' { path=/bin/sh ; argv[]=/bin/sh ; ignore_errors=no ; pid=0 }'
+            with self.assertRaisesRegex(m.Refused, 'unit_exec_format'): m.unit_snapshot('fixture')
+
+    def test_old_or_malformed_receipt_fails_closed(self):
+        self.make(NEW); self.publish()
+        value = m.receipt(self.state, ID)
+        for bad in (None, 'true', 1):
+            changed = dict(value, fallback_allowed=bad)
+            m.atomic(self.state/(ID+'.json'), changed)
+            with self.assertRaisesRegex(m.Refused, 'receipt_invalid'): self.publish()
+        value.pop('fallback_allowed'); m.atomic(self.state/(ID+'.json'), value)
+        with self.assertRaisesRegex(m.Refused, 'receipt_invalid'): self.publish()
+
+    def test_damaged_current_with_healthy_http_does_not_block_emergency_rollback(self):
+        self.make(NEW)
+        (m.release_path(self.p, OLD)/'schema.sha256').write_text('broken')
+        self.assertEqual(self.publish()['phase'], 'succeeded')
+        self.assertFalse(m.receipt(self.state, ID)['fallback_allowed'])
+
+    def test_upload_main_refuses_unapproved_bytes_before_reading_stream(self):
+        import types
+        before = os.umask(0o077)
+        try:
+            with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND':'rebuilt-v1 upload '+NEW+' '+'a'*64}, clear=True), patch.object(m.os,'getuid',return_value=999), patch.object(m.os,'geteuid',return_value=999), patch.object(m.pwd,'getpwuid',return_value=types.SimpleNamespace(pw_name='aifinance-deploy')), patch.object(m,'policy',return_value=self.p), patch.object(m,'state_dir',return_value=self.state), patch.object(m,'lock',return_value=os.open(os.devnull,os.O_RDONLY)), patch.object(m,'upload',side_effect=AssertionError('upload entered')):
+                with self.assertRaisesRegex(m.Refused, 'artifact_not_approved'):m.main()
+        finally:os.umask(before)
+
+    def test_non_utf8_current_marker_does_not_block_emergency_rollback(self):
+        self.make(NEW)
+        (m.release_path(self.p, OLD)/'RELEASE_SHA').write_bytes(b'\xff')
+        self.assertEqual(self.publish()['phase'], 'succeeded')
+        self.assertFalse(m.receipt(self.state, ID)['fallback_allowed'])
+        self.assertEqual(m.current_sha(self.p), NEW)
+
+    def test_non_utf8_new_marker_on_resume_restores_previous(self):
+        self.make(NEW)
+        with patch.object(m, 'restart', side_effect=m.Interrupted):
+            with self.assertRaises(m.Interrupted): self.publish()
+        self.assertEqual(m.receipt(self.state, ID)['phase'], 'checking')
+        (m.release_path(self.p, NEW)/'RELEASE_SHA').write_bytes(b'\xff')
+        self.assertEqual(self.publish()['phase'], 'rolled_back')
+        self.assertEqual(m.current_sha(self.p), OLD)
 
 
 if __name__ == '__main__':
