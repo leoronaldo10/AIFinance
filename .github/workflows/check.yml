@@ -12,6 +12,26 @@ on:
 permissions:
   contents: read
 
+# No production credentials. Tests may explicitly enable a valve only for local stubs.
+# Loopback defaults also protect providers without an explicit fixture override.
+# This is application-level isolation, not an OS network sandbox.
+env:
+  COLLECT_ENABLED: "false"
+  MODEL_CALLS_ENABLED: "false"
+  FEISHU_CONTENT_PUSH_ENABLED: "false"
+  FEISHU_INTERNAL_ENABLED: "false"
+  INDEXNOW_SUBMIT_ENABLED: "false"
+  AIHOT_CREDENTIALS_DIR: /nonexistent-test-credentials
+  LLM_BASE_URL: http://127.0.0.1:1/v1
+  DEEPSEEK_BASE_URL: http://127.0.0.1:1/v1
+  DASHSCOPE_BASE_URL: http://127.0.0.1:1/v1
+  ZHIPU_BASE_URL: http://127.0.0.1:1/v1
+  XIAOMI_MIMO_BASE_URL: http://127.0.0.1:1/v1
+  EMBEDDING_BASE_URL: http://127.0.0.1:1/v1
+  SOCIALDATA_BASE_URL: http://127.0.0.1:1
+  DAJIALA_BASE_URL: http://127.0.0.1:1
+  JINA_BASE_URL: http://127.0.0.1:1
+
 concurrency:
   group: check-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -45,7 +65,11 @@ jobs:
       - name: Install
         run: npm ci --no-audit --no-fund
       - name: Preview safety regression
-        run: npm run test:preview && npm run test:deploy
+        run: npm run test:preview && npm run test:deploy && npm run test:rebuilt
+      - name: Bootstrap first-run CLI with real root-owned files
+        # Ephemeral filesystem; no host mounts, network, SSH or production credentials.
+        # CHOWN only creates the deployment UID fixture inside the disposable container.
+        run: python3 -B scripts/tests/run-rebuilt-bootstrap-cli.py
       - name: Release readable by a different runtime UID
         # Root is used only to create/drop identities in disposable /tmp test fixtures.
         # This job has no SSH credentials and never connects to the deployment host.
