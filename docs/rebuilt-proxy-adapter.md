@@ -6,13 +6,16 @@ readonly client 的 LIVE=false、来源和校验清单不变。旧 SSH workflow 
 
 ## 已实现的边界
 
-`deploy/native/rebuilt-proxy.py` 是离线库，不是可运行的远程发布器。
+`deploy/native/rebuilt-proxy.py` 是协议核心；`rebuilt-proxy-session.py` 已实现完整单次
+API发送→会话URL校验→WS→网关回执编排，测试注入传输工厂运行同一代码路径。
 connection_plan 复用审查版 require_proxy、TLS验证、canonical query 和 ACS3签名；
 只生成内存计划，不发送请求。凭据与 expiration 必须显式传入，不能从环境读取，
 不使用只读源码里的历史 expiration。计划包含秘密，调用方不得打印或保存。
 require_proxy 强制已有环境代理（NO_PROXY 不形成绕过）；证书与主机名验证保持开启。
-已审查的 API connection、session URL/token 检查和 WebSocket connector 仍在原文件，
-本轮没有把它们连接成 live 发布入口。connect_live 无条件拒绝；没有开启开关。
+生产组合复用原文件的 API connection、session URL/token 检查和 WebSocket connector。
+run_live 在任何连接或文件写入之前由 LIVE_EXECUTION_ENABLED=False 拒绝，CLI也拒绝；
+没有环境变量或命令行旁路。已写完整生产组合代码，后续批准的是启用和实测，不是补写编排。
+该代码闸门不是OS权限隔离，不能替代RAM、服务器policy及人工批准。
 
 固定 CommandLine 为 `/opt/aifinance/bin/rebuilt-gateway.py --terminal rebuilt-v1 ...`。
 每参数严格验证、精确数量、最多512 ASCII字节，不调用shell、env、sudo命令包装器，
@@ -38,31 +41,61 @@ Output须非空且一致的channel，连续序号；重复输出忽略，缺帧/
 网关拒绝坏编码、非规范padding、缺换行、超长行、乱序/重复块和超128MiB内容；
 最终仍通过原upload的摘要验证、fsync和原子link才返回上传成功。中途失败清理临时文件。
 
-客户端在首帧前核对bytes大小、SHA256及显式构建来源记录：固定仓库、完整revision、
-sha256、checks_passed、build_run。该记录是调用方提供的审核证据，不是加密签名证明；
-以后live准入必须独立核验构建run与批准SHA/摘要，不能凭自报字段授权。
+编排在API发送前调用rebuilt-provenance.py独立校验，操作参数不能提供可信source声明：
+
+- 默认读取客户端机器固定 `/etc/aifinance-proxy-approval.json`，root属主、不可组/其他人写、
+  非链接；模板accepted=false。此为本地客户端批准记录，不是新服务器权限。
+- 每个SHA的批准项精确包含sha256、run_id、artifact_id、workflow_id、run_attempt、
+  workflow_sha256；repository固定为leoronaldo10/AIFinance。回退目标单独列出。
+- 独立固定GitHub HTTPS GET读取workflow、run、artifact、该SHA上的workflow文件；必须
+  经既有代理和TLS，不跟重定向，不使用metadata里的任意URL，不下载外部artifact URL。
+  固定workflow路径为.github/workflows/deploy-rebuilt.yml；run须同仓库且非fork、
+  workflow_dispatch、completed/success，head_sha、attempt和workflow身份须匹配。
+- 调用方提供原始GitHub ZIP bytes，但外层摘要必须匹配独立API返回的artifact digest，
+  ID/name/run/head_sha及expired=false一致；内层仅允许精确SHA.tar.gz及对应.sha256，
+  核对实际tar摘要与管理员批准值。ZIP不解包到文件系统，不执行制品。
+- 独立固定git命令核对当前干净checkout的HEAD等于目标SHA；workflow文件bytes匹配批准
+  摘要。缺证据、缺API摘要、旧run、未批准workflow、工作区变化都在API发送前失败关闭。
+
+固定GitHub读取支持现有只读Actions/Contents授权，不自动申请新权限、签发凭据或dispatch。
+没有真实批准构建制品时不得放行。管理员批准、GitHub服务与其工作流仍是信任根；
+这不是SLSA签名证明。测试的独立审批/GitHub/checkout reader仅为显式fixture注入。
+依据：[GitHub artifact API](https://docs.github.com/en/rest/actions/artifacts)、
+[workflow run API](https://docs.github.com/en/rest/actions/workflow-runs)。
 发布/回退绑定32hex operation ID；上传由SHA/摘要识别，不冒充发布回执。
 
 上传断线后显式调用固定 `artifact-status SHA DIGEST`：持共享锁、验证policy批准配对，
 核对incoming文件真实摘要；present=true确认已提交，false仅表示查询时无完整制品。
-竞争上传可能使锁拒绝；停止等待人工选择后续查询，不自动重传。SHA同名异摘要失败关闭。
+竞争上传可能使锁拒绝；停止等待人工选择后续查询，不自动重传。SQLite本地journal在
+API发送前以同步事务记录尝试；同SHA或operation ID重复发起会拒绝，包括进程重建后。
+明确artifact-status返回present=false后，调用方可再次显式调用同SHA/摘要upload一次；
+状态许可在发送前消耗，present=true不得重复上传。SHA同名异摘要失败关闭。
 发布断线用status ID核对既有回执，再由调用方明确选择resume ID；保持原ID和原制品。
+进入发送阶段的新status先撤销旧本地观察许可，随后请求失败也不保留旧许可；
+resume消耗最新非终态回执，deploy恢复前重新验证来源；
+已成功/已回退/recovery_required拒绝resume。观察回执还须与本地原请求身份一致。
 不删除回执，不自动恢复recovery_required，不自动发起新operation。
 
 离线exchange使用Unix主线程专用SIGALRM总时限（1..480秒测试参数），覆盖recv与阻塞send，
-保留恢复原信号handler，已有timer则拒绝；服务器原480秒alarm不变。
+保留恢复原信号handler，已有timer则拒绝；服务器原480秒alarm不变。编排外层同一alarm
+覆盖证据/API/WS I/O；超时后的close有独立最多2秒清理预算，总耗时最多操作预算+2秒。
 这不是获批的真实上传/操作时间。768字节stop-and-wait上传128MiB需要174,763次往返，
-480秒要求平均RTT低于2.75ms，实际代理大制品很可能超时。因此当前方案只证明有界、安全
-失败及小制品传输，不承诺最大制品可完成。真实批准前须按实际制品大小制定并离线验证
-有界窗口/流控/时限方案，再另批真实测试；不能简单延长期限或忽略ACK。
+480秒要求平均RTT低于2.75ms，实际代理大制品很可能超时。因此编排明确限制为最多1MiB，且满足
+`15 + (ceil(bytes/768)+2)*0.25 <= seconds` 才允许API启动；超过限额直接拒绝。
+这是250ms/往返的保守规划模型，不是已测WAN上限；真实网络更慢时仍超时停止。
+1MiB真实本地PTY测试使用1367个Input帧，在本机约0.27秒完成，不能外推远程速度。
+实际完整应用包若超过1MiB，当前客户端明确不准入，不能声称128MiB发布已可用。
+首发必须按实际大小确认准入；需要扩大时应另评审有界传输策略，不增加shell/URL/账号权限。
 
 ## 验证与审批
 
-`npm run test:rebuilt` 纳入适配14项：本地真实默认PTY的任意binary字节往返、坏输入、
+`npm run test:rebuilt` 纳入核心适配14项和端到端编排13项：本地真实默认PTY的任意binary字节往返、坏输入、
 摘要/来源、代理/TLS、错误版本/通道/序号、重复ACK、断线、阻塞发送时限、固定请求、
 真实网关upload/artifact-status、受限解包/deploy、status与显式resume、重复操作无重启。
 主机systemd/HTTP由既有fixture替代，真实发布状态机、临时文件/链接/回执和解包器参与。
-来源原70项及SHA256清单亦已本地重跑。没有ECS实测，没有API发送集成或远程吞吐验收。
+新增编排测试覆盖真实g.main、断开API响应/WS、过期假凭据、错工作流/构建/ZIP摘要、
+1MiB真实PTY、状态许可消耗和超时后阻塞清理。来源原70项及SHA256清单亦已本地重跑。
+没有ECS实测或远程吞吐验收；API发送编排已经通过fake API端到端集成。
 
 后续一次性服务器落地审批清单（本轮不申请、不执行）：
 
@@ -73,6 +106,6 @@ sha256、checks_passed、build_run。该记录是调用方提供的审核证据�
 4. 两个95启动drop-in、精确sudo联合restart、管理员daemon-reload及失败恢复步骤；
    保留原EnvFile、HOME兼容drop-in与基线staging。同版SHA重启验收后才能accepted。
 5. 批准具体短期STS批次/到期时间、固定实例和aifinance-deploy用户、代理写会话能力、
-   有界上传策略及真实操作时限；审查live API编排和构建来源核验后才能启用。
+   有界上传策略及真实操作时限；按已实现编排核对客户端审批清单、真实GitHub构建证据与当前checkout后才能启用。
 6. 真实PTY小制品、实际制品吞吐、断线查询/显式resume、健康与回退验收。
    不含迁移/seed/数据回滚、新账号、长期AK、自动续签、公网开放或备案绕过。

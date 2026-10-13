@@ -93,7 +93,7 @@ SQL清单和实际迁移文件必须与已验收基线一致；网关不查询/�
 - 另列首发SHA/摘要/操作ID、回退SHA、维护窗口和STS期限；不批准公网或长期AK。
 
 固定upload现新增PTY安全Base64离线适配与artifact-status查询，deploy/rollback/status/resume
-有离线协议检查与真实网关fixture集成。live入口仍锁定；大制品吞吐与API发送编排未验收，
+有离线协议检查与真实网关fixture集成。live入口仍锁定；API发送编排已完成离线端到端验证，真实吞吐未验收且当前准入最多1MiB，
 详见 [固定代理适配](rebuilt-proxy-adapter.md)。本轮没有启用新远端能力。
 旧deploy-rebuilt.yml仍是SSH通道，不因有只读代理就自动可用；不假定dispatch写权限。
 

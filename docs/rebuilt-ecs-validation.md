@@ -1,3 +1,8 @@
+> 后续本地连接编排已补齐：新增13项fake API→WS→真实PTY→g.main端到端测试，
+> 独立reviewer重跑13/13通过（另保留核心14项）。来源审批、固定GitHub元数据、
+> ZIP/内层摘要与当前checkout独立核验，持久去重与显式恢复均已实现。
+> live仍默认拒绝；当前上传明确只准入≤1MiB及时间预算内的制品，不能宣称128MiB远程可用。
+
 > 新增离线代理适配验证见 [固定代理适配](rebuilt-proxy-adapter.md)：14项适配测试、
 > 原网关43项、bootstrap/launcher24项和readonly来源70项通过。包含真实本地PTY，
 > 不代表ECS/云API或远程大制品验收。以下未提交等措辞是原阶段历史记录。
