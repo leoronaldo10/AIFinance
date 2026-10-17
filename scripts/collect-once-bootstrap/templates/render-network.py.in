@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+"""Offline renderer only. Input: reviewed UID + root-resolved public IPv4 map.
+No DNS, nft execution, installation or server changes happen in this program.
+"""
+import ipaddress,json,sys
+HOSTS={'www.microsoft.com','www.journalofaccountancy.com','www.accountingtoday.com'}
+def render(d):
+ uid=d['uid'];hosts=d['hosts']
+ assert type(uid)==int and uid>=100 and uid not in d['forbidden_uids'] and {0,__APPLICATION_UID__}.issubset(set(d['forbidden_uids'])) and set(hosts)==HOSTS
+ ips=set();lines=[]
+ for host in sorted(hosts):
+  assert isinstance(hosts[host],list) and 1<=len(hosts[host])<=8
+  for v in hosts[host]:
+   ip=ipaddress.ip_address(v);assert ip.version==4 and ip.is_global and not ip.is_multicast and not ip.is_reserved
+   ips.add(str(ip));lines.append(str(ip)+' '+host)
+ table='aifinance_collect_once_v1'
+ rules=['create table inet '+table,'add chain inet '+table+' output { type filter hook output priority -20; policy accept; }']
+ for ip,port in [('127.0.0.1',__DATABASE_PORT__)]+[(ip,443) for ip in sorted(ips)]:rules.append('add rule inet %s output meta skuid %d ip daddr %s tcp dport %d counter accept'%(table,uid,ip,port))
+ rules+=['add rule inet %s output meta skuid %d counter reject'%(table,uid)]
+ return {'nft':'\n'.join(rules)+'\n','hosts':'\n'.join(lines)+'\n','nsswitch':'hosts: files\n'}
+if __name__=='__main__':print(json.dumps(render(json.load(sys.stdin)),indent=2))

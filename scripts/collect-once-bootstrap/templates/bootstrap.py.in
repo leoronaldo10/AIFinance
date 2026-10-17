@@ -1,0 +1,406 @@
+#!/usr/bin/python3
+"""Local root operator only. No gateway, sudoers, polkit or remotely supplied commands.
+check: all static preconditions, no writes. run: one bounded attempt, finally cleanup.
+cleanup: idempotent recovery of this package's marked resources. Passwords are never logged.
+"""
+import argparse,base64,datetime,getpass,grp,hashlib,hmac,ipaddress,json,os,pwd,re,secrets,selectors,shlex,shutil,stat,subprocess,sys,tarfile,time,urllib.parse,uuid
+from pathlib import Path,PurePosixPath
+BUNDLE=Path(__file__).resolve().parent
+ROOT=Path('/opt/aifinance-collect-once');CONF=Path('/etc/aifinance-collect-once');STATE=Path('/var/lib/aifinance-collect-once')
+ROLE='aifinance_collect_once';USER='aifinance-collect-once';UNIT='aifinance-collect-once.service';PROBE='aifinance-collect-once-probe.service';TABLE='aifinance_collect_once_v1'
+SHA='d57ba047369e666025347719caee1a4c642abe62';REL=ROOT/'releases'/SHA
+ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/root','LANG':'C','LC_ALL':'C','SYSTEMD_PAGER':'cat','SYSTEMD_COLORS':'0'}
+PINS={'scripts/collect-only.ts':'6efcefbba537b8f11365fc7bec6de8164343b9f133402facb819b90ecfe4ee9b','industry/collect-sources.json':'fd07adf77e69906fdcc7f003fd823093c6d3977da2ddab126a243f87e27bdc8a','packages/backend/src/sources/collect-only.ts':'1c91090fcb9a9fc0b1dbd4ad095d767d4eef0ad9e51d2c66af2122df8abd2504','packages/backend/src/sources/rss.ts':'d930fe7f8f0c3b4b7d692e9314673c0be187996c4f44c42c416047ea25cbe9b3','packages/backend/src/lib/http-fetch.ts':'bd9fce7b669a33341ef0e95450ead07842a0549933f5939d3823868750ecba03','packages/backend/src/content/materials.ts':'eebc6919c2f37279779082784ed1ea8761564cb4c65bc6fa7c898bba3183c040'}
+class Refused(Exception):pass
+def need(v,code):
+ if not v:raise Refused(code)
+def emit(stage,**v):print(json.dumps(dict(stage=stage,**v),sort_keys=True),flush=True)
+def trusted(p):
+ for q in (p,*p.parents):
+  s=q.lstat();need(s.st_uid==0 and not s.st_mode&0o022 and not stat.S_ISLNK(s.st_mode),'untrusted_path')
+def trusted_tool(p):
+ # Distribution-managed executable symlinks are allowed only through root-owned, non-writable paths.
+ current=p;seen=set()
+ while current.is_symlink():
+  need(current not in seen,'tool_symlink_cycle');seen.add(current)
+  trusted(current.parent);st=current.lstat();need(st.st_uid==0,'untrusted_tool_symlink')
+  target=Path(os.readlink(current));current=target if target.is_absolute() else current.parent/target
+  current=Path(os.path.normpath(current))
+ trusted(current);need(current.is_file() and os.access(current,os.X_OK),'tool_not_executable')
+def cmd(args,input=None,timeout=15,ok=True,env=None):
+ p=subprocess.run(args,input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env=env or ENV)
+ need(len(p.stdout)<=1048576 and len(p.stderr)<=1048576,'command_output_limit')
+ if ok:need(p.returncode==0,'operator_command_failed')
+ return p
+
+def write_new(path,data,mode=0o600,gid=0):
+ trusted(path.parent);fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
+ with os.fdopen(fd,'wb') as f:os.fchown(f.fileno(),0,gid);os.fchmod(f.fileno(),mode);f.write(data);f.flush();os.fsync(f.fileno())
+def scrub_admin(uri):
+ u=urllib.parse.urlsplit(uri)
+ need(u.scheme in ('postgres','postgresql') and u.hostname=='127.0.0.1' and u.port==__DATABASE_PORT__ and u.path=='/__DATABASE_NAME__' and u.username and u.password and not u.query and not u.fragment,'invalid_original_db_admin_target')
+ return dict(ENV,PGHOST='127.0.0.1',PGPORT='__DATABASE_PORT__',PGDATABASE='__DATABASE_NAME__',PGUSER=urllib.parse.unquote(u.username),PGPASSWORD=urllib.parse.unquote(u.password),PGCONNECT_TIMEOUT='3')
+class Database:
+ def __init__(self,uri):self.env=scrub_admin(uri)
+ def sql(self,text,readonly=False):
+  if readonly:text="BEGIN READ ONLY;SET LOCAL statement_timeout='5s';SET LOCAL search_path=pg_catalog,public;"+text+';ROLLBACK;'
+  p=cmd(['/usr/bin/psql','-XwAtq','-v','ON_ERROR_STOP=1','-P','pager=off'],text.encode(),timeout=15,ok=False,env=self.env)
+  need(p.returncode==0,'database_operation_failed_details_suppressed')
+  return p.stdout.decode().strip()
+ def audit(self):return json.loads(self.sql((BUNDLE/'catalog-audit.sql').read_text(),True))
+ def role_owned(self,nonce):
+  need(re.fullmatch('[a-f0-9]{32}',nonce),'invalid_receipt_nonce')
+  return self.sql("SELECT coalesce((SELECT shobj_description(oid,'pg_authid')='aifinance-collect-once:"+nonce+"' FROM pg_roles WHERE rolname='"+ROLE+"'),false)",True)=='t'
+ def deactivate(self,nonce):
+  exists=self.sql("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='"+ROLE+"')",True)=='t'
+  if not exists:return
+  need(self.role_owned(nonce),'database_owner_marker_mismatch')
+  self.sql((BUNDLE/'revoke.sql').read_text())
+  # Only sessions of the newly created dedicated identity, on the original DB.
+  self.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='"+ROLE+"' AND datname='__DATABASE_NAME__' AND pid<>pg_backend_pid();")
+ def verify_disabled(self,nonce):
+  exists=self.sql("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='"+ROLE+"')",True)=='t'
+  if not exists:return
+  need(self.role_owned(nonce),'database_owner_marker_mismatch')
+  need(self.sql((BUNDLE/'verify-disabled.sql').read_text(),True)=='t','database_cleanup_not_verified')
+ def login_probe(self,password):
+  env=dict(self.env,PGUSER=ROLE,PGPASSWORD=password)
+  query="BEGIN READ ONLY;SET LOCAL statement_timeout='5s';SELECT current_user='aifinance_collect_once' AND current_database()='__DATABASE_NAME__' AND current_setting('transaction_read_only')='on';ROLLBACK;"
+  p=cmd(['/usr/bin/psql','-XwAtq','-v','ON_ERROR_STOP=1','-P','pager=off'],query.encode(),env=env,timeout=10,ok=False)
+  need(p.returncode==0 and p.stdout.strip()==b't','dedicated_role_login_probe_failed')
+ def create_role(self,nonce):
+  sql=(BUNDLE/'grants.sql').read_text().replace('COMMIT;',"COMMENT ON ROLE "+ROLE+" IS 'aifinance-collect-once:"+nonce+"';COMMIT;")
+  self.sql(sql)
+ def activate(self,password):
+  salt=secrets.token_bytes(16);salted=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,4096)
+  client=hmac.new(salted,b'Client Key',hashlib.sha256).digest();server=hmac.new(salted,b'Server Key',hashlib.sha256).digest()
+  enc=lambda b:base64.b64encode(b).decode()
+  verifier='SCRAM-SHA-256$4096:'+enc(salt)+'$'+enc(hashlib.sha256(client).digest())+':'+enc(server)
+  expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S+00')
+  # Superuser audit is mandatory. Suppress statement/error-statement logging for this session.
+  self.sql("SET log_statement='none';SET log_min_error_statement='panic';ALTER ROLE "+ROLE+" LOGIN PASSWORD '"+verifier+"' VALID UNTIL '"+expiry+"';")
+
+def audit_pass(a):
+ required=['admin_is_superuser','role_absent','sequence_matches','application_readonly']
+ rejected=['public_object_privileges','public_column_privileges','public_schema_create','public_definer_execute','custom_triggers','row_security','unsafe_defaults','unsafe_check_functions']
+ need(all(a.get(k) is True for k in required) and all(a.get(k) is False for k in rejected),'database_catalog_precondition_failed')
+
+def artifact_members(path,digest):
+ need(re.fullmatch('[a-f0-9]{64}',digest),'artifact_digest_required');trusted(path)
+ h=hashlib.sha256()
+ with path.open('rb') as f:
+  for b in iter(lambda:f.read(1048576),b''):h.update(b)
+ need(h.hexdigest()==digest,'artifact_digest_mismatch')
+ with tarfile.open(path,'r:*') as tar:
+  members=tar.getmembers();need(len(members)<=300000 and sum(x.size for x in members)<=2147483648,'artifact_limits')
+  need(shutil.disk_usage('/opt').free>=sum(x.size for x in members)+268435456,'insufficient_runtime_space')
+  names=set()
+  for m in members:
+   p=PurePosixPath(m.name);need(not p.is_absolute() and '..' not in p.parts and p.parts and m.name not in names,'unsafe_archive_path');names.add(m.name)
+   need(not any(v.startswith('.env') or v in ('.git','.data','.npmrc','.netrc','.aws','.ssh') for v in p.parts),'secret_or_mutable_archive_path')
+   need(m.isfile() or m.isdir() or m.issym(),'unsupported_archive_member')
+   if m.issym():
+    need(not PurePosixPath(m.linkname).is_absolute(),'absolute_archive_symlink')
+    stack=list(p.parent.parts)
+    for part in PurePosixPath(m.linkname).parts:
+     if part=='..':need(bool(stack),'escaping_archive_symlink');stack.pop()
+     elif part!='.':stack.append(part)
+  links={m.name:m.linkname for m in members if m.issym()}
+  for name in links:
+   need(not any(n.startswith(name+'/') for n in names),'archive_symlink_parent')
+  for name,want in PINS.items():
+   m=tar.getmember(name);need(m.isfile() and m.size<=1048576,'invalid_pinned_file');need(hashlib.sha256(tar.extractfile(m).read()).hexdigest()==want,'artifact_pin_mismatch')
+  need(tar.getmember('package.json').isfile() and any(n.startswith('node_modules/') for n in names),'complete_runtime_required')
+ return True
+
+def cgroup_read(path):
+ try:return path.read_text().strip()
+ except (OSError,UnicodeError):raise Refused('cgroup_file_unreadable') from None
+
+def require_cgroup_v2(root=Path('/sys/fs/cgroup'),mountinfo=None):
+ if mountinfo is None:mountinfo=cgroup_read(Path('/proc/self/mountinfo'))
+ matches=[]
+ for line in mountinfo.splitlines():
+  fields=line.split()
+  if len(fields)>6 and fields[4]==str(root):
+   need('-' in fields,'cgroup_mount_invalid');i=fields.index('-')
+   need(i+1<len(fields),'cgroup_mount_invalid');matches.append((fields[3],fields[i+1]))
+ need(len(matches)==1,'cgroup_mount_missing_or_ambiguous')
+ need(matches[0][1]=='cgroup2','cgroup_v1_or_other_unsupported')
+ need(matches[0][0]=='/','cgroup_subtree_mount_unsupported')
+ need(root.resolve()==root and root.is_dir(),'cgroup_root_unsafe')
+ need({'memory','pids','cpu'}<=set(cgroup_read(root/'cgroup.controllers').split()),'cgroup_controller_missing')
+
+def verify_cgroup_v2(root,control_group,pid,process_cgroup):
+ # systemd's actual ControlGroup is the authority; never construct it from a unit name.
+ need(bool(re.fullmatch(r'/(?:[A-Za-z0-9_.@:-]+/)*[A-Za-z0-9_.@:-]+',control_group)),'cgroup_path_invalid')
+ parts=control_group[1:].split('/');need(all(x not in ('.','..') for x in parts),'cgroup_path_escape')
+ group=root
+ for part in parts:
+  group=group/part
+  try:need(stat.S_ISDIR(group.lstat().st_mode) and not group.is_symlink(),'cgroup_path_unsafe')
+  except OSError:raise Refused('cgroup_path_unreadable') from None
+ need(group.resolve()==group and root in group.parents,'cgroup_path_escape')
+ need(process_cgroup.strip()=='0::'+control_group,'process_unit_cgroup_mismatch')
+ need(pid in cgroup_read(group/'cgroup.procs').split(),'cgroup_pid_missing')
+ need(cgroup_read(group/'memory.max')=='268435456','cgroup_memory_limit_mismatch')
+ need(cgroup_read(group/'pids.max')=='32','cgroup_tasks_limit_mismatch')
+ cpu=cgroup_read(group/'cpu.max').split()
+ need(len(cpu)==2 and all(re.fullmatch(r'[1-9][0-9]*',x) for x in cpu),'cgroup_cpu_unlimited_or_invalid')
+ quota,period=map(int,cpu);need(quota*2==period and 1000<=period<=1000000,'cgroup_cpu_quota_mismatch')
+ current=cgroup_read(group/'memory.current');need(current.isdecimal() and int(current)<268435456,'cgroup_memory_limit_hit')
+ events={}
+ for line in cgroup_read(group/'memory.events').splitlines():
+  pair=line.split();need(len(pair)==2 and pair[1].isdecimal(),'cgroup_memory_events_invalid');events[pair[0]]=int(pair[1])
+ need(all(events.get(k)==0 for k in ('max','oom','oom_kill')),'cgroup_memory_limit_hit')
+ return {'cgroup_version':2,'memory_bytes':268435456,'tasks_max':32,'cpu_quota_percent':50}
+
+class Operator:
+ def __init__(self,db,artifact=None,digest=None):self.db=db;self.artifact=artifact;self.digest=digest;self.state={}
+ def property(self,unit,key):
+  p=cmd(['/usr/bin/systemctl','--no-pager','show',unit,'-p',key,'--value'],ok=False)
+  return p.stdout.decode().strip()
+ def save(self):
+  p=STATE/'state.json';tmp=STATE/'state.next';write_new(tmp,json.dumps(self.state,sort_keys=True).encode());os.replace(tmp,p)
+ def preflight(self):
+  need(os.geteuid()==0,'local_root_operator_required');trusted(BUNDLE);trusted(BUNDLE/'SHA256SUMS')
+  for line in (BUNDLE/'SHA256SUMS').read_text().splitlines():
+   h,name=line.split();trusted(BUNDLE/name);need('/' not in name and hashlib.sha256((BUNDLE/name).read_bytes()).hexdigest()==h,'review_bundle_hash_mismatch')
+  for path in [Path('/opt'),Path('/etc'),Path('/var/lib'),Path('/etc/systemd/system'),Path('/usr/local/bin/node'),Path('/usr/bin/python3'),Path('/usr/bin/psql'),Path('/usr/bin/pg_dump'),Path('/usr/bin/pg_restore'),Path('/usr/bin/systemctl'),Path('/usr/sbin/nft'),Path('/usr/sbin/useradd')]:
+   if str(path).startswith(('/usr/bin/','/usr/local/bin/','/usr/sbin/')):trusted_tool(path)
+   else:trusted(path)
+  need(os.uname().machine=='x86_64','runtime_architecture_mismatch')
+  version=cmd(['/usr/local/bin/node','--version']).stdout.decode().strip()
+  match=re.fullmatch(r'v([0-9]+)\.([0-9]+)\.([0-9]+)',version)
+  need(match is not None and tuple(map(int,match.groups()))>=(24,11,0),'runtime_node_version_unsupported')
+  need(all(not p.exists() and not p.is_symlink() for p in (ROOT,CONF,STATE)),'existing_installation_refused')
+  for u in (UNIT,PROBE):need(self.property(u,'LoadState')=='not-found' and not (Path('/etc/systemd/system')/u).exists(),'unit_collision')
+  try:pwd.getpwnam(USER);raise Refused('account_collision')
+  except KeyError:pass
+  try:grp.getgrnam(USER);raise Refused('group_collision')
+  except KeyError:pass
+  require_cgroup_v2()
+  need(Path('/opt/aifinance/switch/current').resolve()==Path('/opt/aifinance/staging')/SHA,'website_baseline_changed')
+  need(self.property('aifinance-api.service','ActiveState')=='active' and self.property('aifinance-web.service','ActiveState')=='active','website_not_healthy')
+  for port,path in [(3000,'/'),(3001,'/api/health')]:cmd(['/usr/bin/curl','-q','--noproxy','*','--max-time','3','-fsS','-o','/dev/null','http://127.0.0.1:'+str(port)+path],timeout=5)
+  tables=json.loads(cmd(['/usr/sbin/nft','-j','list','tables']).stdout)
+  need(not any(x.get('table',{}).get('name')==TABLE for x in tables['nftables']),'firewall_table_collision')
+  cmd(['/usr/sbin/nft','--check','--file','-'],('create table inet '+TABLE+' { comment \"preflight-only\"; }\n').encode())
+  artifact_members(self.artifact,self.digest);audit_pass(self.db.audit())
+  self.resolved_at=time.monotonic()
+  manifest=json.loads((BUNDLE/'approval-manifest.json').read_text());self.feeds=manifest['feeds'];self.hosts={}
+  for row in self.feeds:
+   host=urllib.parse.urlsplit(row['config']['feedUrl']).hostname
+   out=cmd(['/usr/bin/getent','ahostsv4',host],timeout=6).stdout.decode()
+   ips=sorted({x.split()[0] for x in out.splitlines()});need(1<=len(ips)<=8,'feed_address_count')
+   need(all(ipaddress.ip_address(ip).version==4 and ipaddress.ip_address(ip).is_global and not ipaddress.ip_address(ip).is_multicast for ip in ips),'feed_address_not_public')
+   self.hosts[host]=ips
+  # Exact source flags and URLs, counts only; no seed, migration or repair on mismatch.
+  clauses=[]
+  for row in self.feeds:
+   sid=row['id'];url=row['config']['feedUrl'];need("'" not in sid+url,'invalid_fixed_feed')
+   clauses.append("(id='"+sid+"' AND kind='rss' AND NOT enabled AND collect_only AND participation_mode='isolated' AND NOT site_fulltext AND NOT syndicate_fulltext AND config=jsonb_build_object('feedUrl','"+url+"'))")
+  need(self.db.sql('SELECT count(*) FROM sources WHERE '+' OR '.join(clauses),True)=='3','source_configuration_mismatch')
+  # Publication counts require an isolated writer window; don't silently stop existing units.
+  need(self.db.sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND backend_type='client backend' AND usename<>'__APPLICATION_ROLE__'",True)=='0','other_database_clients_present')
+  self.before_counts=self.counts();self.before_audit=self.db.audit();emit('preflight_passed',public_connect_temp_inherited=self.before_audit['public_connect_temp'],no_writes=True)
+ def mkdir(self,p,mode=0o700,gid=0):trusted(p.parent);p.mkdir(mode=mode);os.chown(p,0,gid)
+ def extract(self):
+  self.mkdir(ROOT/'releases',0o755);self.mkdir(REL,0o755)
+  with tarfile.open(self.artifact,'r:*') as tar:
+   entries=tar.getmembers()
+   for m in sorted([m for m in entries if not m.issym()],key=lambda m:(len(PurePosixPath(m.name).parts),m.name)):
+    p=REL/m.name
+    for parent in reversed(p.parents):
+     if parent==REL or REL in parent.parents:
+      if not parent.exists():self.mkdir(parent,0o755)
+      trusted(parent)
+    if m.isdir():
+     if not p.exists():self.mkdir(p,0o755)
+    else:
+     fd=os.open(str(p),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o755 if m.mode&0o111 else 0o644)
+     with os.fdopen(fd,'wb') as out,tar.extractfile(m) as source:
+      shutil.copyfileobj(source,out,1048576);out.flush();os.fsync(out.fileno())
+   for m in [x for x in entries if x.issym()]:
+    p=REL/m.name;trusted(p.parent);os.symlink(m.linkname,p);need(p.resolve()==REL or REL in p.resolve().parents,'resolved_symlink_escape')
+  p=REL/'packages/backend/src/sources/rss.ts';s=p.read_text();old='const text = (bodyText || stripTags(summaryHtml)).slice(0, 20_000);';need(s.count(old)==1,'rss_overlay_mismatch');s=s.replace(old,'const text = stripTags(summaryHtml).slice(0, 2000);')
+  need(hashlib.sha256(s.encode()).hexdigest()=='218e1f92809b75229bf8b5b17bc31a6292c7375995fa0f7e1ebfc8d84df651ab','rss_overlay_hash_mismatch');p.write_text(s)
+  # Only the just-created independent tree is frozen, never existing website directories.
+  for base,dirs,files in os.walk(REL,followlinks=False):
+   for n in files:
+    q=Path(base)/n
+    if not q.is_symlink():q.chmod(0o555 if q.stat().st_mode&0o111 else 0o444)
+   Path(base).chmod(0o555)
+ def prepare(self):
+  self.mkdir(STATE);self.state={'nonce':uuid.uuid4().hex,'artifact_sha256':self.digest,'network_owned':False,'role_attempted':False,'files':[],'phase':'prepared'};self.save()
+  self.mkdir(ROOT,0o755);self.mkdir(CONF,0o750)
+  cmd(['/usr/sbin/useradd','--system','--user-group','--home-dir','/nonexistent','--shell','/sbin/nologin',USER]);u=pwd.getpwnam(USER)
+  need(u.pw_uid not in (0,__APPLICATION_UID__,pwd.getpwnam('__DEPLOY_USER__').pw_uid),'unsafe_collector_uid');self.state['uid']=u.pw_uid;self.state['gid']=u.pw_gid;self.save();os.chown(CONF,0,u.pw_gid)
+  self.extract();self.mkdir(ROOT/'bin',0o755)
+  for name in ['run.py','consume.py']:write_new(ROOT/'bin'/name,(BUNDLE/name).read_bytes(),0o555)
+  import runpy
+  render=runpy.run_path(str(BUNDLE/'render-network.py'))['render']
+  network=render({'uid':u.pw_uid,'forbidden_uids':[0,__APPLICATION_UID__,pwd.getpwnam('__DEPLOY_USER__').pw_uid],'hosts':self.hosts})
+  network['nft']=network['nft'].replace('create table inet '+TABLE,'create table inet '+TABLE+' { comment \"aifinance-collect-once:'+self.state['nonce']+'\"; }')
+  self.state['network_sha256']=hashlib.sha256(network['nft'].encode()).hexdigest();self.save()
+  for name in ['hosts','nsswitch']:write_new(CONF/('nsswitch.conf' if name=='nsswitch' else name),network[name].encode(),0o440,u.pw_gid)
+  self.network=network['nft']
+  text=(BUNDLE/UNIT).read_text();probe=text.replace('ExecStartPre=+/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/consume.py\n','').replace('ExecStart=/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/run.py','ExecStart=/usr/bin/sleep 30\nPrivateNetwork=yes')
+  for name,s in [(UNIT,text),(PROBE,probe)]:
+   path=Path('/etc/systemd/system')/name;write_new(path,s.encode(),0o644);self.state['files'].append(str(path));self.save()
+  cmd(['/usr/bin/systemctl','daemon-reload']);self.verify_units()
+ def verify_units(self):
+  for unit in (UNIT,PROBE):
+   need(self.property(unit,'DropInPaths')=='','unexpected_unit_dropins')
+   need(self.property(unit,'FragmentPath')=='/etc/systemd/system/'+unit,'wrong_unit_fragment')
+   for k,v in {'User':USER,'Group':USER,'MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','TimeoutStartUSec':'2min','NoNewPrivileges':'yes','KillMode':'control-group','ProtectSystem':'strict'}.items():need(self.property(unit,k)==v,'unit_safety_property_mismatch')
+   expected='/usr/bin/sleep 30' if unit==PROBE else '/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/run.py'
+   actual=self.property(unit,'ExecStart');need('argv[]='+expected+' ;' in actual and actual.count('argv[]=')==1,'unit_exec_mismatch')
+ def kernel_evidence(self,unit):
+  pid=self.property(unit,'MainPID');need(re.fullmatch('[1-9][0-9]*',pid),'probe_pid_missing')
+  values=dict(x.split(':',1) for x in Path('/proc/'+pid+'/status').read_text().splitlines() if ':' in x)
+  need(values['Uid'].split()==[str(self.state['uid'])]*4 and values['NoNewPrivs'].strip()=='1' and int(values['CapEff'].strip(),16)==0,'probe_identity_or_capabilities')
+  require_cgroup_v2()
+  control_group=self.property(unit,'ControlGroup')
+  evidence=verify_cgroup_v2(Path('/sys/fs/cgroup'),control_group,pid,cgroup_read(Path('/proc/'+pid+'/cgroup')))
+  need(self.property(unit,'MainPID')==pid and self.property(unit,'ControlGroup')==control_group,'probe_pid_or_cgroup_changed')
+  for name in ('hosts','nsswitch.conf'):
+   need(Path('/proc/'+pid+'/root/etc/'+name).read_bytes()==(CONF/name).read_bytes(),'resolver_binding_mismatch')
+  mounts=Path('/proc/'+pid+'/mountinfo').read_text().splitlines()
+  for target in ('/etc/hosts','/etc/nsswitch.conf'):need(any(len(x.split())>5 and x.split()[4]==target and 'ro' in x.split()[5].split(',') for x in mounts),'resolver_not_readonly')
+  return dict(evidence,uid=self.state['uid'])
+ def probe(self):
+  cmd(['/usr/bin/systemctl','start','--no-block',PROBE]);deadline=time.monotonic()+5
+  while self.property(PROBE,'MainPID')=='0' and time.monotonic()<deadline:time.sleep(.1)
+  evidence=self.kernel_evidence(PROBE);cmd(['/usr/bin/systemctl','stop',PROBE]);need(self.property(PROBE,'MainPID')=='0','probe_not_stopped');emit('resource_probe_passed',**evidence)
+ def backup(self):
+  size=int(self.db.sql('SELECT pg_database_size(current_database())',True));need(shutil.disk_usage(STATE).free>=size*2+268435456,'insufficient_backup_space')
+  path=STATE/'before.dump';fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  with os.fdopen(fd,'wb') as out:
+   p=subprocess.run(['/usr/bin/pg_dump','-Fc'],stdout=out,stderr=subprocess.PIPE,timeout=120,env=self.db.env);out.flush();os.fsync(out.fileno())
+  need(p.returncode==0,'backup_failed');cmd(['/usr/bin/pg_restore','--list',str(path)],timeout=15)
+  h=hashlib.sha256()
+  with path.open('rb') as f:
+   for b in iter(lambda:f.read(1048576),b''):h.update(b)
+  self.state['backup_sha256']=h.hexdigest();self.state['backup_bytes']=path.stat().st_size;self.save();emit('backup_created',bytes=path.stat().st_size,restore_rehearsal=False)
+ def activate(self):
+  need(0<=time.monotonic()-self.resolved_at<=180,'feed_resolution_expired')
+  cmd(['/usr/sbin/nft','--check','--file','-'],self.network.encode());self.state['network_attempted']=True;self.save()
+  cmd(['/usr/sbin/nft','--file','-'],self.network.encode());self.state['network_owned']=True;self.save()
+  self.state['role_attempted']=True;self.save();self.db.create_role(self.state['nonce'])
+  password=secrets.token_urlsafe(48)
+  write_new(CONF/'database.env',('DATABASE_URL=postgresql://'+ROLE+':'+password+'@127.0.0.1:__DATABASE_PORT__/__DATABASE_NAME__\n').encode(),0o440,self.state['gid'])
+  self.db.activate(password)
+  try:self.db.login_probe(password)
+  finally:del password
+  write_new(STATE/'ready',(SHA+'\n').encode());self.state['phase']='activated';self.save()
+ def counts(self):
+  result={}
+  for table in ('articles','article_revisions','article_discoveries','fetch_runs','analyses','receipts','editorial_overrides','editorial_review_state','editorial_versions','editorial_exports','publications','deliveries','grouping_decisions','pgboss.job'):
+   exists=self.db.sql("SELECT to_regclass('"+table+"') IS NOT NULL",True)=='t'
+   if not exists:
+    need(table=='pgboss.job','required_acceptance_table_missing');result[table]=None
+   else:result[table]=int(self.db.sql('SELECT count(*) FROM '+table,True))
+  return result
+ def records(self):
+  # Only IDs, hashes and boolean validation results leave PostgreSQL; never text bodies.
+  result=json.loads(self.db.sql((BUNDLE/'record-snapshot.sql').read_text(),True))
+  for table in ('analyses','receipts','editorial_overrides','editorial_review_state','editorial_versions','editorial_exports','publications','deliveries','grouping_decisions','pgboss.job'):
+   if table=='pgboss.job' and self.db.sql("SELECT to_regclass('pgboss.job') IS NOT NULL",True)!='t':
+    result[table]={};continue
+   query="SELECT coalesce(jsonb_object_agg(h,n),'{}'::jsonb) FROM (SELECT md5(to_jsonb(t)::text) h,count(*) n FROM "+table+" t GROUP BY 1) s"
+   result[table]=json.loads(self.db.sql(query,True))
+  return result
+ def verify_records(self,before,after):
+  for table,old in before.items():
+   new=after[table];need(set(old)<=set(new),'record_deleted')
+   changed=[key for key,value in new.items() if old.get(key)!=value]
+   if table in ('articles','article_revisions','article_discoveries','fetch_runs','sources'):
+    need(len(changed)<=3,'changed_record_limit')
+    need(all(new[key]['valid'] is True for key in changed),'changed_record_invalid')
+   else:need(not changed,'downstream_record_changed')
+  emit('record_validation_passed',changed_articles=sum(before['articles'].get(k)!=v for k,v in after['articles'].items()))
+ def run_once(self):
+  need(0<=time.monotonic()-self.resolved_at<=180,'feed_resolution_expired')
+  before_records=self.records()
+  need(0<=time.monotonic()-self.resolved_at<=180,'feed_resolution_expired')
+  self.state['phase']='starting';self.save();cmd(['/usr/bin/systemctl','start','--no-block',UNIT])
+  deadline=time.monotonic()+130;sample=None
+  while time.monotonic()<deadline:
+   active=self.property(UNIT,'ActiveState');pid=self.property(UNIT,'MainPID')
+   if pid!='0' and sample is None:sample=self.kernel_evidence(UNIT)
+   if active in ('inactive','failed') and (STATE/'consumed').exists():break
+   time.sleep(.1)
+  need(self.property(UNIT,'MainPID')=='0','collector_did_not_stop');need(sample is not None,'live_resource_sample_missing')
+  need(self.property(UNIT,'Result')=='success' and self.property(UNIT,'ExecMainStatus')=='0','collector_failed')
+  raw=cmd(['/usr/bin/journalctl','--no-pager','-u',UNIT,'-o','cat','-n','30']).stdout.decode()
+  rows=[]
+  for line in raw.splitlines():
+   try:x=json.loads(line)
+   except ValueError:continue
+   if isinstance(x,dict) and x.get('status')=='batch_completed':rows.append(x)
+  need(len(rows)==1,'sanitized_batch_receipt_missing')
+  import runpy
+  counts=runpy.run_path(str(BUNDLE/'run.py'))['summary'](rows[0]['counts'])
+  self.verify_records(before_records,self.records())
+  after=self.counts()
+  for table,before in self.before_counts.items():
+   if table in ('articles','article_revisions','article_discoveries','fetch_runs'):need(0<=after[table]-before<=3,'material_count_delta_out_of_bounds')
+   else:need(after[table]==before,'downstream_count_changed')
+  need(self.db.audit()['application_readonly'],'application_permissions_changed')
+  need(Path('/opt/aifinance/switch/current').resolve()==Path('/opt/aifinance/staging')/SHA,'website_baseline_changed')
+  for port,path in [(3000,'/'),(3001,'/api/health')]:cmd(['/usr/bin/curl','-q','--noproxy','*','--max-time','3','-fsS','-o','/dev/null','http://127.0.0.1:'+str(port)+path],timeout=5)
+  self.state['phase']='completed';self.save();emit('batch_completed',counts=counts)
+ def cleanup(self):
+  errors=[]
+  def attempt(fn):
+   try:fn()
+   except Exception:errors.append('cleanup_step_failed')
+  for unit in (UNIT,PROBE):
+   if str(Path('/etc/systemd/system')/unit) in self.state.get('files',[]):
+    attempt(lambda unit=unit:cmd(['/usr/bin/systemctl','stop',unit],timeout=15))
+    attempt(lambda unit=unit:need(self.property(unit,'MainPID')=='0' and self.property(unit,'ActiveState') in ('inactive','failed'),'service_cleanup_not_verified'))
+  if self.state.get('role_attempted'):
+   attempt(lambda:self.db.deactivate(self.state['nonce']))
+   attempt(lambda:self.db.verify_disabled(self.state['nonce']))
+  secret=CONF/'database.env'
+  if secret.exists() or secret.is_symlink():attempt(lambda:secret.unlink())
+  attempt(lambda:need(not secret.exists() and not secret.is_symlink(),'credential_cleanup_not_verified'))
+  if self.state.get('network_attempted'):
+   def remove_network():
+    tables=json.loads(cmd(['/usr/sbin/nft','-j','list','tables']).stdout)
+    if any(x.get('table',{}).get('name')==TABLE for x in tables['nftables']):
+     detail=json.loads(cmd(['/usr/sbin/nft','-j','list','table','inet',TABLE]).stdout)
+     need(any(x.get('table',{}).get('comment')=='aifinance-collect-once:'+self.state['nonce'] for x in detail['nftables']),'firewall_owner_marker_mismatch')
+     cmd(['/usr/sbin/nft','delete','table','inet',TABLE])
+    final=json.loads(cmd(['/usr/sbin/nft','-j','list','tables']).stdout)
+    need(not any(x.get('table',{}).get('name')==TABLE for x in final['nftables']),'firewall_cleanup_not_verified')
+   attempt(remove_network)
+  ready=STATE/'ready'
+  if ready.exists() or ready.is_symlink():attempt(lambda:ready.unlink())
+  attempt(lambda:need(not ready.exists() and not ready.is_symlink(),'ready_cleanup_not_verified'))
+  if self.state.get('role_attempted'):
+   attempt(lambda:need(self.db.audit()['application_readonly'],'application_permissions_changed'))
+  if self.state:
+   self.state['phase']='cleanup_incomplete' if errors else 'disabled';attempt(self.save)
+  emit('cleanup_finished',complete=not errors,remaining='root-owned audit files, immutable snapshot, nologin OS/DB identities, consumed latch; no timer')
+  need(not errors,'cleanup_requires_operator_recovery')
+ def execute(self):
+  self.preflight()  # No operator mutation before this returns.
+  try:self.prepare();self.probe();self.backup();self.activate();self.run_once()
+  finally:self.cleanup()
+
+def main():
+ p=argparse.ArgumentParser();p.add_argument('mode',choices=['check','run','cleanup']);p.add_argument('--artifact',type=Path);p.add_argument('--sha256');p.add_argument('--approve-three-source-smoke',action='store_true');p.add_argument('--exclusive-writer-window',action='store_true');a=p.parse_args()
+ need(os.geteuid()==0 and sys.stdin.isatty(),'local_root_tty_required')
+ if a.mode=='run':need(a.approve_three_source_smoke and a.exclusive_writer_window,'explicit_scope_and_writer_window_required')
+ db=Database(getpass.getpass('Original DB administrator URI (hidden; never stored): '));op=Operator(db,a.artifact,a.sha256)
+ if a.mode=='cleanup':
+  trusted(STATE/'state.json');op.state=json.loads((STATE/'state.json').read_text());op.cleanup()
+ else:
+  need(a.artifact is not None and a.sha256 is not None,'reviewed_complete_runtime_artifact_required')
+  if a.mode=='check':op.preflight()
+  else:op.execute()
+if __name__=='__main__':
+ try:main()
+ except Exception as e:emit('stopped',reason=str(e) if isinstance(e,Refused) else 'operator_failure_details_suppressed');sys.exit(1)

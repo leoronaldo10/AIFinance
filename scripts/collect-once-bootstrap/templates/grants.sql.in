@@ -1,0 +1,24 @@
+-- REVIEW ONLY. Run only after the bootstrap preconditions and explicit approval.
+-- Dedicated identity; fail on collision. No application-role changes.
+BEGIN;
+SET LOCAL lock_timeout='3s';
+SET LOCAL statement_timeout='5s';
+CREATE ROLE aifinance_collect_once NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 1;
+GRANT CONNECT ON DATABASE __DATABASE_NAME__ TO aifinance_collect_once;
+GRANT USAGE ON SCHEMA public TO aifinance_collect_once;
+GRANT SELECT ON TABLE public.sources TO aifinance_collect_once;
+GRANT UPDATE (cursor, last_fetch_at, last_ok_at, health, fail_count, last_error, updated_at) ON TABLE public.sources TO aifinance_collect_once;
+GRANT SELECT (id, source_id, identity_key, collect_only, revision, content_hash, backfill, title, body_text, excerpt, author, language, body_html, body_status, media, x_post, processing_state) ON TABLE public.articles TO aifinance_collect_once;
+GRANT INSERT (id, source_id, identity_key, url, title, author, language, published_at, published_at_claim, discovered_at, source_updated_at, timeline_at, backfill, backfill_reason, revision, content_hash, excerpt, body_text, body_html, body_status, media, x_post, raw, collect_only, processing_state) ON TABLE public.articles TO aifinance_collect_once;
+GRANT UPDATE (collect_only, processing_state, processing_queued_at, processing_retry_at, content_hash, excerpt, title, author, language, source_updated_at, body_text, body_html, body_status, media, x_post, revision, updated_at) ON TABLE public.articles TO aifinance_collect_once;
+GRANT SELECT (article_id, content_hash) ON TABLE public.article_revisions TO aifinance_collect_once;
+GRANT INSERT (article_id, revision, content_hash, title, body_text) ON TABLE public.article_revisions TO aifinance_collect_once;
+GRANT INSERT (article_id, source_id, via, discovered_at) ON TABLE public.article_discoveries TO aifinance_collect_once;
+GRANT INSERT (source_id, status, finished_at, found_count, new_count, error, detail) ON TABLE public.fetch_runs TO aifinance_collect_once;
+GRANT USAGE ON SEQUENCE public.fetch_runs_id_seq TO aifinance_collect_once;
+ALTER ROLE aifinance_collect_once IN DATABASE __DATABASE_NAME__ SET statement_timeout='15s';
+ALTER ROLE aifinance_collect_once IN DATABASE __DATABASE_NAME__ SET lock_timeout='3s';
+ALTER ROLE aifinance_collect_once IN DATABASE __DATABASE_NAME__ SET idle_in_transaction_session_timeout='90s';
+ALTER ROLE aifinance_collect_once IN DATABASE __DATABASE_NAME__ SET search_path=pg_catalog,public,pg_temp;
+COMMIT;
+-- Still NOLOGIN and no password. Activation is a separate bounded bootstrap phase.

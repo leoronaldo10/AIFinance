@@ -1,0 +1,33 @@
+SELECT json_build_object(
+ 'admin_is_superuser',(SELECT rolsuper FROM pg_roles WHERE rolname=current_user),
+ 'role_absent',NOT EXISTS(SELECT FROM pg_roles WHERE rolname='aifinance_collect_once'),
+ 'public_object_privileges',EXISTS(
+   SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace,
+   LATERAL aclexplode(coalesce(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S'::"char" ELSE 'r'::"char" END,c.relowner))) a
+   WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND c.relkind IN ('r','p','v','m','S') AND a.grantee=0),
+ 'public_column_privileges',EXISTS(
+   SELECT FROM pg_attribute c JOIN pg_class t ON t.oid=c.attrelid JOIN pg_namespace n ON n.oid=t.relnamespace,
+   LATERAL aclexplode(c.attacl) a WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND a.grantee=0),
+ 'public_schema_create',EXISTS(SELECT FROM pg_namespace n,LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a
+   WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND a.grantee=0 AND a.privilege_type='CREATE'),
+ 'public_definer_execute',EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace,
+   LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+   WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND p.prosecdef AND a.grantee=0 AND a.privilege_type='EXECUTE'),
+ 'custom_triggers',EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+   WHERE n.nspname='public' AND c.relname IN ('sources','articles','article_revisions','article_discoveries','fetch_runs') AND NOT t.tgisinternal),
+ 'row_security',EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
+   AND c.relname IN ('sources','articles','article_revisions','article_discoveries','fetch_runs') AND (c.relrowsecurity OR c.relforcerowsecurity)),
+ 'sequence_matches',pg_get_serial_sequence('public.fetch_runs','id')='public.fetch_runs_id_seq',
+ 'application_readonly',NOT EXISTS(SELECT FROM unnest(ARRAY['sources','articles','article_revisions','article_discoveries','fetch_runs']) t
+   WHERE has_table_privilege('__APPLICATION_ROLE__','public.'||t,'INSERT,UPDATE,DELETE,TRUNCATE')
+   OR has_any_column_privilege('__APPLICATION_ROLE__','public.'||t,'INSERT,UPDATE')),
+ 'unsafe_defaults',EXISTS(SELECT FROM pg_attrdef d JOIN pg_class c ON c.oid=d.adrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+   WHERE n.nspname='public' AND c.relname IN ('articles','article_revisions','article_discoveries','fetch_runs')
+   AND pg_get_expr(d.adbin,d.adrelid) NOT IN ('now()','CURRENT_TIMESTAMP',$v$nextval('fetch_runs_id_seq'::regclass)$v$,$v$nextval('public.fetch_runs_id_seq'::regclass)$v$)
+   AND pg_get_expr(d.adbin,d.adrelid) !~ $regex$^(NULL|true|false|-?[0-9]+|'[^']*')(::[a-zA-Z0-9_ .\[\]]+)?$$regex$),
+ 'unsafe_check_functions',EXISTS(SELECT FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+   JOIN pg_depend d ON d.classid='pg_constraint'::regclass AND d.objid=c.oid AND d.refclassid='pg_proc'::regclass JOIN pg_proc p ON p.oid=d.refobjid JOIN pg_namespace f ON f.oid=p.pronamespace
+   WHERE n.nspname='public' AND t.relname IN ('sources','articles','article_revisions','article_discoveries','fetch_runs') AND f.nspname<>'pg_catalog'),
+ 'public_connect_temp',EXISTS(SELECT FROM pg_database d,LATERAL aclexplode(coalesce(d.datacl,acldefault('d',d.datdba))) a
+   WHERE d.datname=current_database() AND a.grantee=0 AND a.privilege_type IN ('CONNECT','TEMPORARY'))
+);

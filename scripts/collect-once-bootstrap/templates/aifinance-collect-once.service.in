@@ -1,0 +1,33 @@
+[Unit]
+Description=Approved single AIFinance RSS batch (maximum three items)
+[Service]
+Type=oneshot
+User=aifinance-collect-once
+Group=aifinance-collect-once
+WorkingDirectory=/opt/aifinance-collect-once/releases/d57ba047369e666025347719caee1a4c642abe62
+ExecStartPre=+/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/consume.py
+ExecStart=/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/run.py
+TimeoutStartSec=120
+TimeoutStopSec=5
+KillMode=control-group
+Restart=no
+MemoryAccounting=yes
+MemoryMax=256M
+TasksMax=32
+CPUQuota=50%
+LimitNOFILE=512
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aifinance-collect-once
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+BindReadOnlyPaths=/etc/aifinance-collect-once/hosts:/etc/hosts /etc/aifinance-collect-once/nsswitch.conf:/etc/nsswitch.conf
+InaccessiblePaths=-/opt/aifinance/staging -/opt/aifinance/releases -/opt/aifinance/switch -/etc/aifinance-preview.env -/run/nscd -/var/run/nscd
+StandardOutput=journal
+StandardError=null
+# Deliberately no [Install], WantedBy, timer, restart, or remote start authorization.

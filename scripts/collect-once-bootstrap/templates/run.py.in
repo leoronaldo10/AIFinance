@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+"""Fixed dedicated-UID runner; only bounded aggregate counts reach the journal."""
+import os,sys,stat,pwd,json,subprocess,selectors,time,urllib.parse,signal
+from pathlib import Path
+ROOT=Path('/opt/aifinance-collect-once')
+REL=ROOT/'releases/d57ba047369e666025347719caee1a4c642abe62'
+IDS={'collect-dynamics-finance','collect-journal-accountancy','collect-accounting-today'}
+def trusted(p):
+ for q in (p,*p.parents):
+  s=q.lstat();assert s.st_uid==0 and not s.st_mode&0o022 and not stat.S_ISLNK(s.st_mode)
+def trusted_node():
+ p=Path('/usr/local/bin/node');seen=set()
+ while p.is_symlink():
+  assert p not in seen;seen.add(p);trusted(p.parent);assert p.lstat().st_uid==0
+  target=Path(os.readlink(p));p=Path(os.path.normpath(target if target.is_absolute() else p.parent/target))
+ trusted(p);assert p.is_file() and os.access(p,os.X_OK)
+def bounded(p,n):
+ fd=os.open(str(p),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as f:
+  s=os.fstat(f.fileno());assert stat.S_ISREG(s.st_mode) and s.st_size<=n
+  return f.read(n+1).decode()
+def summary(rows):
+ assert isinstance(rows,list) and len(rows)==3 and {r['sourceId'] for r in rows}==IDS
+ result=[]
+ for r in rows:
+  d={k:r[k] for k in ('sourceId','found','processed','created','revised')}
+  assert all(type(d[k])==int and 0<=d[k]<=1000000 for k in ('found','processed','created','revised'))
+  assert d['created']+d['revised']<=d['processed']
+  result.append(d)
+ assert sum(r['processed'] for r in result)<=3
+ return result
+
+def main():
+ assert len(sys.argv)==1 and os.getuid()==os.geteuid()!=0
+ assert pwd.getpwuid(os.getuid()).pw_name=='aifinance-collect-once'
+ trusted(Path(__file__));trusted(REL);trusted_node()
+ assert Path.cwd()==REL
+ secret=Path('/etc/aifinance-collect-once/database.env');trusted(secret)
+ s=secret.stat();assert stat.S_IMODE(s.st_mode)==0o440 and s.st_gid==os.getgid()
+ text=bounded(secret,8192);assert len(text.splitlines())==1 and text.startswith('DATABASE_URL=')
+ url=text.strip().split('=',1)[1];u=urllib.parse.urlsplit(url)
+ assert u.scheme=='postgresql' and u.hostname=='127.0.0.1' and u.port==__DATABASE_PORT__ and u.username=='aifinance_collect_once' and u.path=='/__DATABASE_NAME__' and u.password and not u.query and not u.fragment
+ env=dict(PATH='/usr/bin:/bin',HOME='/nonexistent',LANG='C',NODE_ENV='production',DATABASE_URL=url,DATABASE_POOL_MAX='1',PREVIEW_MODE='false',COLLECT_ENABLED='false',MODEL_CALLS_ENABLED='false',ALLOW_PRIVATE_NETWORK_FETCH='false',FEISHU_INTERNAL_ENABLED='false',FEISHU_CONTENT_PUSH_ENABLED='false',INDEXNOW_SUBMIT_ENABLED='false',AIHOT_CREDENTIALS_DIR='')
+ os.environ.clear()
+ p=subprocess.Popen(['/usr/local/bin/node','--experimental-strip-types','scripts/collect-only.ts','--run'],cwd=str(REL),env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+ del env,url,text
+ data=bytearray();deadline=time.monotonic()+105
+ sel=selectors.DefaultSelector();sel.register(p.stdout,selectors.EVENT_READ)
+ try:
+  while True:
+   left=deadline-time.monotonic()
+   if left<=0:raise TimeoutError()
+   if not sel.select(min(left,1)):continue
+   chunk=os.read(p.stdout.fileno(),4096)
+   if not chunk:break
+   data.extend(chunk)
+   if len(data)>16384:raise ValueError()
+  assert p.wait(timeout=max(0.1,deadline-time.monotonic()))==0
+  print(json.dumps({'status':'batch_completed','counts':summary(json.loads(data))}),flush=True)
+ except Exception:
+  p.kill();p.wait(timeout=5)
+  raise
+ finally:sel.close()
+if __name__=='__main__':
+ try:main()
+ except Exception:
+  print('{"status":"batch_failed_details_suppressed"}',flush=True);sys.exit(1)

@@ -1,0 +1,113 @@
+{
+  "sources": {
+    "SELECT": "*",
+    "UPDATE": [
+      "cursor",
+      "last_fetch_at",
+      "last_ok_at",
+      "health",
+      "fail_count",
+      "last_error",
+      "updated_at"
+    ]
+  },
+  "articles": {
+    "SELECT": [
+      "id",
+      "source_id",
+      "identity_key",
+      "collect_only",
+      "revision",
+      "content_hash",
+      "backfill",
+      "title",
+      "body_text",
+      "excerpt",
+      "author",
+      "language",
+      "body_html",
+      "body_status",
+      "media",
+      "x_post",
+      "processing_state"
+    ],
+    "INSERT": [
+      "id",
+      "source_id",
+      "identity_key",
+      "url",
+      "title",
+      "author",
+      "language",
+      "published_at",
+      "published_at_claim",
+      "discovered_at",
+      "source_updated_at",
+      "timeline_at",
+      "backfill",
+      "backfill_reason",
+      "revision",
+      "content_hash",
+      "excerpt",
+      "body_text",
+      "body_html",
+      "body_status",
+      "media",
+      "x_post",
+      "raw",
+      "collect_only",
+      "processing_state"
+    ],
+    "UPDATE": [
+      "collect_only",
+      "processing_state",
+      "processing_queued_at",
+      "processing_retry_at",
+      "content_hash",
+      "excerpt",
+      "title",
+      "author",
+      "language",
+      "source_updated_at",
+      "body_text",
+      "body_html",
+      "body_status",
+      "media",
+      "x_post",
+      "revision",
+      "updated_at"
+    ]
+  },
+  "article_revisions": {
+    "SELECT": [
+      "article_id",
+      "content_hash"
+    ],
+    "INSERT": [
+      "article_id",
+      "revision",
+      "content_hash",
+      "title",
+      "body_text"
+    ]
+  },
+  "article_discoveries": {
+    "INSERT": [
+      "article_id",
+      "source_id",
+      "via",
+      "discovered_at"
+    ]
+  },
+  "fetch_runs": {
+    "INSERT": [
+      "source_id",
+      "status",
+      "finished_at",
+      "found_count",
+      "new_count",
+      "error",
+      "detail"
+    ]
+  }
+}
