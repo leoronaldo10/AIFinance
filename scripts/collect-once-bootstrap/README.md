@@ -32,7 +32,19 @@ python3 -I -B build-runtime.py --helper-commit "$HELPER_SHA" --output "$HOME/aif
 
 The output directory must be absent. This fetches the exact application commit into an isolated source tree, verifies lock SHA256 `cb9821a67f7044e86c51ac5149fa0f7550511342b00560c4c593d4fc42bae503`, and runs `npm ci --ignore-scripts --omit=dev --workspace=@aihot/backend --include-workspace-root=false` against the official npm registry. npm cache/home/config are isolated; existing website files and `.env` are not read. Lifecycle scripts remain disabled. Every installed external package tarball is checked against lockfile SHA-512 before packaging.
 
-Review `build-result.json` and the printed artifact SHA256. It is the digest of YOUR locally generated `collector-runtime.tar.gz`; do not substitute a digest from another machine or this documentation. The archive is a collector runtime, not a full website build. No existing `node_modules` is copied. Native lifecycle scripts have not been needed for the collector tests; if anything requires them, stop and review that specific requirement instead of enabling all scripts.
+Review `build-result.json` and the printed artifact SHA256. It is the digest of YOUR locally generated `collector-runtime.tar.gz`; do not substitute a digest from another machine or this documentation. The archive is a collector runtime, not a full website build. Only the isolated build’s verified dependencies are packaged, including workspace-local `node_modules`. Native lifecycle scripts have not been needed for the collector tests; if anything requires them, stop and review that specific requirement instead of enabling all scripts.
+
+## 2a. Repair an existing isolated build without reinstalling
+
+Use the newly reviewed helper commit, not the earlier helper that omitted workspace-local dependencies. After obtaining that helper and running its checksum/tests, keep the existing build untouched and use a NEW output directory:
+
+```sh
+python3 -I -B build-runtime.py --helper-commit "$HELPER_SHA" --repack-existing "$HOME/aifinance-collect-build" --output "$HOME/aifinance-collect-repacked"
+```
+
+This mode runs no fetch, npm command, lifecycle script or installation. It requires the old build receipt, original archive, exact clean tracked source and existing npm cache. It checks cached tarball SHA-512 and installed file bytes, verifies the required dependency graph and workspace aliases, includes nested dependencies, and validates the extracted archive by loading the real HTTP and collector modules with network disabled. Missing cache/files, changed source or invalid dependencies stop the process; there is no automatic reinstall. Optional dependency counts can differ without weakening required-dependency checks.
+
+Use `--build-dir "$HOME/aifinance-collect-repacked"` in step 3 and its newly printed digest. Older receipts without runtime validation are refused. Root preflight independently verifies the archive’s inventory and required dependencies; it does not execute the JavaScript probe as root. Do not overwrite existing root review directories or proceed to run after a failed check.
 
 ## 3. Copy only the fixed helper into a NEW root-owned review directory
 
@@ -67,3 +79,5 @@ Recovery again needs local root TTY and hidden original DB administrator authent
 `test.py` renders templates with synthetic targets and runs offline grant-shape/orchestration/cgroup/build tests. Optional `test.py --postgres` is ONLY for a disposable isolated test cluster: supply `COLLECT_TEST_PSQL`, `COLLECT_TEST_SOCKET`, `COLLECT_TEST_PORT`, `COLLECT_TEST_ADMIN`; it creates/drops `collector_fixture_ci` and fixture roles. Never point it at a real database cluster.
 
 The fixed application collector and summary overlay were also tested with synthetic in-memory RSS and an isolated database under the dedicated grants: create, duplicate, revise, source rejection, <=3 processed, <=2000 summary, application role read-only. That is not target root/systemd/nft acceptance or current source reachability. No actual server evidence or private approval metadata is committed here. These changes add no CI workflow or auto-deployment and must not be merged into main as part of this task.
+
+The standalone `tests/test_runtime_http.mjs <extracted-runtime>` integration test requires an isolated test process with `NODE_ENV=test`, `ALLOW_PRIVATE_NETWORK_FETCH=true` and all collection/model/publication flags disabled. It starts its own loopback HTTP fixture, permits socket connections only to that fixture, loads the real HTTP module (no mocks), and verifies fetch and response-size enforcement. These test-only network settings must never be applied to deployment configuration.

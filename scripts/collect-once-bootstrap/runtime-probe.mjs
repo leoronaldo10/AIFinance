@@ -1,0 +1,26 @@
+// Loads the real HTTP and collector modules from an extracted artifact; permits no network.
+import assert from 'node:assert/strict';
+import {createRequire,syncBuiltinESMExports} from 'node:module';
+import {readFileSync,realpathSync} from 'node:fs';
+import {pathToFileURL} from 'node:url';
+import net from 'node:net';
+import path from 'node:path';
+const root=realpathSync(process.argv[2]);
+let attempts=0;
+net.Socket.prototype.connect=function(){attempts++;throw Error('network forbidden during runtime probe');};
+globalThis.fetch=()=>{attempts++;throw Error('network forbidden during runtime probe');};
+syncBuiltinESMExports();
+const parent=path.join(root,'packages/backend/src/lib/http-fetch.ts');
+const require=createRequire(parent);
+const expected=path.join(root,'packages/backend/node_modules/undici');
+assert.ok(realpathSync(require.resolve('undici')).startsWith(expected+path.sep));
+const version=JSON.parse(readFileSync(path.join(expected,'package.json'),'utf8')).version;
+assert.equal(version,'8.11.2');
+const http=await import(pathToFileURL(parent));
+assert.equal(typeof http.guardedFetch,'function');
+const collector=await import(pathToFileURL(path.join(root,'packages/backend/src/sources/collect-only.ts')));
+assert.equal(typeof collector.collectOnlyBatch,'function');
+const db=await import(pathToFileURL(path.join(root,'packages/backend/src/db.ts')));
+await db.closeDb();
+assert.equal(attempts,0);
+console.log(JSON.stringify({real_http_module_loaded:true,collector_module_loaded:true,backend_undici_version:version,network_attempts:attempts}));

@@ -7,11 +7,12 @@ class Build(unittest.TestCase):
  def test_reproducible_package_and_secret_file_exclusion(self):
   with tempfile.TemporaryDirectory() as d:
    root=pathlib.Path(d);src=root/'source';src.mkdir()
-   for path in ['package.json','package-lock.json','scripts/collect-only.ts','industry/package.json','packages/backend/package.json','packages/backend/src/x.ts','packages/contracts/package.json','packages/contracts/src/x.ts','node_modules/pkg/package.json','node_modules/pkg/.env']:
+   for path in ['package.json','package-lock.json','scripts/collect-only.ts','industry/package.json','packages/backend/package.json','packages/backend/src/x.ts','packages/contracts/package.json','packages/contracts/src/x.ts','node_modules/pkg/package.json','node_modules/pkg/.env','packages/backend/node_modules/nested/package.json']:
     p=src/path;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('synthetic')
    a=root/'a.tgz';b=root/'b.tgz';ha=B['package'](src,a);hb=B['package'](src,b);self.assertEqual(ha,hb)
    import tarfile
-   with tarfile.open(a) as tar:self.assertFalse(any('.env' in p.name for p in tar.getmembers()))
+   with tarfile.open(a) as tar:
+    self.assertFalse(any('.env' in p.name for p in tar.getmembers()));self.assertIn('packages/backend/node_modules/nested/package.json',tar.getnames())
    (src/'node_modules/escape').symlink_to('/etc/passwd')
    with self.assertRaises(B['Refused']):B['package'](src,root/'bad.tgz')
  def test_dependency_integrity_and_tamper(self):

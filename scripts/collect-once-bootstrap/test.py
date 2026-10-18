@@ -15,3 +15,5 @@ if __name__=='__main__':
   if a.postgres:shutil.copyfile(R/'tests/test_postgres.py',dest/'test_postgres.py');suites.append('test_postgres.py')
   for name in suites:subprocess.run([sys.executable,'-I','-B',str(dest/name)],check=True,timeout=60)
  subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_build.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_runtime.py')],check=True,timeout=30)

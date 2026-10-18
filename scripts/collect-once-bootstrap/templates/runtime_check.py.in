@@ -1,0 +1,72 @@
+"""Read-only package inventory/required-edge validation shared by build and root preflight."""
+import hashlib,json,posixpath
+from pathlib import PurePosixPath
+LOCK='cb9821a67f7044e86c51ac5149fa0f7550511342b00560c4c593d4fc42bae503'
+WORKSPACES={'industry','packages/backend','packages/contracts'}
+class InvalidRuntime(ValueError):pass
+def need(value,reason):
+ if not value:raise InvalidRuntime(reason)
+def safe(name):
+ p=PurePosixPath(name);need(name and not p.is_absolute() and '..' not in p.parts and '.' not in name.split('/') and str(p)==name,'unsafe_inventory_path');return name
+def resolve(mapping,parent,name):
+ safe(name);current=parent
+ while True:
+  if posixpath.basename(current)!='node_modules':
+   candidate=posixpath.join(current,'node_modules',name)
+   if candidate in mapping:
+    meta=mapping[candidate]
+    if meta.get('link'):
+     target=safe(meta['resolved']);need(target in WORKSPACES and target in mapping,'unapproved_workspace_link');return target
+    return candidate
+  if not current:return None
+  current=posixpath.dirname(current)
+def verify(read_file,link_target):
+ lock_bytes=read_file('package-lock.json');need(hashlib.sha256(lock_bytes).hexdigest()==LOCK,'fixed_lock_mismatch')
+ locked=json.loads(lock_bytes)['packages'];installed=json.loads(read_file('node_modules/.package-lock.json'))['packages'];external=[];links=[]
+ for name,meta in installed.items():
+  safe(name);need(name in locked,'package_not_in_fixed_lock');expected=locked[name]
+  if meta.get('link'):
+   target=safe(meta['resolved']);need(target in WORKSPACES and expected.get('link') and expected['resolved']==target,'workspace_link_mismatch')
+   need(link_target(name)==target,'workspace_link_target_missing_or_changed');links.append(name);continue
+  if 'version' not in meta:need(name in WORKSPACES,'unexpected_unversioned_package')
+  else:
+   need('node_modules' in PurePosixPath(name).parts,'invalid_external_package_path')
+   need(meta['version']==expected.get('version') and meta.get('integrity')==expected.get('integrity') and bool(meta.get('integrity')),'package_lock_mismatch');external.append(name)
+  package=json.loads(read_file(name+'/package.json'))
+  need(package.get('name') and (name in WORKSPACES or package.get('version')==meta['version']),'package_json_missing_or_mismatched')
+  required=set(expected.get('dependencies',{}))|{n for n in expected.get('peerDependencies',{}) if not expected.get('peerDependenciesMeta',{}).get(n,{}).get('optional')}
+  for dependency in required:
+   if dependency in expected.get('optionalDependencies',{}):continue
+   wanted=resolve(locked,name,dependency);actual=resolve(installed,name,dependency)
+   need(wanted is not None and actual==wanted,'required_dependency_missing_or_relocated')
+ need(WORKSPACES<=installed.keys(),'workspace_inventory_incomplete')
+ for name in WORKSPACES:
+  package=json.loads(read_file(name+'/package.json'));alias='node_modules/'+package['name']
+  need(alias in links and link_target(alias)==name,'workspace_alias_missing')
+ return {'external_packages':len(external),'external_paths':sorted(external),'workspace_links':sorted(links),'required_edges_verified':True}
+def verify_directory(root):
+ root=root.resolve()
+ def read(name):
+  p=root/safe(name);need(p.is_file() and not p.is_symlink() and root in p.resolve().parents,'runtime_file_missing_or_unsafe');return p.read_bytes()
+ def target(name):
+  p=root/safe(name);need(p.is_symlink() and root in p.resolve().parents,'workspace_link_missing_or_unsafe');return p.resolve().relative_to(root).as_posix()
+ return verify(read,target)
+def verify_archive(tar):
+ members={}
+ for m in tar.getmembers():
+  safe(m.name);need(m.name not in members,'duplicate_archive_member')
+  need(m.isfile() or m.isdir() or m.issym(),'unsafe_archive_member_type')
+  if m.issym():
+   need(not posixpath.isabs(m.linkname),'absolute_archive_link')
+   safe(posixpath.normpath(posixpath.join(posixpath.dirname(m.name),m.linkname)))
+  members[m.name]=m
+ for name in members:
+  for parent in PurePosixPath(name).parents:
+   need(str(parent) not in members or not members[str(parent)].issym(),'archive_symlink_parent')
+ def read(name):
+  m=members.get(safe(name));need(m is not None and m.isfile() and m.size<=1048576,'archive_package_file_missing_or_unsafe');return tar.extractfile(m).read()
+ def target(name):
+  m=members.get(safe(name));need(m is not None and m.issym() and not m.linkname.startswith('/'),'archive_workspace_link_missing')
+  resolved=posixpath.normpath(posixpath.join(posixpath.dirname(name),m.linkname));safe(resolved)
+  need(resolved+'/package.json' in members,'archive_workspace_target_missing');return resolved
+ return verify(read,target)

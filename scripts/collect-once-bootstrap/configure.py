@@ -34,6 +34,7 @@ def main():
  artifact=build/'collector-runtime.tar.gz';receipt=build/'build-result.json'
  need(all(p.is_file() and not p.is_symlink() for p in (artifact,receipt)),'build_files_missing')
  result=json.loads(receipt.read_text());need(result['helper_commit']==args.helper_commit and result['source_commit']==BASELINE and result['lockfile_sha256']==LOCK and result['npm_ignore_scripts'] is True,'build_receipt_mismatch')
+ need(result.get('runtime_verification',{}).get('probe',{}).get('real_http_module_loaded') is True and result['runtime_verification']['probe'].get('backend_undici_version')=='8.11.2' and result['runtime_verification'].get('required_edges_verified') is True,'runtime_verification_missing')
  digest=input('Paste the artifact SHA256 reported by your non-root build: ').strip();need(re.fullmatch('[a-f0-9]{64}',digest) and digest==result['artifact_sha256'],'artifact_digest_mismatch')
  need(hashlib.sha256(artifact.read_bytes()).hexdigest()==digest,'artifact_changed')
  database=getpass.getpass('Approved existing database name (hidden, local only): ');port=int(getpass.getpass('Approved existing loopback database port (hidden): '));app=getpass.getpass('Existing SELECT-only application database role (hidden): ');deploy=getpass.getpass('Existing restricted deploy OS account (hidden): ')

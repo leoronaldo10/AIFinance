@@ -111,6 +111,8 @@ def artifact_members(path,digest):
   for name,want in PINS.items():
    m=tar.getmember(name);need(m.isfile() and m.size<=1048576,'invalid_pinned_file');need(hashlib.sha256(tar.extractfile(m).read()).hexdigest()==want,'artifact_pin_mismatch')
   need(tar.getmember('package.json').isfile() and any(n.startswith('node_modules/') for n in names),'complete_runtime_required')
+  import runpy
+  runpy.run_path(str(BUNDLE/'runtime_check.py'))['verify_archive'](tar)
  return True
 
 def cgroup_read(path):
