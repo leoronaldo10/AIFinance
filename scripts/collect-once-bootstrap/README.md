@@ -109,3 +109,67 @@ Publication and installation of this administrator-mode change require explicit 
 ### Validation limits
 
 The local-socket suite executes real SQL, grants/revocation, pg_dump output and pg_restore listing against a disposable PostgreSQL cluster. The available test environment is non-root: tests intercept the OS identity-switch arguments and assert them separately; they do not claim a kernel-level root-to-postgres transition or root-owned dump was exercised locally. Production code always requests that transition and fails closed if it fails. File tests exercise exclusive creation, mode 0600, existing-file preservation and symlink refusal. Existing URI-path and safety suites remain required.
+
+### Approved recovery of the pre-start TCP/HBA refusal (retry-001)
+
+`retry-once.py` is a separate, exact-target local-root tool. It never changes the
+old review, original runtime, original `state.json`, backup, or consumed latch.
+Only `aifinance_preview:55432`, application role `aifinance_app`, deploy identity
+`aifinance-deploy`, and runtime SHA256
+`a88da42096a452d526e7cd53f6fdf26e6349cf1cd3d148428cefa9e73632656a` are accepted.
+The sibling helper must be checksum-verified before execution. This recovery was
+explicitly approved together with a temporary exact HBA rule and one retry.
+
+`check` performs no writes. `run --approve-three-source-smoke
+--exclusive-writer-window` repeats those gates and exclusively creates
+`/var/lib/aifinance-collect-once/retry-001`, permanently consuming this recovery
+attempt even on failure. `cleanup` only disables/verifies this same marked
+attempt and restores its HBA change; it cannot start a batch. No automatic retry.
+
+Required evidence: original attempt within the current boot, original phase disabled, verified backup and original role
+marker, NOLOGIN/password NULL/revoked rights, no membership or privileged role
+attributes, trusted unchanged runner/latch/unit and entire frozen runtime tree,
+no consumed/ready/credential file, inactive static service with zero recorded
+main-process start/PID/restarts, no timer. Missing or conflicting evidence stops
+before mutation. The root-owned durable consumed latch is the principal
+pre-start evidence; this does not attempt to defend against a root operator who
+previously deleted or forged audit files. Never delete old state to pass a gate.
+Existing resolver bindings must still equal fresh resolution of the exact three
+approved feeds; changed DNS stops for review rather than rewriting old files.
+
+The existing OS/DB identity is reused only after ownership and safety checks.
+The exact old grants are reapplied without CREATE ROLE, with a new short-lived
+SCRAM password. A new backup is placed under retry-001; old backups are retained.
+Probe and batch resource limits, three-source/three-item cap, and disabled source
+flags remain unchanged. The installed systemd service/runner is not rewritten.
+
+HBA: locate `SHOW hba_file`, require a trusted regular single-link file without
+extended attributes; refuse includes/continuations, existing matching or ambiguous
+rules, parse errors, pending restart or file changes newer than configuration
+load. Snapshot config hashes; append only
+`host aifinance_preview aifinance_collect_once 127.0.0.1/32 scram-sha-256` inside a
+unique comment block. Preserve all old rule bytes/order, owner/group/mode, atomically
+replace and fsync, validate parsed rule, reload (never restart), wait for reload
+observation, then require the real TCP read-only identity probe. All operations
+require an exclusive configuration-edit window as well as the DB writer window:
+hash checks detect intervening changes but cannot prevent a non-cooperating root
+writer racing the last compare and rename. No concurrent administrator edits.
+
+Cleanup always attempts DB/session/credential/firewall/ready cleanup, HBA restore,
+and website baseline/HTTP health checks. HBA rollback restores original bytes only
+when the current file is exactly original or exactly our addition; other changes
+are preserved and reported for operator recovery. The role is disabled first.
+`retry_cleanup_finished complete=true,hba_restored=true` is the overall receipt;
+the old `cleanup_finished` alone is insufficient. Protected audit files contain
+original HBA and hashes, old state copy, new backup/state, and sanitized retry events.
+Raw client stderr/passwords are never persisted. `cleanup` can recover a completed
+HBA receipt after interruption; unreadable/ambiguous receipts fail closed.
+
+Test with an existing PostgreSQL 17 distribution (no software installation):
+`RETRY_TEST_PG_BIN=/path/to/bin RETRY_TEST_PG_SHARE=/path/to/share python3 -I -B tests/test_retry_hba.py`.
+It creates/stops a disposable cluster on 127.0.0.1:56441 and temporary Unix socket.
+Tests cover real SCRAM correct/wrong credentials, absent HBA, other role/database
+denial, column grants/forbidden writes, regrant/revoke, loaded HBA rollback,
+concurrent edits, reload failure, interrupted HBA recovery and retry/start guards.
+Root ownership/uid transitions and systemd kernel evidence cannot be integrated
+locally under the non-root runner; production gates verify them before the batch.
