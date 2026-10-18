@@ -17,3 +17,5 @@ if __name__=='__main__':
  subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_build.py')],check=True,timeout=30)
 
  subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_runtime.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_configure_ux.py')],check=True,timeout=30)
