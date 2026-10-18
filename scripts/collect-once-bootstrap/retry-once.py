@@ -97,22 +97,21 @@ def gates(m,op,old):
  audit=op.db.audit();need(audit['role_absent'] is False,'existing_dedicated_role_missing')
  need(all(audit.get(k) is True for k in ('admin_is_superuser','sequence_matches','application_readonly')) and all(audit.get(k) is False for k in ('public_object_privileges','public_column_privileges','public_schema_create','public_definer_execute','custom_triggers','row_security','unsafe_defaults','unsafe_check_functions')),'retry_catalog_precondition_failed')
  need(op.db.sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND backend_type='client backend' AND usename<>'aifinance_app'",True)=='0','other_database_clients_present')
- manifest=json.loads((REVIEW/'approval-manifest.json').read_text());op.feeds=manifest['feeds'];op.hosts={};clauses=[]
+ manifest=json.loads((REVIEW/'approval-manifest.json').read_text());op.feeds=manifest['feeds'];clauses=[]
  for row in op.feeds:
-  host=m['urllib'].parse.urlsplit(row['config']['feedUrl']).hostname
-  out=m['cmd'](['/usr/bin/getent','ahostsv4',host],timeout=6).stdout.decode();ips=sorted({s.split()[0] for s in out.splitlines()})
-  need(1<=len(ips)<=8 and all(m['ipaddress'].ip_address(ip).version==4 and m['ipaddress'].ip_address(ip).is_global and not m['ipaddress'].ip_address(ip).is_multicast for ip in ips),'unsafe_feed_resolution');op.hosts[host]=ips
   sid=row['id'];url=row['config']['feedUrl'];need("'" not in sid+url,'invalid_feed')
+  endpoint=m['urllib'].parse.urlsplit(url);need(endpoint.scheme=='https' and endpoint.hostname in RESOLVER['HOSTS'] and endpoint.port in (None,443) and not endpoint.username and not endpoint.password,'feed_host_scope_changed')
   clauses.append("(id='"+sid+"' AND kind='rss' AND NOT enabled AND collect_only AND participation_mode='isolated' AND NOT site_fulltext AND NOT syndicate_fulltext AND config=jsonb_build_object('feedUrl','"+url+"'))")
  need(len(clauses)==3 and op.db.sql('SELECT count(*) FROM sources WHERE '+' OR '.join(clauses),True)=='3','source_configuration_mismatch')
- op.resolved_at=time.monotonic();op.before_counts=op.counts();op.before_audit=audit
- net=runpy.run_path(str(REVIEW/'render-network.py'))['render']({'uid':old['uid'],'forbidden_uids':[0,int(VALUES['__APPLICATION_UID__']),pwd.getpwnam('aifinance-deploy').pw_uid],'hosts':op.hosts})
- op.network=net['nft'].replace('create table inet '+m['TABLE'],'create table inet '+m['TABLE']+' { comment "aifinance-collect-once:'+old['nonce']+'"; }')
- for name in ('hosts','nsswitch'):
-  p=m['CONF']/('nsswitch.conf' if name=='nsswitch' else name);m['trusted'](p);need(p.read_text()==net[name],'feed_resolution_changed_requires_review')
+ op.before_counts=op.counts();op.before_audit=audit
+ resolver=make_resolver(m,old);resolver.inspect();op.resolved_at,op.hosts,net=resolver.resolve();op.network=net['nft'];op.resolver=resolver
  tables=json.loads(m['cmd'](['/usr/sbin/nft','-j','list','tables']).stdout)
  need(not any(x.get('table',{}).get('name')==m['TABLE'] for x in tables['nftables']),'firewall_table_collision')
  m['cmd'](['/usr/sbin/nft','--check','--file','-'],op.network.encode())
+
+def make_resolver(m,old):
+ render=runpy.run_path(str(REVIEW/'render-network.py'))['render']
+ return RESOLVER['ResolverSnapshot'](m,old,AUDIT,render,[0,int(VALUES['__APPLICATION_UID__']),pwd.getpwnam('aifinance-deploy').pw_uid])
 
 def make_operator(m,db):
  class RetryOperator(m['Operator']):
@@ -127,16 +126,19 @@ def make_operator(m,db):
    self.state['backup_sha256']=sha(path);self.state['backup_bytes']=path.stat().st_size;self.save();emit('retry_backup_created',bytes=path.stat().st_size,restore_rehearsal=False)
  return RetryOperator(db,REVIEW/'collector-runtime.tar.gz',ARTIFACT_SHA)
 
-def cleanup_all(m,op,hba):
+def cleanup_all(m,op,hba,resolver=None):
  errors=[]
  try:op.cleanup()
  except Exception:errors.append('operator_cleanup_failed')
  try:hba.restore()
  except Exception:errors.append('hba_restore_failed')
+ try:
+  if resolver is not None:resolver.restore()
+ except Exception:errors.append('resolver_restore_failed')
  try:website(m,op)
  except Exception:errors.append('website_health_failed')
  exclusive(AUDIT/('cleanup-'+str(time.time_ns())+'.json'),json.dumps({'complete':not errors,'errors':errors}).encode())
- emit('retry_cleanup_finished',complete=not errors,errors=errors,hba_restored=not hba.changed)
+ emit('retry_cleanup_finished',complete=not errors,errors=errors,hba_restored=not hba.changed,resolver_restored=resolver is None or not resolver.changed)
  need(not errors,'retry_cleanup_requires_recovery')
 
 def trusted_receipt(path):
@@ -145,7 +147,7 @@ def trusted_receipt(path):
 
 def load_hba_recovery(h,db):
  hba=h['TemporaryHBA'](db,AUDIT,db.local_identity[0]);receipt=AUDIT/'hba-receipt.json'
- if not receipt.exists():return hba
+ if not receipt.exists() and not receipt.is_symlink():return hba
  for path in (receipt,AUDIT/'hba.original'):trusted_receipt(path)
  data=json.loads(receipt.read_text());hba.path=Path(data['path']);hba.original=(AUDIT/'hba.original').read_bytes()
  hba.modified=hba.original+b'\n# AIFinance approved retry-001 BEGIN\n'+h['RULE']+b'# AIFinance approved retry-001 END\n'
@@ -170,11 +172,21 @@ def probe_tcp(m,password):
   emit('retry_login_probe_failed',exit_code=p.returncode,category=category,identity_readonly_ok=p.stdout.strip()==b't');raise Refused('dedicated_role_login_probe_failed')
  emit('retry_tcp_scram_probe_passed')
 
+def execute_retry(m,op,hba):
+ try:
+  op.backup()
+  op.resolved_at,op.hosts,net=op.resolver.install();op.network=net['nft'];op.state['network_sha256']=hashlib.sha256(op.network.encode()).hexdigest();op.save()
+  emit('retry_resolver_pinned',hosts=3,public_ipv4_count=len({ip for ips in op.hosts.values() for ip in ips}),snapshot_sha256=hashlib.sha256(net['hosts'].encode()).hexdigest())
+  op.probe();hba.install();op.activate();op.run_once()
+ finally:
+  signal.signal(signal.SIGTERM,signal.SIG_IGN);signal.signal(signal.SIGINT,signal.SIG_IGN)
+  cleanup_all(m,op,hba,op.resolver)
+
 def main():
- global VALUES,RECORD_EVENTS
+ global VALUES,RECORD_EVENTS,RESOLVER
  p=argparse.ArgumentParser();p.add_argument('mode',choices=['check','run','cleanup']);p.add_argument('--approve-three-source-smoke',action='store_true');p.add_argument('--exclusive-writer-window',action='store_true');a=p.parse_args()
  need(os.geteuid()==0 and sys.stdin.isatty(),'local_root_tty_required')
- m,VALUES=verify_helper();h=runpy.run_path(str(HERE/'retry-hba.py'));db=m['Database'].local_socket('/var/run/postgresql');db.verify_admin_identity();op=make_operator(m,db)
+ m,VALUES=verify_helper();RESOLVER=runpy.run_path(str(HERE/'retry-resolver.py'));h=runpy.run_path(str(HERE/'retry-hba.py'));db=m['Database'].local_socket('/var/run/postgresql');db.verify_admin_identity();op=make_operator(m,db)
  m['trusted'](STATE/'state.json');old=json.loads((STATE/'state.json').read_text());need(old.get('admin_auth')==db.auth_binding(),'original_auth_binding_changed')
  if a.mode=='cleanup':
   m['trusted'](AUDIT/'state.json');RECORD_EVENTS=True;op.state=json.loads((AUDIT/'state.json').read_text());need(op.state.get('nonce')==old.get('nonce') and op.state.get('admin_auth')==db.auth_binding(),'retry_receipt_mismatch')
@@ -184,7 +196,14 @@ def main():
     changed=True
     def restore(self):raise Refused('hba_recovery_receipt_unreadable')
    hba=UnreadableHBA()
-  cleanup_all(m,op,hba);return
+  try:
+   resolver=make_resolver(m,old);resolver.recover(trusted_receipt)
+  except Exception:
+   class UnreadableResolver:
+    changed=True
+    def restore(self):raise Refused('resolver_recovery_receipt_unreadable')
+   resolver=UnreadableResolver()
+  cleanup_all(m,op,hba,resolver);return
  need(absent(AUDIT),'retry_already_attempted');op.state=copy.deepcopy(old);gates(m,op,old)
  hba=h['TemporaryHBA'](db,AUDIT,db.local_identity[0]);hba.inspect();emit('retry_preflight_passed',no_writes=True,never_started=True)
  if a.mode=='check':return
@@ -197,11 +216,7 @@ def main():
  def regrant(nonce):regrant_existing(db,REVIEW,nonce)
  db.create_role=regrant
  db.login_probe=lambda password:probe_tcp(m,password)
- try:
-  op.probe();op.backup();hba.install();op.activate();op.run_once()
- finally:
-  signal.signal(signal.SIGTERM,signal.SIG_IGN);signal.signal(signal.SIGINT,signal.SIG_IGN)
-  cleanup_all(m,op,hba)
+ execute_retry(m,op,hba)
  need((STATE/'state.json').read_bytes()==(AUDIT/'original-state.json').read_bytes(),'original_receipt_changed')
  emit('retry_finished',complete=True)
 if __name__=='__main__':

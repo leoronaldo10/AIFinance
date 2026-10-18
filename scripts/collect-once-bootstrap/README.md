@@ -134,13 +134,18 @@ main-process start/PID/restarts, no timer. Missing or conflicting evidence stops
 before mutation. The root-owned durable consumed latch is the principal
 pre-start evidence; this does not attempt to defend against a root operator who
 previously deleted or forged audit files. Never delete old state to pass a gate.
-Existing resolver bindings must still equal fresh resolution of the exact three
-approved feeds; changed DNS stops for review rather than rewriting old files.
+The old resolver bindings must be canonical, match the original network receipt,
+and retain `hosts: files`. Only after that proof, fresh public IPv4 answers for
+the same three approved HTTPS hosts may differ. Address order/duplicates are
+canonicalized. The old resolver bytes and hashes are preserved in retry-001.
 
 The existing OS/DB identity is reused only after ownership and safety checks.
 The exact old grants are reapplied without CREATE ROLE, with a new short-lived
 SCRAM password. A new backup is placed under retry-001; old backups are retained.
-Probe and batch resource limits, three-source/three-item cap, and disabled source
+After the new backup, resolve again and pin one fresh snapshot to hosts and the
+UID firewall, then perform the resource probe before activating credentials. The
+180-second freshness clock starts before the first DNS request. Probe and batch
+resource limits, three-source/three-item cap, and disabled source
 flags remain unchanged. The installed systemd service/runner is not rewritten.
 
 HBA: locate `SHOW hba_file`, require a trusted regular single-link file without
@@ -156,10 +161,11 @@ hash checks detect intervening changes but cannot prevent a non-cooperating root
 writer racing the last compare and rename. No concurrent administrator edits.
 
 Cleanup always attempts DB/session/credential/firewall/ready cleanup, HBA restore,
-and website baseline/HTTP health checks. HBA rollback restores original bytes only
+original resolver snapshot restore, and website baseline/HTTP health checks. HBA rollback restores original bytes only
 when the current file is exactly original or exactly our addition; other changes
 are preserved and reported for operator recovery. The role is disabled first.
-`retry_cleanup_finished complete=true,hba_restored=true` is the overall receipt;
+`retry_cleanup_finished complete=true,hba_restored=true,resolver_restored=true`
+is the overall receipt;
 the old `cleanup_finished` alone is insufficient. Protected audit files contain
 original HBA and hashes, old state copy, new backup/state, and sanitized retry events.
 Raw client stderr/passwords are never persisted. `cleanup` can recover a completed
@@ -173,3 +179,36 @@ denial, column grants/forbidden writes, regrant/revoke, loaded HBA rollback,
 concurrent edits, reload failure, interrupted HBA recovery and retry/start guards.
 Root ownership/uid transitions and systemd kernel evidence cannot be integrated
 locally under the non-root runner; production gates verify them before the batch.
+
+
+### DNS-only recovery-helper revision
+
+The published predecessor could stop at `feed_resolution_changed_requires_review`
+before HBA inspection, retry-001 creation, credential generation, network writes,
+or service start. No cleanup is needed for that preflight refusal. The installer
+now starts from the exact checksum-verified predecessor helper and creates
+`/root/aifinance-once-helper-retry-dns/helper`; the older helper is preserved. An
+already complete new helper may be reused only after its full fixed manifest is
+verified and retry-001 remains absent. A partial/mismatched helper or any retry-001
+entry is a hard stop; nothing is deleted or reset. The retry ID remains retry-001.
+
+Resolver changes touch only the dedicated `hosts` snapshot, with the same
+root:collector ownership and 0440 mode. `nsswitch.conf`, the site, TLS behavior,
+fixed URLs, source flags, service unit, and runtime are unchanged. Resolution uses
+only the three exact hostnames and accepts 1–8 distinct globally routable,
+non-multicast, non-reserved IPv4 addresses per host. No DNS egress is added to the
+collector, no domain or subnet is added, and the UID firewall still rejects all
+other traffic. The runner keeps default TLS certificate verification and existing
+same-origin redirect restrictions. DNS output is parsed as address data only.
+
+The original snapshot is checked against the original network SHA256, not just
+against today's DNS. A receipt is fsynced before atomic replacement. Cleanup and
+interrupted-attempt cleanup restore old bytes only if current content is exactly
+our old or new snapshot; concurrent edits are preserved and reported. New DNS
+results after pinning cannot widen the in-flight batch. A fresh address becoming
+unavailable still causes a normal bounded failure, never a permissive fallback.
+
+Offline resolver/cleanup tests (no external DNS):
+`python3 -I -B tests/test_retry_resolver.py`.
+The same-boot/no-start proof, consumed/retry latches, file integrity, 180-second
+freshness and pending-server-configuration checks remain hard safety gates.
