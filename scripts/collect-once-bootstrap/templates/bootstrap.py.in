@@ -40,11 +40,52 @@ def scrub_admin(uri):
  u=urllib.parse.urlsplit(uri)
  need(u.scheme in ('postgres','postgresql') and u.hostname=='127.0.0.1' and u.port==__DATABASE_PORT__ and u.path=='/__DATABASE_NAME__' and u.username and u.password and not u.query and not u.fragment,'invalid_original_db_admin_target')
  return dict(ENV,PGHOST='127.0.0.1',PGPORT='__DATABASE_PORT__',PGDATABASE='__DATABASE_NAME__',PGUSER=urllib.parse.unquote(u.username),PGPASSWORD=urllib.parse.unquote(u.password),PGCONNECT_TIMEOUT='3')
+def socket_endpoint(path,uid,gid):
+ need(path in ('/run/postgresql','/var/run/postgresql'),'unapproved_admin_socket_directory')
+ try:root=Path(path).resolve(strict=True)
+ except OSError:raise Refused('admin_socket_unavailable') from None
+ need(root==Path('/run/postgresql'),'admin_socket_directory_changed')
+ for p in (root,*root.parents):
+  st=p.lstat();need(stat.S_ISDIR(st.st_mode) and st.st_uid in (0,uid) and not st.st_mode&0o002 and (not st.st_mode&0o020 or st.st_gid in (0,gid)),'untrusted_admin_socket_directory')
+ endpoint=root/'.s.PGSQL.__DATABASE_PORT__';st=endpoint.lstat()
+ need(stat.S_ISSOCK(st.st_mode) and st.st_uid==uid,'untrusted_admin_socket')
+ return str(root)
 class Database:
- def __init__(self,uri):self.env=scrub_admin(uri)
+ def __init__(self,uri):self.env=scrub_admin(uri);self.local_identity=None;self.socket=None
+ @classmethod
+ def local_socket(cls,path):
+  need(os.geteuid()==0,'local_root_operator_required');need(sys.version_info>=(3,9),'admin_identity_switch_python_unsupported')
+  try:account=pwd.getpwnam('postgres')
+  except KeyError:raise Refused('postgres_os_account_missing') from None
+  need(account.pw_uid>0 and account.pw_gid>0,'invalid_postgres_os_identity')
+  self=cls.__new__(cls);self.local_identity=(account.pw_uid,account.pw_gid);self.socket=socket_endpoint(path,*self.local_identity)
+  for tool in ('psql','pg_dump'):trusted_tool(Path('/usr/lib/postgresql/17/bin')/tool)
+  self.env=dict(ENV,HOME='/nonexistent',PGHOST=self.socket,PGPORT='__DATABASE_PORT__',PGDATABASE='__DATABASE_NAME__',PGUSER='postgres',PGPASSFILE='/dev/null',PGCONNECT_TIMEOUT='3')
+  return self
+ def auth_binding(self):
+  if getattr(self,'local_identity',None) is None:return {'mode':'uri'}
+  return {'mode':'local-socket','socket':self.socket,'os_user':'postgres','db_user':'postgres','database':'__DATABASE_NAME__','port':'__DATABASE_PORT__'}
+ def admin_process(self,args,input=None,timeout=15,output=None):
+  identity=getattr(self,'local_identity',None)
+  if identity is None:
+   if output is None:return cmd(args,input,timeout=timeout,ok=False,env=self.env)
+   return subprocess.run(args,stdout=output,stderr=subprocess.PIPE,timeout=timeout,env=self.env)
+  socket_endpoint(self.socket,*identity)
+  need(args[0] in ('/usr/bin/psql','/usr/bin/pg_dump'),'unapproved_admin_tool')
+  actual=['/usr/lib/postgresql/17/bin/'+Path(args[0]).name]+args[1:]
+  env=dict(self.env)
+  if output is not None:env['PGOPTIONS']='-cdefault_transaction_read_only=on'
+  try:result=subprocess.run(actual,input=input,stdout=output if output is not None else subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env=env,user=identity[0],group=identity[1],extra_groups=[],cwd='/',umask=0o077)
+  except subprocess.TimeoutExpired:raise Refused('admin_operation_timeout') from None
+  except OSError:raise Refused('admin_identity_drop_or_process_failed') from None
+  need(len(result.stderr)<=1048576 and (output is not None or len(result.stdout)<=1048576),'command_output_limit')
+  return result
+ def verify_admin_identity(self):
+  if getattr(self,'local_identity',None) is not None:
+   need(self.sql("SELECT current_user='postgres' AND current_database()='__DATABASE_NAME__' AND rolsuper FROM pg_roles WHERE rolname=current_user",True)=='t','local_admin_identity_mismatch')
  def sql(self,text,readonly=False):
   if readonly:text="BEGIN READ ONLY;SET LOCAL statement_timeout='5s';SET LOCAL search_path=pg_catalog,public;"+text+';ROLLBACK;'
-  p=cmd(['/usr/bin/psql','-XwAtq','-v','ON_ERROR_STOP=1','-P','pager=off'],text.encode(),timeout=15,ok=False,env=self.env)
+  p=self.admin_process(['/usr/bin/psql','-XwAtq','-v','ON_ERROR_STOP=1','-P','pager=off'],text.encode(),timeout=15)
   need(p.returncode==0,'database_operation_failed_details_suppressed')
   return p.stdout.decode().strip()
  def audit(self):return json.loads(self.sql((BUNDLE/'catalog-audit.sql').read_text(),True))
@@ -65,6 +106,7 @@ class Database:
   need(self.sql((BUNDLE/'verify-disabled.sql').read_text(),True)=='t','database_cleanup_not_verified')
  def login_probe(self,password):
   env=dict(self.env,PGUSER=ROLE,PGPASSWORD=password)
+  if getattr(self,'local_identity',None) is not None:env=dict(ENV,PGHOST='127.0.0.1',PGPORT='__DATABASE_PORT__',PGDATABASE='__DATABASE_NAME__',PGUSER=ROLE,PGPASSWORD=password,PGPASSFILE='/dev/null',PGCONNECT_TIMEOUT='3')
   query="BEGIN READ ONLY;SET LOCAL statement_timeout='5s';SELECT current_user='aifinance_collect_once' AND current_database()='__DATABASE_NAME__' AND current_setting('transaction_read_only')='on';ROLLBACK;"
   p=cmd(['/usr/bin/psql','-XwAtq','-v','ON_ERROR_STOP=1','-P','pager=off'],query.encode(),env=env,timeout=10,ok=False)
   need(p.returncode==0 and p.stdout.strip()==b't','dedicated_role_login_probe_failed')
@@ -188,7 +230,7 @@ class Operator:
   tables=json.loads(cmd(['/usr/sbin/nft','-j','list','tables']).stdout)
   need(not any(x.get('table',{}).get('name')==TABLE for x in tables['nftables']),'firewall_table_collision')
   cmd(['/usr/sbin/nft','--check','--file','-'],('create table inet '+TABLE+' { comment \"preflight-only\"; }\n').encode())
-  artifact_members(self.artifact,self.digest);audit_pass(self.db.audit())
+  artifact_members(self.artifact,self.digest);self.db.verify_admin_identity();audit_pass(self.db.audit())
   self.resolved_at=time.monotonic()
   manifest=json.loads((BUNDLE/'approval-manifest.json').read_text());self.feeds=manifest['feeds'];self.hosts={}
   for row in self.feeds:
@@ -234,7 +276,7 @@ class Operator:
     if not q.is_symlink():q.chmod(0o555 if q.stat().st_mode&0o111 else 0o444)
    Path(base).chmod(0o555)
  def prepare(self):
-  self.mkdir(STATE);self.state={'nonce':uuid.uuid4().hex,'artifact_sha256':self.digest,'network_owned':False,'role_attempted':False,'files':[],'phase':'prepared'};self.save()
+  self.mkdir(STATE);self.state={'nonce':uuid.uuid4().hex,'artifact_sha256':self.digest,'network_owned':False,'role_attempted':False,'files':[],'phase':'prepared','admin_auth':self.db.auth_binding()};self.save()
   self.mkdir(ROOT,0o755);self.mkdir(CONF,0o750)
   cmd(['/usr/sbin/useradd','--system','--user-group','--home-dir','/nonexistent','--shell','/sbin/nologin',USER]);u=pwd.getpwnam(USER)
   need(u.pw_uid not in (0,__APPLICATION_UID__,pwd.getpwnam('__DEPLOY_USER__').pw_uid),'unsafe_collector_uid');self.state['uid']=u.pw_uid;self.state['gid']=u.pw_gid;self.save();os.chown(CONF,0,u.pw_gid)
@@ -277,9 +319,10 @@ class Operator:
   evidence=self.kernel_evidence(PROBE);cmd(['/usr/bin/systemctl','stop',PROBE]);need(self.property(PROBE,'MainPID')=='0','probe_not_stopped');emit('resource_probe_passed',**evidence)
  def backup(self):
   size=int(self.db.sql('SELECT pg_database_size(current_database())',True));need(shutil.disk_usage(STATE).free>=size*2+268435456,'insufficient_backup_space')
-  path=STATE/'before.dump';fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  path=STATE/'before.dump';trusted(STATE);fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
   with os.fdopen(fd,'wb') as out:
-   p=subprocess.run(['/usr/bin/pg_dump','-Fc'],stdout=out,stderr=subprocess.PIPE,timeout=120,env=self.db.env);out.flush();os.fsync(out.fileno())
+   os.fchown(out.fileno(),0,0);os.fchmod(out.fileno(),0o600)
+   p=self.db.admin_process(['/usr/bin/pg_dump','-w','-Fc'],timeout=120,output=out);out.flush();os.fsync(out.fileno())
   need(p.returncode==0,'backup_failed');cmd(['/usr/bin/pg_restore','--list',str(path)],timeout=15)
   h=hashlib.sha256()
   with path.open('rb') as f:
@@ -393,12 +436,13 @@ class Operator:
   finally:self.cleanup()
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('mode',choices=['check','run','cleanup']);p.add_argument('--artifact',type=Path);p.add_argument('--sha256');p.add_argument('--approve-three-source-smoke',action='store_true');p.add_argument('--exclusive-writer-window',action='store_true');a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('mode',choices=['check','run','cleanup']);p.add_argument('--artifact',type=Path);p.add_argument('--sha256');p.add_argument('--approve-three-source-smoke',action='store_true');p.add_argument('--exclusive-writer-window',action='store_true');p.add_argument('--admin-auth',choices=['uri','local-socket'],default='uri');p.add_argument('--admin-socket');a=p.parse_args()
  need(os.geteuid()==0 and sys.stdin.isatty(),'local_root_tty_required')
  if a.mode=='run':need(a.approve_three_source_smoke and a.exclusive_writer_window,'explicit_scope_and_writer_window_required')
- db=Database(getpass.getpass('Original DB administrator URI (hidden; never stored): '));op=Operator(db,a.artifact,a.sha256)
+ need((a.admin_auth=='local-socket' and a.admin_socket is not None) or (a.admin_auth=='uri' and a.admin_socket is None),'explicit_admin_auth_binding_required')
+ db=Database.local_socket(a.admin_socket) if a.admin_auth=='local-socket' else Database(getpass.getpass('Original DB administrator URI (hidden; never stored): '));op=Operator(db,a.artifact,a.sha256)
  if a.mode=='cleanup':
-  trusted(STATE/'state.json');op.state=json.loads((STATE/'state.json').read_text());op.cleanup()
+  trusted(STATE/'state.json');op.state=json.loads((STATE/'state.json').read_text());need(op.state.get('admin_auth',{'mode':'uri'})==db.auth_binding(),'cleanup_admin_auth_mismatch');db.verify_admin_identity();op.cleanup()
  else:
   need(a.artifact is not None and a.sha256 is not None,'reviewed_complete_runtime_artifact_required')
   if a.mode=='check':op.preflight()
