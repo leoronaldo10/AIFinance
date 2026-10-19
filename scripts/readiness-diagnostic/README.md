@@ -11,7 +11,7 @@ The fixed installer takes a 40-character commit and the SHA256 of
 `DIAGNOSTIC.SHA256`. Use the separately pinned installer hash before execution.
 It downloads only four scripts and their manifest from that exact commit,
 rechecks the staged root-owned bytes and installs atomically under
-`/root/aifinance-readiness-diagnostic-v1`. Existing matching installations are
+`/root/aifinance-readiness-diagnostic-v2`. Existing matching installations are
 reused; changed files or path collisions fail closed. No runtime is repacked,
 no dependency is installed, and no existing download folder is reused.
 
@@ -70,7 +70,7 @@ systemd lifecycle/ownership/failure fixtures. The development container has
 non-systemd PID 1 and UID 1000; these tests do not establish real root/systemd
 sandbox integration. That evidence must come from this diagnostic on ECS.
 
-## Property-reader repair (installer transition pending)
+## Property-reader repair and independent v2 session
 
 A real systemctl 257 client against a synthetic local D-Bus service reproduces
 empty ExecStartPre and EnvironmentFiles arrays disappearing from show output,
@@ -96,18 +96,18 @@ unknown or absent scalar fields still fail. Existing PID/invocation/exit checks
 are unchanged. A unit that gets unloaded before exit evidence is observed still
 fails closed rather than fabricating successful completion.
 
-This does not change any unit text, isolation policy, session marker, installer,
-collector or retry record. The consumed diagnostic v1 session is not reset. A
-new server session requires a separately reviewed and approved installation and
-session plan; this patch is not a command to rerun the old installer.
+The v2 installer and diagnostic use only `/root/aifinance-readiness-diagnostic-v2`,
+`/run/aifinance-readiness-v2`, and `aifinance-readiness-v2*.service` resources.
+The old v1 directory, reports, events and session marker are never overwritten,
+renamed or removed. The v2 marker permits one new session only; reconnecting or
+repeating the same command retrieves v2 results rather than repeating its tests.
+The isolation policy, two inert commands, collector tools and retry records are
+unchanged. There is no reset command or collection/recovery entry point.
 
 Before any child setup, busctl is checked for existence, trusted ownership/path
 and executable regular-file status. Missing, untrusted, nonexecutable, execution
 denied, timeout and D-Bus query failures have distinct sanitized reason codes.
-
-Rollout constraint: the published installer fixes DEST and its later checksum
-working directory to /root/aifinance-readiness-diagnostic-v1. On a host with the
-old v1 bundle, a new manifest fails verification before new code runs. Keeping
-the old manifest retrieves the old final report. A second isolated session needs
-a separately approved installer change (a fifth changed file), plus consistent
-new diagnostic directory/unit/input names. No such change is included here.
+The fixed v2 installer verifies its own v2 manifest and uses a separate root-owned
+staging directory before atomic installation. A matching existing v2 installation
+is reused; changed bytes fail before launch. The old v1 result is never used to
+satisfy v2 status. Download/install failures do not launch diagnostic processes.

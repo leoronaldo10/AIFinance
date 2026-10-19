@@ -2,8 +2,8 @@
 """One detached, diagnosis-only session. No collector, database or recovery action."""
 import argparse,hashlib,json,os,pwd,re,runpy,signal,stat,subprocess,sys,time
 from pathlib import Path
-ROOT=Path('/root/aifinance-readiness-diagnostic-v1');INPUT=Path('/run/aifinance-readiness-v1');UNITS=Path('/run/systemd/system')
-CONTROLLER='aifinance-readiness-v1.service';SLEEP='aifinance-readiness-v1-sleep-probe.service';PYTHON='aifinance-readiness-v1-python.service';CHILDREN=(SLEEP,PYTHON)
+ROOT=Path('/root/aifinance-readiness-diagnostic-v2');INPUT=Path('/run/aifinance-readiness-v2');UNITS=Path('/run/systemd/system')
+CONTROLLER='aifinance-readiness-v2.service';SLEEP='aifinance-readiness-v2-sleep-probe.service';PYTHON='aifinance-readiness-v2-python.service';CHILDREN=(SLEEP,PYTHON)
 SOURCE=Path('/etc/aifinance-collect-once');OLD=Path('/var/lib/aifinance-collect-once')
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C','HOME':'/root','SYSTEMD_PAGER':'cat','SYSTEMD_COLORS':'0'}
 class Refused(Exception):

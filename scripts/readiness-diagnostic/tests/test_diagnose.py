@@ -1,5 +1,5 @@
 """Offline ownership, lifecycle and failure tests. No real systemd assertion."""
-import hashlib,json,pathlib,runpy,subprocess,tempfile,types,unittest
+import hashlib,json,pathlib,runpy,subprocess,tempfile,types,unittest,os,sys
 from unittest.mock import patch,Mock
 R=pathlib.Path(__file__).resolve().parents[1]
 M=runpy.run_path(str(R/'diagnose.py'));G=M['cleanup'].__globals__
@@ -130,7 +130,7 @@ class Lifecycle(unittest.TestCase):
   for key,sig in [('ExecStartPre','a(sasbttttuii)'),('EnvironmentFiles','a(sb)')]:
    with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=(sig+' 0\n').encode(),stderr=b'')) as command:
     self.assertTrue(M['typed_empty'](M['SLEEP'],key)['empty'])
-    args=command.call_args.args[0];self.assertIn('--system',args);self.assertEqual(args[-1],key);self.assertIn('aifinance_2dreadiness_2dv1_2dsleep_2dprobe_2eservice',args[-3])
+    args=command.call_args.args[0];self.assertIn('--system',args);self.assertEqual(args[-1],key);self.assertIn('aifinance_2dreadiness_2dv2_2dsleep_2dprobe_2eservice',args[-3])
    for data in (b'',b'as 0',b'a(sb) 1 SECRET',b'a(sasbttttuii) 1 SECRET'):
     if data==(sig+' 0').encode():continue
     with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=data,stderr=b'')):
@@ -162,4 +162,50 @@ class Lifecycle(unittest.TestCase):
   with patch.dict(G,props=lambda *a:{'MainPID':str(M['os'].getpid()),'InvocationID':invocation},claim_session=lambda:None,busctl_preflight=Mock(side_effect=M['Refused']('busctl_missing')),prepare_children=prepare,cleanup=clean),patch.dict(M['os'].environ,INVOCATION_ID=invocation),patch.object(M['signal'],'signal'),patch.object(M['runpy'],'run_path',return_value={}):
    self.assertFalse(M['run'](self.sha))
   prepare.assert_not_called();clean.assert_called_once_with(self.sha,final=False);self.assertEqual(M['read_report']()['reason'],'busctl_missing')
+class InstallerFlow(unittest.TestCase):
+ """Execute the real Bash installer with local downloads and privilege/launch stubs."""
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.base=pathlib.Path(self.tmp.name)
+  self.home=self.base/'home';self.root=self.base/'root';self.bin=self.base/'bin'
+  for p in (self.home,self.root,self.bin):p.mkdir()
+  self.v1=self.root/'aifinance-readiness-diagnostic-v1';self.v1.mkdir();(self.v1/'report.json').write_text('old report');(self.v1/'validation.started').write_text('old marker')
+  self.before={p.name:p.read_bytes() for p in self.v1.iterdir()}
+  self.installer=self.base/'installer.sh';self.installer.write_text((R/'diagnose-install.sh').read_text().replace('/root/',str(self.root)+'/'))
+  shim=self.bin/'shim';shim.write_text('#!'+sys.executable+'\n'+'''import os,sys,pathlib,shutil,urllib.parse,json
+name=pathlib.Path(sys.argv[0]).name;a=sys.argv[1:]
+if name=='id':print('ecs-user');sys.exit(0)
+if name=='hostname':print('iZ2zedybs3fftu1d9vnx39Z');sys.exit(0)
+if name=='curl':
+ if os.environ.get('FIXTURE_DOWNLOAD_FAIL'):sys.exit(22)
+ url=next(x for x in a if x.startswith('https://'));file=urllib.parse.urlsplit(url).path.rsplit('/',1)[1];shutil.copyfile(pathlib.Path(os.environ['FIXTURE_SOURCE'])/file,a[a.index('-o')+1]);sys.exit(0)
+assert name=='sudo'
+if a==['-v']:sys.exit(0)
+if a[0]=='install':
+ for flag in ('-o','-g'):
+  i=a.index(flag);del a[i:i+2]
+if len(a)>3 and a[0]=='/usr/bin/python3' and a[3].endswith('/diagnose.py'):
+ p=pathlib.Path(a[3]).parent;mode=a[4]
+ assert p.name=='aifinance-readiness-diagnostic-v2'
+ if mode=='launch':
+  marker=p/'fixture.started'
+  if not marker.exists():marker.write_text('one session')
+ elif mode=='status':print(json.dumps({'final':True,'passed':True,'cleanup_complete':True}))
+ else:raise AssertionError('unexpected mode')
+ sys.exit(0)
+os.execvp(a[0],a)
+''');shim.chmod(0o755)
+  for n in ('id','hostname','curl','sudo'):(self.bin/n).symlink_to(shim)
+  self.env=dict(os.environ,PATH=str(self.bin)+':/usr/bin:/bin',HOME=str(self.home),FIXTURE_SOURCE=str(R));self.sha=hashlib.sha256((R/'DIAGNOSTIC.SHA256').read_bytes()).hexdigest()
+ def invoke(self):return subprocess.run(['/bin/bash',str(self.installer),'f'*40,self.sha],env=self.env,capture_output=True,text=True,timeout=15)
+ def assert_old(self):self.assertEqual({p.name:p.read_bytes() for p in self.v1.iterdir()},self.before)
+ def test_new_v2_install_and_repeat_preserve_v1(self):
+  first=self.invoke();self.assertEqual(first.returncode,0,first.stderr);self.assertIn('DIAGNOSTIC_EXIT=0',first.stdout)
+  v2=self.root/'aifinance-readiness-diagnostic-v2';marker=(v2/'fixture.started').stat()
+  self.env['FIXTURE_DOWNLOAD_FAIL']='1';second=self.invoke();self.assertEqual(second.returncode,0,second.stderr);self.assertEqual((v2/'fixture.started').stat().st_mtime_ns,marker.st_mtime_ns);self.assert_old()
+  self.assertFalse(list(self.home.iterdir()));self.assertEqual(sorted(p.name for p in self.root.iterdir()),[self.v1.name,v2.name])
+ def test_corrupted_existing_v2_stops_before_launch(self):
+  self.assertEqual(self.invoke().returncode,0);v2=self.root/'aifinance-readiness-diagnostic-v2';(v2/'diagnose.py').write_text('changed');(v2/'fixture.started').unlink()
+  self.assertNotEqual(self.invoke().returncode,0);self.assertFalse((v2/'fixture.started').exists());self.assert_old()
+ def test_download_failure_does_not_install_or_launch(self):
+  self.env['FIXTURE_DOWNLOAD_FAIL']='1';self.assertNotEqual(self.invoke().returncode,0);self.assertFalse((self.root/'aifinance-readiness-diagnostic-v2').exists());self.assertFalse(list(self.home.iterdir()));self.assert_old()
 if __name__=='__main__':unittest.main(verbosity=2)
