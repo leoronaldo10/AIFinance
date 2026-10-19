@@ -69,3 +69,45 @@ Tests include real local Linux pidfd/exec/exit and proc parsing, and mocked
 systemd lifecycle/ownership/failure fixtures. The development container has
 non-systemd PID 1 and UID 1000; these tests do not establish real root/systemd
 sandbox integration. That evidence must come from this diagnostic on ECS.
+
+## Property-reader repair (installer transition pending)
+
+A real systemctl 257 client against a synthetic local D-Bus service reproduces
+empty ExecStartPre and EnvironmentFiles arrays disappearing from show output,
+even with --all. The original profile parser consequently rejected a valid
+empty-array profile before either child was started. Upstream v239 and v257
+source both have element-only printers for these structured arrays. The ECS
+report did not retain missing names, so its exact missing set cannot be recovered.
+
+The repair reads the other 14 profile properties with explicit --all, and
+reads these two arrays with existing /usr/bin/busctl get-property on the system
+bus. It requires the exact D-Bus signatures a(sasbttttuii) / a(sb) and an explicit
+zero count. Missing properties, unknown types, nonempty arrays and bus failures
+are never interpreted as empty. No software is installed. The existing busctl
+executable and working system D-Bus are additional prerequisites, not assumed
+to have been validated on ECS. Only names, type, empty/nonempty result and return
+codes are retained; command contents, environment-file paths and raw stderr are
+not reported. Scalar property errors now retain the exact missing-name list.
+
+All property callers share this reader: controller identity, profile, process
+readiness/exit, cleanup and reconnect. Empty InvocationID and ControlGroup remain
+valid serialized strings only where the lifecycle checks already allow them;
+unknown or absent scalar fields still fail. Existing PID/invocation/exit checks
+are unchanged. A unit that gets unloaded before exit evidence is observed still
+fails closed rather than fabricating successful completion.
+
+This does not change any unit text, isolation policy, session marker, installer,
+collector or retry record. The consumed diagnostic v1 session is not reset. A
+new server session requires a separately reviewed and approved installation and
+session plan; this patch is not a command to rerun the old installer.
+
+Before any child setup, busctl is checked for existence, trusted ownership/path
+and executable regular-file status. Missing, untrusted, nonexecutable, execution
+denied, timeout and D-Bus query failures have distinct sanitized reason codes.
+
+Rollout constraint: the published installer fixes DEST and its later checksum
+working directory to /root/aifinance-readiness-diagnostic-v1. On a host with the
+old v1 bundle, a new manifest fails verification before new code runs. Keeping
+the old manifest retrieves the old final report. A second isolated session needs
+a separately approved installer change (a fifth changed file), plus consistent
+new diagnostic directory/unit/input names. No such change is included here.

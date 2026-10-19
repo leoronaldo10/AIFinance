@@ -1,6 +1,6 @@
 """Offline ownership, lifecycle and failure tests. No real systemd assertion."""
 import hashlib,json,pathlib,runpy,subprocess,tempfile,types,unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 R=pathlib.Path(__file__).resolve().parents[1]
 M=runpy.run_path(str(R/'diagnose.py'));G=M['cleanup'].__globals__
 class Lifecycle(unittest.TestCase):
@@ -110,4 +110,56 @@ class Lifecycle(unittest.TestCase):
   (self.root/'validation.started').write_text('claimed');M['save_report']({'final':False})
   with patch.object(M['os'],'uname',return_value=types.SimpleNamespace(nodename='iZ2zedybs3fftu1d9vnx39Z')),patch.dict(G,props=lambda u,k:{'ActiveState':'activating','LoadState':'loaded'}):M['launch'](self.sha)
   self.assertEqual(self.calls,[]);self.assertFalse(M['read_report']()['final'])
+ def test_show_explicitly_requests_all_and_retains_empty_scalar(self):
+  seen=[]
+  def command(args,**kw):seen.append(args);return types.SimpleNamespace(returncode=0,stdout=b'DropInPaths=\n')
+  with patch.dict(G,systemctl=command):self.assertEqual(M['props'](M['SLEEP'],('DropInPaths',)),{'DropInPaths':''})
+  self.assertEqual(seen,[['show',M['SLEEP'],'--all','--property=DropInPaths']])
+ def test_missing_scalar_reports_exact_name_never_assumes_empty(self):
+  with patch.dict(G,systemctl=lambda *a,**kw:types.SimpleNamespace(returncode=0,stdout=b'User=fixture\n')):
+   with self.assertRaises(M['Refused']) as caught:M['props'](M['SLEEP'],('User','DropInPaths'))
+  self.assertEqual(caught.exception.evidence['missing'],['DropInPaths']);self.assertEqual(caught.exception.evidence['returncode'],0)
+ def test_query_error_is_not_misclassified_missing_properties(self):
+  with patch.dict(G,systemctl=lambda *a,**kw:types.SimpleNamespace(returncode=1,stdout=b'')):
+   with self.assertRaisesRegex(M['Refused'],'diagnostic_systemctl_failed'):M['props'](M['SLEEP'],('User',))
+ def test_duplicate_or_unrequested_property_rejected(self):
+  for data in (b'User=a\nUser=a\n',b'User=a\nEnvironment=SECRET\n'):
+   with patch.dict(G,systemctl=lambda *a,**kw:types.SimpleNamespace(returncode=0,stdout=data)):
+    with self.assertRaisesRegex(M['Refused'],'invalid_unit_properties'):M['props'](M['SLEEP'],('User',))
+ def test_typed_arrays_require_exact_types_and_zero_count(self):
+  for key,sig in [('ExecStartPre','a(sasbttttuii)'),('EnvironmentFiles','a(sb)')]:
+   with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=(sig+' 0\n').encode(),stderr=b'')) as command:
+    self.assertTrue(M['typed_empty'](M['SLEEP'],key)['empty'])
+    args=command.call_args.args[0];self.assertIn('--system',args);self.assertEqual(args[-1],key);self.assertIn('aifinance_2dreadiness_2dv1_2dsleep_2dprobe_2eservice',args[-3])
+   for data in (b'',b'as 0',b'a(sb) 1 SECRET',b'a(sasbttttuii) 1 SECRET'):
+    if data==(sig+' 0').encode():continue
+    with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=data,stderr=b'')):
+     with self.assertRaisesRegex(M['Refused'],'typed_property_not_verified_empty') as caught:M['typed_empty'](M['SLEEP'],key)
+    self.assertNotIn('SECRET',json.dumps(caught.exception.evidence))
+ def test_typed_unknown_property_or_bus_failure_fails_closed(self):
+  with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=1,stdout=b'',stderr=b'SECRET')):
+   with self.assertRaisesRegex(M['Refused'],'typed_property_query_failed'):M['typed_empty'](M['SLEEP'],'ExecStartPre')
+ def test_typed_timeout_is_safe_failure(self):
+  with patch.object(M['subprocess'],'run',side_effect=subprocess.TimeoutExpired('SECRET',4)):
+   with self.assertRaisesRegex(M['Refused'],'typed_property_query_timeout'):M['typed_empty'](M['SLEEP'],'ExecStartPre')
+ def test_profile_failure_is_recorded_before_start(self):
+  a=M['Adapter'](types.SimpleNamespace(pw_uid=995,pw_gid=996),{})
+  with patch.dict(G,props=lambda *a,**kw:(_ for _ in ()).throw(M['Refused']('missing_unit_properties',{'missing':['User'],'returncode':0}))):
+   with self.assertRaisesRegex(M['Refused'],'missing_unit_properties'):a.test(M['SLEEP'],{})
+  self.assertEqual(a.last['unit_query']['missing'],['User']);self.assertEqual(self.calls,[])
+ def test_query_evidence_survives_readiness_failure_record(self):
+  a=self.adapter();a.query_failure={'missing':['InvocationID'],'returncode':0};a.process_diagnostic('process_readiness_failed',{'role':'resource_probe','reason':'missing_unit_properties'})
+  self.assertEqual(a.last['unit_query']['missing'],['InvocationID'])
+ def test_busctl_preflight_distinguishes_missing_untrusted_and_permissions(self):
+  with patch.object(pathlib.Path,'lstat',side_effect=FileNotFoundError()):
+   with self.assertRaisesRegex(M['Refused'],'busctl_missing'):M['busctl_preflight']()
+  with patch.dict(G,trusted=lambda p:(_ for _ in ()).throw(M['Refused']('untrusted_diagnostic_path'))):
+   with self.assertRaisesRegex(M['Refused'],'busctl_untrusted_path'):M['busctl_preflight']()
+  with patch.object(M['os'],'access',return_value=False):
+   with self.assertRaisesRegex(M['Refused'],'busctl_not_executable'):M['busctl_preflight']()
+ def test_busctl_preflight_precedes_child_setup(self):
+  prepare=Mock();clean=Mock();invocation='a'*32
+  with patch.dict(G,props=lambda *a:{'MainPID':str(M['os'].getpid()),'InvocationID':invocation},claim_session=lambda:None,busctl_preflight=Mock(side_effect=M['Refused']('busctl_missing')),prepare_children=prepare,cleanup=clean),patch.dict(M['os'].environ,INVOCATION_ID=invocation),patch.object(M['signal'],'signal'),patch.object(M['runpy'],'run_path',return_value={}):
+   self.assertFalse(M['run'](self.sha))
+  prepare.assert_not_called();clean.assert_called_once_with(self.sha,final=False);self.assertEqual(M['read_report']()['reason'],'busctl_missing')
 if __name__=='__main__':unittest.main(verbosity=2)

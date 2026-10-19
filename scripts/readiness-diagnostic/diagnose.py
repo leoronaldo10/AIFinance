@@ -6,7 +6,8 @@ ROOT=Path('/root/aifinance-readiness-diagnostic-v1');INPUT=Path('/run/aifinance-
 CONTROLLER='aifinance-readiness-v1.service';SLEEP='aifinance-readiness-v1-sleep-probe.service';PYTHON='aifinance-readiness-v1-python.service';CHILDREN=(SLEEP,PYTHON)
 SOURCE=Path('/etc/aifinance-collect-once');OLD=Path('/var/lib/aifinance-collect-once')
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C','HOME':'/root','SYSTEMD_PAGER':'cat','SYSTEMD_COLORS':'0'}
-class Refused(Exception):pass
+class Refused(Exception):
+ def __init__(self,reason,evidence=None):super().__init__(reason);self.evidence=evidence or {}
 def need(v,reason):
  if not v:raise Refused(reason)
 def reason(e):return str(e) if type(e).__name__=='Refused' and re.fullmatch('[a-z_]{1,100}',str(e)) else 'diagnostic_operation_failed'
@@ -31,18 +32,58 @@ def read_report():
 def systemctl(args,timeout=5,ok=True):
  need(args and args[0] in ('show','start','stop','daemon-reload','--version'),'unapproved_diagnostic_command')
  if args[0] in ('start','stop'):need(all(a in (CONTROLLER,*CHILDREN,'--no-block') for a in args[1:]),'unapproved_diagnostic_unit')
- if args[0]=='show':need(len(args)>1 and args[1] in (CONTROLLER,*CHILDREN) and all(a.startswith('--property=') for a in args[2:]),'unapproved_diagnostic_unit')
+ if args[0]=='show':need(len(args)>1 and args[1] in (CONTROLLER,*CHILDREN) and all(a=='--all' or a.startswith('--property=') for a in args[2:]),'unapproved_diagnostic_unit')
  p=subprocess.run(['/usr/bin/systemctl','--no-pager',*args],capture_output=True,env=ENV,timeout=timeout)
  need(len(p.stdout)<=131072 and len(p.stderr)<=131072,'diagnostic_output_limit')
  if ok:need(p.returncode==0,'diagnostic_systemctl_failed')
  return p
 
 def props(unit,keys,timeout=5):
- p=systemctl(['show',unit]+['--property='+k for k in keys],timeout=timeout,ok=False);values={}
+ evidence={'requested':list(keys),'missing':[],'reader':'systemctl_show'}
+ try:p=systemctl(['show',unit,'--all']+['--property='+k for k in keys],timeout=timeout,ok=False)
+ except subprocess.TimeoutExpired:raise Refused('unit_evidence_query_timeout',evidence) from None
+ except OSError:raise Refused('unit_evidence_reader_unavailable',evidence) from None
+ evidence['returncode']=p.returncode;values={}
  for line in p.stdout.decode().splitlines():
   if '=' in line:
-   k,v=line.split('=',1);need(k in keys and k not in values,'invalid_unit_properties');values[k]=v
- need(set(values)==set(keys),'missing_unit_properties');need(p.returncode==0 or values.get('LoadState')=='not-found','diagnostic_systemctl_failed');return values
+   k,v=line.split('=',1)
+   if k not in keys or k in values:raise Refused('invalid_unit_properties',evidence)
+   values[k]=v
+ evidence['missing']=sorted(set(keys)-set(values))
+ if p.returncode!=0 and values.get('LoadState')!='not-found':raise Refused('diagnostic_systemctl_failed',evidence)
+ if evidence['missing']:raise Refused('missing_unit_properties',evidence)
+ return values
+
+def busctl_preflight():
+ p=Path('/usr/bin/busctl')
+ try:st=p.lstat()
+ except FileNotFoundError:raise Refused('busctl_missing') from None
+ except OSError:raise Refused('busctl_metadata_unavailable') from None
+ try:trusted(p)
+ except Exception:raise Refused('busctl_untrusted_path') from None
+ need(stat.S_ISREG(st.st_mode) and os.access(p,os.X_OK),'busctl_not_executable')
+
+def typed_empty(unit,key):
+ # systemctl suppresses empty structure arrays even with --all. Never infer empty
+ # from missing text: require the real D-Bus type and explicit zero element count.
+ signatures={'ExecStartPre':'a(sasbttttuii)','EnvironmentFiles':'a(sb)'}
+ need(unit in CHILDREN and key in signatures,'unapproved_diagnostic_property')
+ path='/org/freedesktop/systemd1/unit/'+''.join(c if c.isascii() and c.isalnum() else '_'+format(ord(c),'02x') for c in unit)
+ evidence={'requested':[key],'reader':'busctl_typed','signature':signatures[key],'empty':False}
+ try:
+  busctl_preflight()
+  p=subprocess.run(['/usr/bin/busctl','--system','--no-pager','--timeout=3','get-property','org.freedesktop.systemd1',path,'org.freedesktop.systemd1.Service',key],capture_output=True,env=ENV,timeout=4)
+ except Refused as e:raise Refused(str(e),evidence) from None
+ except subprocess.TimeoutExpired:raise Refused('typed_property_query_timeout',evidence) from None
+ except PermissionError:raise Refused('busctl_execution_denied',evidence) from None
+ except FileNotFoundError:raise Refused('busctl_missing',evidence) from None
+ except OSError:raise Refused('busctl_execution_failed',evidence) from None
+ evidence['returncode']=p.returncode
+ if p.returncode!=0:raise Refused('typed_property_query_failed',evidence)
+ if len(p.stdout)>131072 or len(p.stderr)>131072:raise Refused('diagnostic_output_limit',evidence)
+ # No command arguments, environment-file paths or arbitrary output are logged.
+ if p.stdout.strip()!=(signatures[key]+' 0').encode():raise Refused('typed_property_not_verified_empty',evidence)
+ evidence['empty']=True;return evidence
 
 def controller_text(manifest):
  return f'''[Unit]
@@ -157,18 +198,31 @@ def prepare_children():
  systemctl(['daemon-reload']);return account
 
 class Adapter:
- def __init__(self,account,core):self.state={'uid':account.pw_uid,'gid':account.pw_gid};self.core=core;self.last={}
- def properties(self,unit,keys,timeout=2):need(unit in CHILDREN,'unapproved_diagnostic_unit');return props(unit,keys,timeout)
+ def __init__(self,account,core):self.state={'uid':account.pw_uid,'gid':account.pw_gid};self.core=core;self.last={};self.query_failure={}
+ def properties(self,unit,keys,timeout=2):
+  need(unit in CHILDREN,'unapproved_diagnostic_unit')
+  try:return props(unit,keys,timeout)
+  except Refused as e:
+   self.query_failure=e.evidence;self.last.update(stage='unit_property_query_failed',reason=reason(e),unit_query=e.evidence);raise
  def process_diagnostic(self,stage,values):
   allowed={'role','expected_uid','expected_gid','pid','start_ticks','uids','gids','no_new_privileges','capabilities_zero','checks','resolver_bindings_readonly','cgroup_verified','exec_matches','reason','cgroup','resolver_checks'}
-  need(set(values)<=allowed,'diagnostic_fields_invalid');record=dict(values,stage=stage);record['role']='sleep_diagnostic' if values.get('role')=='resource_probe' else 'python_diagnostic';self.last=record
+  need(set(values)<=allowed,'diagnostic_fields_invalid');record=dict(values,stage=stage);record['role']='sleep_diagnostic' if values.get('role')=='resource_probe' else 'python_diagnostic'
+  if self.query_failure:record['unit_query']=self.query_failure
+  self.last=record
   fd=os.open(ROOT/'events.jsonl',os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
   with os.fdopen(fd,'w') as out:out.write(json.dumps(record,sort_keys=True)+'\n');out.flush();os.fsync(out.fileno())
  def verify_profile(self,unit):
-  expected={'User':'aifinance-collect-once','Group':'aifinance-collect-once','Type':'oneshot','NoNewPrivileges':'yes','PrivateNetwork':'yes','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','CapabilityBoundingSet':'','AmbientCapabilities':'','Restart':'no','KillMode':'control-group','ProtectSystem':'strict','DropInPaths':'','ExecStartPre':'','EnvironmentFiles':''}
-  need(props(unit,tuple(expected))==expected,'diagnostic_unit_profile_mismatch')
+  expected={'User':'aifinance-collect-once','Group':'aifinance-collect-once','Type':'oneshot','NoNewPrivileges':'yes','PrivateNetwork':'yes','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','CapabilityBoundingSet':'','AmbientCapabilities':'','Restart':'no','KillMode':'control-group','ProtectSystem':'strict','DropInPaths':''}
+  actual=self.properties(unit,tuple(expected))
+  mismatched=[k for k in expected if actual[k]!=expected[k]]
+  if mismatched:
+   self.last.update(stage='unit_profile_failed',reason='diagnostic_unit_profile_mismatch',mismatched=mismatched);raise Refused('diagnostic_unit_profile_mismatch')
+  for key in ('ExecStartPre','EnvironmentFiles'):
+   try:typed_empty(unit,key)
+   except Refused as e:
+    self.last.update(stage='unit_profile_failed',reason=reason(e),unit_query=e.evidence);raise
  def test(self,unit,readiness):
-  self.verify_profile(unit);self.last={};expected=Path('/usr/bin/sleep' if unit==SLEEP else '/usr/bin/python3');self.core['trusted_tool'](expected)
+  self.last={};self.query_failure={};self.verify_profile(unit);expected=Path('/usr/bin/sleep' if unit==SLEEP else '/usr/bin/python3');self.core['trusted_tool'](expected)
   sample=None
   try:
    systemctl(['start','--no-block',unit]);sample=readiness['wait_for_process'](self,unit,expected,INPUT,self.core['require_cgroup_v2'],self.core['verify_cgroup_v2'],timeout=5)
@@ -179,7 +233,7 @@ class Adapter:
     if state['MainPID']=='0' and state['ActiveState'] in ('inactive','failed'):break
     time.sleep(.025)
    else:raise Refused('diagnostic_natural_exit_timeout')
-   need(props(unit,('Result','ExecMainStatus','ExecMainCode'))=={'Result':'success','ExecMainStatus':'0','ExecMainCode':'1'},'diagnostic_natural_exit_failed')
+   need(self.properties(unit,('Result','ExecMainStatus','ExecMainCode'))=={'Result':'success','ExecMainStatus':'0','ExecMainCode':'1'},'diagnostic_natural_exit_failed')
    return {'name':'sleep' if unit==SLEEP else 'python','readiness':True,'natural_exit':True,'network_isolated':True,'uid':self.state['uid'],'gid':self.state['gid'],'no_new_privileges':1,'capabilities_zero':True,'readonly_mounts':True,**sample.evidence}
   finally:
    try:systemctl(['stop',unit]);need(props(unit,('MainPID',))['MainPID']=='0','diagnostic_child_not_stopped')
@@ -230,7 +284,7 @@ def run(manifest):
  adapter=None
  try:
   core=runpy.run_path(str(ROOT/'diagnostic_core.py'));readiness=runpy.run_path(str(ROOT/'process_readiness.py'))
-  account=prepare_children();adapter=Adapter(account,core)
+  busctl_preflight();account=prepare_children();adapter=Adapter(account,core)
   for unit in CHILDREN:
    try:result=adapter.test(unit,readiness)
    except Exception as e:
@@ -259,7 +313,10 @@ def main():
   try:return 0 if run(a.manifest_sha) else 1
   except Exception as e:
    report=read_report()
-   if not report.get('final'):report.update(reason=reason(e),tests_passed=False);save_report(report)
+   if not report.get('final'):
+    report.update(reason=reason(e),tests_passed=False)
+    if isinstance(e,Refused) and e.evidence:report['unit_query']=e.evidence
+    save_report(report)
    raise
  if a.mode=='cleanup':return 0 if cleanup(a.manifest_sha) else 1
  return status(a.quiet_pending)
