@@ -91,12 +91,40 @@ class Lifecycle(unittest.TestCase):
  def test_both_children_wait_for_natural_exit_and_close_sample(self):
   calls=[];closed=[]
   def waiter(*args,**kw):
-   calls.append((args[1],str(args[2])));return types.SimpleNamespace(pid=123,evidence={'memory_bytes':268435456},observe_running=lambda s:None,close=lambda:closed.append(True))
+   calls.append((args[1],str(args[2])));return types.SimpleNamespace(pid=123,evidence={'memory_bytes':268435456},observe_running=lambda s:None,verify_exit=lambda s:None,diagnostic={'unit_transition':{}},close=lambda:closed.append(True))
   def props(u,keys,timeout=5,**kw):
-   values={'MainPID':'0','ActiveState':'inactive','Result':'success','ExecMainStatus':'0','ExecMainCode':'1'};return {k:values[k] for k in keys}
+   values={'MainPID':'0','ActiveState':'active','SubState':'exited','Result':'success','ExecMainStatus':'0','ExecMainCode':'1'};return {k:values[k] for k in keys}
   with patch.dict(G,props=props),patch.object(M['os'],'stat',side_effect=lambda p:types.SimpleNamespace(st_ino=1 if p=='/proc/1/ns/net' else 2)):
-   for u in M['CHILDREN']:self.assertTrue(self.adapter().test(u,{'wait_for_process':waiter,'FIELDS':('MainPID','ActiveState')})['natural_exit'])
+   for u in M['CHILDREN']:self.assertTrue(self.adapter().test(u,{'wait_for_process':waiter,'EXIT_FIELDS':('MainPID','ActiveState','SubState','Result','ExecMainStatus','ExecMainCode')})['natural_exit'])
   self.assertEqual(calls,[(M['SLEEP'],'/usr/bin/sleep'),(M['PYTHON'],'/usr/bin/python3')]);self.assertEqual(closed,[True,True])
+ def test_runtime_failure_report_keeps_readiness_success(self):
+  adapter=types.SimpleNamespace(progress={'readiness':True,'exit_verified':False,'natural_exit':False},last={'stage':'process_runtime_failed'},test=Mock(side_effect=M['Refused']('unit_execution_changed')))
+  invocation='a'*32
+  def properties(unit,keys):return {'MainPID':str(M['os'].getpid()),'InvocationID':invocation} if unit==M['CONTROLLER'] else {'MainPID':'0'}
+  with patch.dict(G,props=properties,claim_session=lambda:None,busctl_preflight=lambda:None,prepare_children=lambda:None,Adapter=lambda *a:adapter,cleanup=Mock()),patch.dict(M['os'].environ,INVOCATION_ID=invocation),patch.object(M['signal'],'signal'),patch.object(M['runpy'],'run_path',return_value={}):self.assertFalse(M['run'](self.sha))
+  report=M['read_report']();self.assertEqual(len(report['tests']),2)
+  for result in report['tests']:self.assertTrue(result['readiness']);self.assertFalse(result['exit_verified']);self.assertFalse(result['natural_exit'])
+ def test_terminal_recheck_rejects_changed_result_and_cleans_child(self):
+  a=self.adapter();calls=[];close=Mock()
+  def verify(state):
+   calls.append(state['ExecMainStatus'])
+   if state['ExecMainStatus']!='0':raise M['Refused']('diagnostic_natural_exit_failed')
+  sample=types.SimpleNamespace(pid=123,observe_running=lambda s:None,verify_exit=verify,close=close)
+  rows=iter(['0','1'])
+  def properties(unit,keys,timeout=5):
+   if keys==('MainPID',):return {'MainPID':'0'}
+   return {'MainPID':'0','ActiveState':'active','SubState':'exited','ExecMainStatus':next(rows)}
+  with patch.dict(G,props=properties),patch.object(M['os'],'stat',side_effect=lambda p:types.SimpleNamespace(st_ino=1 if p=='/proc/1/ns/net' else 2)):
+   with self.assertRaisesRegex(M['Refused'],'diagnostic_natural_exit_failed'):a.test(M['SLEEP'],{'wait_for_process':lambda *a,**kw:sample,'EXIT_FIELDS':('MainPID','ActiveState','SubState','ExecMainStatus')})
+  self.assertEqual(calls,['0','1']);self.assertTrue(a.progress['readiness']);self.assertFalse(a.progress['exit_verified']);close.assert_called_once();self.assertIn(['stop',M['SLEEP']],self.calls)
+ def test_slow_query_cannot_pass_after_observation_deadline(self):
+  a=self.adapter();clock=[100.0];verify=Mock();sample=types.SimpleNamespace(pid=123,observe_running=lambda s:None,verify_exit=verify,close=Mock());timeouts=[]
+  def properties(unit,keys,timeout=5):
+   if keys==('MainPID',):return {'MainPID':'0'}
+   timeouts.append(timeout);clock[0]+=21;return {'MainPID':'0','ActiveState':'active','SubState':'exited'}
+  with patch.dict(G,props=properties),patch.object(M['time'],'monotonic',side_effect=lambda:clock[0]),patch.object(M['os'],'stat',side_effect=lambda p:types.SimpleNamespace(st_ino=1 if p=='/proc/1/ns/net' else 2)):
+   with self.assertRaisesRegex(M['Refused'],'diagnostic_natural_exit_timeout'):a.test(M['SLEEP'],{'wait_for_process':lambda *a,**kw:sample,'EXIT_FIELDS':('MainPID','ActiveState','SubState')})
+  self.assertEqual(timeouts,[2]);verify.assert_not_called();self.assertTrue(a.progress['readiness']);self.assertFalse(a.progress['exit_verified']);sample.close.assert_called_once()
  def test_bundle_rejects_changed_payload_or_manifest(self):
   names=('diagnose.py','diagnose-install.sh','diagnostic_core.py','process_readiness.py')
   for n in names:(self.root/n).write_text('fixture')
@@ -130,7 +158,7 @@ class Lifecycle(unittest.TestCase):
   for key,sig in [('ExecStartPre','a(sasbttttuii)'),('EnvironmentFiles','a(sb)')]:
    with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=(sig+' 0\n').encode(),stderr=b'')) as command:
     self.assertTrue(M['typed_empty'](M['SLEEP'],key)['empty'])
-    args=command.call_args.args[0];self.assertIn('--system',args);self.assertEqual(args[-1],key);self.assertIn('aifinance_2dreadiness_2dv2_2dsleep_2dprobe_2eservice',args[-3])
+    args=command.call_args.args[0];self.assertIn('--system',args);self.assertEqual(args[-1],key);self.assertIn('aifinance_2dreadiness_2dv3_2dsleep_2dprobe_2eservice',args[-3])
    for data in (b'',b'as 0',b'a(sb) 1 SECRET',b'a(sasbttttuii) 1 SECRET'):
     if data==(sig+' 0').encode():continue
     with patch.object(M['subprocess'],'run',return_value=types.SimpleNamespace(returncode=0,stdout=data,stderr=b'')):
@@ -169,7 +197,8 @@ class InstallerFlow(unittest.TestCase):
   self.home=self.base/'home';self.root=self.base/'root';self.bin=self.base/'bin'
   for p in (self.home,self.root,self.bin):p.mkdir()
   self.v1=self.root/'aifinance-readiness-diagnostic-v1';self.v1.mkdir();(self.v1/'report.json').write_text('old report');(self.v1/'validation.started').write_text('old marker')
-  self.before={p.name:p.read_bytes() for p in self.v1.iterdir()}
+  self.v2=self.root/'aifinance-readiness-diagnostic-v2';self.v2.mkdir();(self.v2/'report.json').write_text('old v2 report');(self.v2/'validation.started').write_text('old v2 marker')
+  self.before={str(p.relative_to(self.root)):p.read_bytes() for d in (self.v1,self.v2) for p in d.iterdir()}
   self.installer=self.base/'installer.sh';self.installer.write_text((R/'diagnose-install.sh').read_text().replace('/root/',str(self.root)+'/'))
   shim=self.bin/'shim';shim.write_text('#!'+sys.executable+'\n'+'''import os,sys,pathlib,shutil,urllib.parse,json
 name=pathlib.Path(sys.argv[0]).name;a=sys.argv[1:]
@@ -185,7 +214,7 @@ if a[0]=='install':
   i=a.index(flag);del a[i:i+2]
 if len(a)>3 and a[0]=='/usr/bin/python3' and a[3].endswith('/diagnose.py'):
  p=pathlib.Path(a[3]).parent;mode=a[4]
- assert p.name=='aifinance-readiness-diagnostic-v2'
+ assert p.name=='aifinance-readiness-diagnostic-v3'
  if mode=='launch':
   marker=p/'fixture.started'
   if not marker.exists():marker.write_text('one session')
@@ -197,15 +226,15 @@ os.execvp(a[0],a)
   for n in ('id','hostname','curl','sudo'):(self.bin/n).symlink_to(shim)
   self.env=dict(os.environ,PATH=str(self.bin)+':/usr/bin:/bin',HOME=str(self.home),FIXTURE_SOURCE=str(R));self.sha=hashlib.sha256((R/'DIAGNOSTIC.SHA256').read_bytes()).hexdigest()
  def invoke(self):return subprocess.run(['/bin/bash',str(self.installer),'f'*40,self.sha],env=self.env,capture_output=True,text=True,timeout=15)
- def assert_old(self):self.assertEqual({p.name:p.read_bytes() for p in self.v1.iterdir()},self.before)
- def test_new_v2_install_and_repeat_preserve_v1(self):
+ def assert_old(self):self.assertEqual({str(p.relative_to(self.root)):p.read_bytes() for d in (self.v1,self.v2) for p in d.iterdir()},self.before)
+ def test_new_v3_install_and_repeat_preserve_v1_v2(self):
   first=self.invoke();self.assertEqual(first.returncode,0,first.stderr);self.assertIn('DIAGNOSTIC_EXIT=0',first.stdout)
-  v2=self.root/'aifinance-readiness-diagnostic-v2';marker=(v2/'fixture.started').stat()
+  v2=self.root/'aifinance-readiness-diagnostic-v3';marker=(v2/'fixture.started').stat()
   self.env['FIXTURE_DOWNLOAD_FAIL']='1';second=self.invoke();self.assertEqual(second.returncode,0,second.stderr);self.assertEqual((v2/'fixture.started').stat().st_mtime_ns,marker.st_mtime_ns);self.assert_old()
-  self.assertFalse(list(self.home.iterdir()));self.assertEqual(sorted(p.name for p in self.root.iterdir()),[self.v1.name,v2.name])
- def test_corrupted_existing_v2_stops_before_launch(self):
-  self.assertEqual(self.invoke().returncode,0);v2=self.root/'aifinance-readiness-diagnostic-v2';(v2/'diagnose.py').write_text('changed');(v2/'fixture.started').unlink()
+  self.assertFalse(list(self.home.iterdir()));self.assertEqual(sorted(p.name for p in self.root.iterdir()),[self.v1.name,self.v2.name,v2.name])
+ def test_corrupted_existing_v3_stops_before_launch(self):
+  self.assertEqual(self.invoke().returncode,0);v2=self.root/'aifinance-readiness-diagnostic-v3';(v2/'diagnose.py').write_text('changed');(v2/'fixture.started').unlink()
   self.assertNotEqual(self.invoke().returncode,0);self.assertFalse((v2/'fixture.started').exists());self.assert_old()
  def test_download_failure_does_not_install_or_launch(self):
-  self.env['FIXTURE_DOWNLOAD_FAIL']='1';self.assertNotEqual(self.invoke().returncode,0);self.assertFalse((self.root/'aifinance-readiness-diagnostic-v2').exists());self.assertFalse(list(self.home.iterdir()));self.assert_old()
+  self.env['FIXTURE_DOWNLOAD_FAIL']='1';self.assertNotEqual(self.invoke().returncode,0);self.assertFalse((self.root/'aifinance-readiness-diagnostic-v3').exists());self.assertFalse(list(self.home.iterdir()));self.assert_old()
 if __name__=='__main__':unittest.main(verbosity=2)

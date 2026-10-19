@@ -17,7 +17,7 @@ class FakeSample(M['ProcessSample']):
  def read(self,name,limit=None):
   if name=='status':return self.status() if callable(self.status) else self.status
   return {'stat':self.stat_text,'cgroup':'0::/fixture.service\n'}[name]
- def executable_matches(self):return self.exe_sequence.pop(0) if len(self.exe_sequence)>1 else self.exe_sequence[0]
+ def executable_matches(self,allow_missing=True):return self.exe_sequence.pop(0) if len(self.exe_sequence)>1 else self.exe_sequence[0]
  def resolver_evidence(self):self.diagnostic['resolver_bindings_readonly']=True
  def close(self):self.closed=True
 class SequencingTests(unittest.TestCase):
@@ -93,8 +93,65 @@ class SequencingTests(unittest.TestCase):
  def test_security_status_tabs_and_spaces(self):
   for text in (STATUS,STATUS.replace('\t',' ')):
    checks,values=M['security_status'](text,995,996);self.assertTrue(all(checks.values()))
+ def exited(self,**extra):return snapshot(MainPID='0',ActiveState='active',SubState='exited',Result='success',ExecMainCode='1',ExecMainStatus='0',**extra)
+ def test_retained_exit_requires_dead_original_pidfd_and_same_instance(self):
+  op=FakeOp();s=self.run_wait(op)
+  with self.assertRaisesRegex(M['Refused'],'unit_completion_not_observed'):s.verify_exit(self.exited())
+  s.is_alive=False;s.verify_exit(self.exited());self.assertEqual(op.events[-1]['stage'],'process_exit_verified')
+  self.assertFalse(op.events[-1]['unit_transition']['held_pidfd_alive'])
+ def test_cleared_pid_or_start_stamp_never_becomes_success(self):
+  for change in ({'ExecMainPID':'0'},{'ExecMainStartTimestampMonotonic':'0'},{'ExecMainPID':'0','ExecMainStartTimestampMonotonic':'0'}):
+   op=FakeOp();s=self.run_wait(op);s.is_alive=False
+   with self.assertRaisesRegex(M['Refused'],'unit_execution_changed'):s.verify_exit(self.exited(**change))
+   transition=op.events[-1]['unit_transition'];self.assertEqual(transition['initial']['ExecMainPID'],'123')
+   for key,value in change.items():self.assertEqual(transition['current'][key],value);self.assertIn(key,transition['changed_fields'])
+ def test_reaping_window_still_rejects_changed_execution_identity(self):
+  s=self.run_wait();s.is_alive=False
+  with self.assertRaisesRegex(M['Refused'],'unit_execution_changed'):s.observe_running(snapshot(ExecMainPID='124'))
+ def test_nonzero_signal_timeout_and_unretained_exit_rejected(self):
+  changes=[{'Result':'exit-code','ExecMainStatus':'1'},{'Result':'signal','ExecMainCode':'2','ExecMainStatus':'15'},{'Result':'timeout'},{'ActiveState':'inactive','SubState':'dead'},{'InvocationID':''},{'InvocationID':'b'*32}]
+  for change in changes:
+   op=FakeOp();s=self.run_wait(op);s.is_alive=False;state=self.exited();state.update(change)
+   with self.assertRaises(M['Refused']):s.verify_exit(state)
+   self.assertNotEqual(op.events[-1]['stage'],'process_exit_verified')
+ def test_restart_after_first_exit_observation_is_rejected(self):
+  s=self.run_wait();s.is_alive=False;s.verify_exit(self.exited())
+  with self.assertRaises(M['Refused']):s.verify_exit(self.exited(ExecMainPID='124',InvocationID='b'*32))
+ def test_transition_log_redacts_unexpected_values_and_paths(self):
+  op=FakeOp();s=self.run_wait(op)
+  with self.assertRaises(M['Refused']):s.observe_running(snapshot(ExecMainPID='SECRET',ControlGroup='/SECRET',InvocationID='SECRET',ActiveState='SECRET'))
+  data=json.dumps(op.events[-1]);self.assertNotIn('SECRET',data);self.assertIn('ExecMainPID',data)
+ def test_previous_snapshot_and_observation_duration_are_recorded(self):
+  op=FakeOp();s=self.run_wait(op);s.observe_running(snapshot());s.is_alive=False;s.verify_exit(self.exited())
+  t=op.events[-1]['unit_transition'];self.assertEqual(t['previous']['MainPID'],'123');self.assertGreaterEqual(t['elapsed_ms'],0);self.assertGreaterEqual(t['since_last_observation_ms'],0)
+ def test_exit_between_snapshot_and_proc_read_waits_for_verified_exit(self):
+  op=FakeOp();s=self.run_wait(op);original=s.read
+  def vanishes(name,limit=None):
+   if name=='stat':s.is_alive=False;raise FileNotFoundError(2,'fixture disappearance')
+   return original(name,limit)
+  s.read=vanishes;s.observe_running(snapshot());self.assertTrue(s.diagnostic['unit_transition']['exit_observed_during_sample'])
+  self.assertNotEqual(op.events[-1]['stage'],'process_exit_verified');s.verify_exit(self.exited());self.assertEqual(op.events[-1]['stage'],'process_exit_verified')
+ def test_live_proc_failure_or_identity_mismatch_is_not_swallowed(self):
+  s=self.run_wait();s.read=lambda *a,**kw:(_ for _ in ()).throw(FileNotFoundError(2,'fixture'))
+  with self.assertRaises(M['Refused']):s.observe_running(snapshot())
+  s=self.run_wait()
+  def reused(*a,**kw):s.is_alive=False;return proc_stat(ticks=901)
+  s.read=reused
+  with self.assertRaisesRegex(M['Refused'],'process_pid_reused'):s.observe_running(snapshot())
 
 class LinuxProcessTests(unittest.TestCase):
+ def test_real_pidfd_natural_exit_with_retained_and_cleared_unit_fixtures(self):
+  p=subprocess.Popen(['/usr/bin/sleep','.15']);op=FakeOp();sample=M['ProcessSample'](op,'fixture-probe.service',pathlib.Path('/usr/bin/sleep'),pathlib.Path('/unused'),lambda:None,lambda *a:None)
+  initial=snapshot(MainPID=str(p.pid),ExecMainPID=str(p.pid))
+  try:
+   sample.attach(initial);self.assertTrue(sample.alive());self.assertEqual(p.wait(timeout=3),0);self.assertFalse(sample.alive())
+   ended=dict(initial,MainPID='0',ActiveState='active',SubState='exited',Result='success',ExecMainStatus='0',ExecMainCode='1')
+   with self.assertRaisesRegex(M['Refused'],'unit_execution_changed'):sample.verify_exit(dict(ended,ExecMainPID='0'))
+   sample.verify_exit(ended);self.assertEqual(op.events[-1]['stage'],'process_exit_verified')
+  finally:
+   sample.close()
+   if p.poll() is None:p.kill()
+   p.wait()
  def test_real_pidfd_exec_transition_and_exit(self):
   # A blocked Python child then execs sleep: real exec transition, no systemd claim.
   p=subprocess.Popen([sys.executable,'-I','-B','-c','import os,sys; sys.stdout.write("ready\\n");sys.stdout.flush();sys.stdin.readline();os.execv("/usr/bin/sleep",["sleep","2"])'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)

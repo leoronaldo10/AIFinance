@@ -2,8 +2,8 @@
 """One detached, diagnosis-only session. No collector, database or recovery action."""
 import argparse,hashlib,json,os,pwd,re,runpy,signal,stat,subprocess,sys,time
 from pathlib import Path
-ROOT=Path('/root/aifinance-readiness-diagnostic-v2');INPUT=Path('/run/aifinance-readiness-v2');UNITS=Path('/run/systemd/system')
-CONTROLLER='aifinance-readiness-v2.service';SLEEP='aifinance-readiness-v2-sleep-probe.service';PYTHON='aifinance-readiness-v2-python.service';CHILDREN=(SLEEP,PYTHON)
+ROOT=Path('/root/aifinance-readiness-diagnostic-v3');INPUT=Path('/run/aifinance-readiness-v3');UNITS=Path('/run/systemd/system')
+CONTROLLER='aifinance-readiness-v3.service';SLEEP='aifinance-readiness-v3-sleep-probe.service';PYTHON='aifinance-readiness-v3-python.service';CHILDREN=(SLEEP,PYTHON)
 SOURCE=Path('/etc/aifinance-collect-once');OLD=Path('/var/lib/aifinance-collect-once')
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C','HOME':'/root','SYSTEMD_PAGER':'cat','SYSTEMD_COLORS':'0'}
 class Refused(Exception):
@@ -110,6 +110,7 @@ def child_text(unit):
 Description=AIFinance inert identity and sandbox diagnostic
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=aifinance-collect-once
 Group=aifinance-collect-once
 ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C {command}
@@ -198,21 +199,21 @@ def prepare_children():
  systemctl(['daemon-reload']);return account
 
 class Adapter:
- def __init__(self,account,core):self.state={'uid':account.pw_uid,'gid':account.pw_gid};self.core=core;self.last={};self.query_failure={}
+ def __init__(self,account,core):self.state={'uid':account.pw_uid,'gid':account.pw_gid};self.core=core;self.last={};self.query_failure={};self.progress={'readiness':False,'exit_verified':False,'natural_exit':False}
  def properties(self,unit,keys,timeout=2):
   need(unit in CHILDREN,'unapproved_diagnostic_unit')
   try:return props(unit,keys,timeout)
   except Refused as e:
    self.query_failure=e.evidence;self.last.update(stage='unit_property_query_failed',reason=reason(e),unit_query=e.evidence);raise
  def process_diagnostic(self,stage,values):
-  allowed={'role','expected_uid','expected_gid','pid','start_ticks','uids','gids','no_new_privileges','capabilities_zero','checks','resolver_bindings_readonly','cgroup_verified','exec_matches','reason','cgroup','resolver_checks'}
+  allowed={'role','expected_uid','expected_gid','pid','start_ticks','uids','gids','no_new_privileges','capabilities_zero','checks','resolver_bindings_readonly','cgroup_verified','exec_matches','reason','cgroup','resolver_checks','unit_transition'}
   need(set(values)<=allowed,'diagnostic_fields_invalid');record=dict(values,stage=stage);record['role']='sleep_diagnostic' if values.get('role')=='resource_probe' else 'python_diagnostic'
   if self.query_failure:record['unit_query']=self.query_failure
   self.last=record
   fd=os.open(ROOT/'events.jsonl',os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
   with os.fdopen(fd,'w') as out:out.write(json.dumps(record,sort_keys=True)+'\n');out.flush();os.fsync(out.fileno())
  def verify_profile(self,unit):
-  expected={'User':'aifinance-collect-once','Group':'aifinance-collect-once','Type':'oneshot','NoNewPrivileges':'yes','PrivateNetwork':'yes','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','CapabilityBoundingSet':'','AmbientCapabilities':'','Restart':'no','KillMode':'control-group','ProtectSystem':'strict','DropInPaths':''}
+  expected={'User':'aifinance-collect-once','Group':'aifinance-collect-once','Type':'oneshot','RemainAfterExit':'yes','NoNewPrivileges':'yes','PrivateNetwork':'yes','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','CapabilityBoundingSet':'','AmbientCapabilities':'','Restart':'no','KillMode':'control-group','ProtectSystem':'strict','DropInPaths':''}
   actual=self.properties(unit,tuple(expected))
   mismatched=[k for k in expected if actual[k]!=expected[k]]
   if mismatched:
@@ -222,19 +223,26 @@ class Adapter:
    except Refused as e:
     self.last.update(stage='unit_profile_failed',reason=reason(e),unit_query=e.evidence);raise
  def test(self,unit,readiness):
-  self.last={};self.query_failure={};self.verify_profile(unit);expected=Path('/usr/bin/sleep' if unit==SLEEP else '/usr/bin/python3');self.core['trusted_tool'](expected)
+  self.last={};self.query_failure={};self.progress={'readiness':False,'exit_verified':False,'natural_exit':False};self.verify_profile(unit);expected=Path('/usr/bin/sleep' if unit==SLEEP else '/usr/bin/python3');self.core['trusted_tool'](expected)
   sample=None
   try:
    systemctl(['start','--no-block',unit]);sample=readiness['wait_for_process'](self,unit,expected,INPUT,self.core['require_cgroup_v2'],self.core['verify_cgroup_v2'],timeout=5)
+   self.progress['readiness']=True
    need(os.stat('/proc/'+str(sample.pid)+'/ns/net').st_ino!=os.stat('/proc/1/ns/net').st_ino,'diagnostic_network_namespace_not_isolated')
    deadline=time.monotonic()+20
    while time.monotonic()<deadline:
-    state=self.properties(unit,readiness['FIELDS']);sample.observe_running(state)
-    if state['MainPID']=='0' and state['ActiveState'] in ('inactive','failed'):break
-    time.sleep(.025)
+    remaining=deadline-time.monotonic();need(remaining>0,'diagnostic_natural_exit_timeout')
+    state=self.properties(unit,readiness['EXIT_FIELDS'],timeout=min(2,remaining));sample.observe_running(state)
+    need(time.monotonic()<=deadline,'diagnostic_natural_exit_timeout')
+    if state['MainPID']=='0' and state['ActiveState'] in ('active','inactive','failed'):
+     sample.verify_exit(state)
+     remaining=deadline-time.monotonic();need(remaining>0,'diagnostic_natural_exit_timeout')
+     confirmed=self.properties(unit,readiness['EXIT_FIELDS'],timeout=min(2,remaining))
+     need(time.monotonic()<=deadline,'diagnostic_natural_exit_timeout');sample.verify_exit(confirmed);break
+    time.sleep(min(.025,max(0,deadline-time.monotonic())))
    else:raise Refused('diagnostic_natural_exit_timeout')
-   need(self.properties(unit,('Result','ExecMainStatus','ExecMainCode'))=={'Result':'success','ExecMainStatus':'0','ExecMainCode':'1'},'diagnostic_natural_exit_failed')
-   return {'name':'sleep' if unit==SLEEP else 'python','readiness':True,'natural_exit':True,'network_isolated':True,'uid':self.state['uid'],'gid':self.state['gid'],'no_new_privileges':1,'capabilities_zero':True,'readonly_mounts':True,**sample.evidence}
+   self.progress.update(exit_verified=True,natural_exit=True)
+   return {'name':'sleep' if unit==SLEEP else 'python',**self.progress,'exit_evidence':sample.diagnostic['unit_transition'],'network_isolated':True,'uid':self.state['uid'],'gid':self.state['gid'],'no_new_privileges':1,'capabilities_zero':True,'readonly_mounts':True,**sample.evidence}
   finally:
    try:systemctl(['stop',unit]);need(props(unit,('MainPID',))['MainPID']=='0','diagnostic_child_not_stopped')
    finally:
@@ -288,10 +296,10 @@ def run(manifest):
   for unit in CHILDREN:
    try:result=adapter.test(unit,readiness)
    except Exception as e:
-    result={'name':'sleep' if unit==SLEEP else 'python','readiness':False,'reason':reason(e),'last_evidence':adapter.last}
+    result={'name':'sleep' if unit==SLEEP else 'python',**adapter.progress,'reason':reason(e),'last_evidence':adapter.last}
     need(props(unit,('MainPID',))['MainPID']=='0','diagnostic_child_not_stopped')
    report['tests'].append(result);save_report(report)
-  report['tests_passed']=all(t.get('natural_exit') for t in report['tests'])
+  report['tests_passed']=all(t.get('readiness') and t.get('exit_verified') and t.get('natural_exit') and not t.get('reason') for t in report['tests'])
  except Exception as e:
   report['reason']=reason(e)
   if adapter and adapter.last:report['last_evidence']=adapter.last

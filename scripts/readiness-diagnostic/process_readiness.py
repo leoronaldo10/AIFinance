@@ -1,8 +1,9 @@
 """Read-only process evidence. PID availability is not exec or sandbox readiness."""
-import os,re,select,stat,time
+import errno,os,re,select,stat,time
 from pathlib import Path
 FIELDS=('MainPID','ExecMainPID','ExecMainStartTimestampMonotonic','InvocationID','ControlGroup','ActiveState','SubState')
 CAPS=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
+EXIT_FIELDS=FIELDS+('Result','ExecMainStatus','ExecMainCode')
 class Refused(Exception):pass
 def need(value,reason):
  if not value:raise Refused(reason)
@@ -41,6 +42,7 @@ class ProcessSample:
  def __init__(self,op,unit,expected,conf,require_cgroup,verify_cgroup):
   self.op=op;self.unit=unit;self.expected=expected;self.conf=conf;self.require_cgroup=require_cgroup;self.verify_cgroup=verify_cgroup
   self.pidfd=None;self.procfd=None;self.pid=None;self.ticks=None;self.initial=None;self.evidence={};self.diagnostic={'role':'resource_probe' if unit.endswith('-probe.service') else 'collector','expected_uid':op.state['uid'],'expected_gid':op.state['gid']}
+  self.last_good=None;self.last_observed_at=None;self.sampling_started=time.monotonic()
  def close(self):
   for key in ('procfd','pidfd'):
    fd=getattr(self,key)
@@ -53,9 +55,11 @@ class ProcessSample:
   fd=os.open(name,os.O_RDONLY|os.O_CLOEXEC,dir_fd=self.procfd)
   with os.fdopen(fd,'rb') as f:data=f.read(limit+1)
   need(len(data)<=limit,'process_evidence_size_limit');return data.decode()
- def executable_matches(self):
+ def executable_matches(self,allow_missing=True):
   try:actual=os.stat('exe',dir_fd=self.procfd)
-  except FileNotFoundError:return False
+  except FileNotFoundError:
+   if allow_missing:return False
+   raise
   expected=os.stat(self.expected)
   return (actual.st_dev,actual.st_ino)==(expected.st_dev,expected.st_ino)
  def attach(self,snapshot):
@@ -74,6 +78,20 @@ class ProcessSample:
   need(snapshot['MainPID']==str(self.pid) and snapshot['ControlGroup']==self.initial['ControlGroup'],'process_unit_identity_changed')
   need(self.alive(),'process_exited_during_evidence')
   need(start_identity(self.read('stat'),self.pid)==self.ticks,'process_pid_reused')
+ def transition(self,snapshot):
+  def safe(row):
+   result={}
+   for key in ('MainPID','ExecMainPID','ExecMainStartTimestampMonotonic','ExecMainStatus','ExecMainCode'):
+    value=(row or {}).get(key);result[key]=value if isinstance(value,str) and re.fullmatch('[0-9]{1,20}',value) else None
+   value=(row or {}).get('InvocationID');result['InvocationID']=value if isinstance(value,str) and re.fullmatch('[a-f0-9]{32}|',value) else None
+   for key,allowed in [('ActiveState',('activating','active','deactivating','inactive','failed','reloading','maintenance')),('SubState',('start','running','exited','dead','failed','stop','stop-sigterm','stop-sigkill','stop-post')),('Result',('success','exit-code','signal','core-dump','timeout','oom-kill','resources','protocol','start-limit-hit'))]:
+    value=(row or {}).get(key);result[key]=value if value in allowed else None
+   return result
+  now=time.monotonic()
+  try:alive=self.alive()
+  except OSError:alive=None
+  self.diagnostic['unit_transition']={'initial':safe(self.initial),'previous':safe(self.last_good),'current':safe(snapshot),'changed_fields':[k for k in FIELDS if (self.initial or {}).get(k)!=snapshot.get(k)],'held_pidfd_alive':alive,'elapsed_ms':int((now-self.sampling_started)*1000),'since_last_observation_ms':None if self.last_observed_at is None else int((now-self.last_observed_at)*1000),'control_group_matches':snapshot.get('ControlGroup')==(self.initial or {}).get('ControlGroup')}
+  self.last_observed_at=now
  def check_security(self):
   checks,values=security_status(self.read('status'),self.op.state['uid'],self.op.state['gid']);self.diagnostic.update(values);self.diagnostic['checks']=checks
   for name,ok in checks.items():need(ok,'process_'+name+'_failed')
@@ -104,13 +122,32 @@ class ProcessSample:
   # An exited pidfd is terminal; never open or attach to a replacement PID.
   need(snapshot['MainPID']==str(self.pid),'process_unit_identity_changed')
   need(snapshot['InvocationID']==self.initial['InvocationID'],'unit_invocation_changed')
+  need(snapshot['ExecMainPID']==str(self.pid) and snapshot['ExecMainStartTimestampMonotonic']==self.initial['ExecMainStartTimestampMonotonic'],'unit_execution_changed')
   if not self.alive():return  # systemd may not have reaped/cleared MainPID yet.
-  self.consistent(snapshot);need(self.executable_matches(),'process_executable_changed');self.check_security()
+  try:
+   self.consistent(snapshot);need(self.executable_matches(allow_missing=False),'process_executable_changed');self.check_security()
+  except (Refused,OSError) as e:
+   disappeared=(isinstance(e,Refused) and str(e) in ('process_exited_during_evidence','process_exited_before_ready')) or (isinstance(e,OSError) and e.errno in (errno.ENOENT,errno.ESRCH))
+   if not disappeared or self.alive():raise
+   # Exit between manager snapshot and /proc reads is pending, never success.
+   # The next bounded terminal query must still prove the original instance/code.
+   self.diagnostic['unit_transition'].update(held_pidfd_alive=False,exit_observed_during_sample=True)
  def observe_running(self,snapshot):
-  try:self._observe_running(snapshot)
+  self.transition(snapshot)
+  try:self._observe_running(snapshot);self.last_good=dict(snapshot)
   except Exception as e:
    reason=failure_reason(self,e)
    self.record('process_runtime_failed',reason);raise Refused(reason) from None
+ def verify_exit(self,snapshot):
+  self.observe_running(snapshot)
+  try:
+   need(snapshot['MainPID']=='0','unit_completion_not_observed')
+   need(snapshot['InvocationID']==self.initial['InvocationID'],'unit_invocation_changed')
+   need((snapshot['ActiveState'],snapshot['SubState'])==('active','exited'),'unit_exit_state_not_retained')
+   need(snapshot.get('Result')=='success' and snapshot.get('ExecMainCode')=='1' and snapshot.get('ExecMainStatus')=='0','diagnostic_natural_exit_failed')
+  except Exception as e:
+   reason=failure_reason(self,e);self.record('process_exit_failed',reason);raise Refused(reason) from None
+  self.record('process_exit_verified')
  def wait(self,timeout):
   deadline=time.monotonic()+timeout;seen_start=False
   while True:

@@ -11,7 +11,7 @@ The fixed installer takes a 40-character commit and the SHA256 of
 `DIAGNOSTIC.SHA256`. Use the separately pinned installer hash before execution.
 It downloads only four scripts and their manifest from that exact commit,
 rechecks the staged root-owned bytes and installs atomically under
-`/root/aifinance-readiness-diagnostic-v2`. Existing matching installations are
+`/root/aifinance-readiness-diagnostic-v3`. Existing matching installations are
 reused; changed files or path collisions fail closed. No runtime is repacked,
 no dependency is installed, and no existing download folder is reused.
 
@@ -70,7 +70,7 @@ systemd lifecycle/ownership/failure fixtures. The development container has
 non-systemd PID 1 and UID 1000; these tests do not establish real root/systemd
 sandbox integration. That evidence must come from this diagnostic on ECS.
 
-## Property-reader repair and independent v2 session
+## Property-reader repair and independent v3 session
 
 A real systemctl 257 client against a synthetic local D-Bus service reproduces
 empty ExecStartPre and EnvironmentFiles arrays disappearing from show output,
@@ -96,18 +96,53 @@ unknown or absent scalar fields still fail. Existing PID/invocation/exit checks
 are unchanged. A unit that gets unloaded before exit evidence is observed still
 fails closed rather than fabricating successful completion.
 
-The v2 installer and diagnostic use only `/root/aifinance-readiness-diagnostic-v2`,
-`/run/aifinance-readiness-v2`, and `aifinance-readiness-v2*.service` resources.
-The old v1 directory, reports, events and session marker are never overwritten,
-renamed or removed. The v2 marker permits one new session only; reconnecting or
-repeating the same command retrieves v2 results rather than repeating its tests.
+The v3 installer and diagnostic use only `/root/aifinance-readiness-diagnostic-v3`,
+`/run/aifinance-readiness-v3`, and `aifinance-readiness-v3*.service` resources.
+The old v1 and v2 directories, reports, events and session marker are never overwritten,
+renamed or removed. The v3 marker permits one new session only; reconnecting or
+repeating the same command retrieves v3 results rather than repeating its tests.
 The isolation policy, two inert commands, collector tools and retry records are
 unchanged. There is no reset command or collection/recovery entry point.
 
 Before any child setup, busctl is checked for existence, trusted ownership/path
 and executable regular-file status. Missing, untrusted, nonexecutable, execution
 denied, timeout and D-Bus query failures have distinct sanitized reason codes.
-The fixed v2 installer verifies its own v2 manifest and uses a separate root-owned
-staging directory before atomic installation. A matching existing v2 installation
-is reused; changed bytes fail before launch. The old v1 result is never used to
-satisfy v2 status. Download/install failures do not launch diagnostic processes.
+The fixed v3 installer verifies its own v3 manifest and uses a separate root-owned
+staging directory before atomic installation. A matching existing v3 installation
+is reused; changed bytes fail before launch. The old v1/v2 result is never used to
+satisfy v3 status. Download/install failures do not launch diagnostic processes.
+
+## Lifecycle evidence retained through verification
+
+The original v2 report proves readiness but not the cause of the final identity
+mismatch: it omitted before/after ExecMainPID and start-timestamp values. Local
+fixtures reproduce the error when either field is cleared. Inactive-unit garbage
+collection is a documented possible cause, not a confirmed ECS diagnosis.
+
+The local repair sets RemainAfterExit=yes only on the two inert child units.
+After natural process exit, the active/exited unit retains execution state until
+the observer verifies it and stops the owned unit in its existing finally path.
+No child process is kept alive to hold the state. The controller is unchanged.
+
+The observer retains the original pidfd, PID, proc start ticks, executable and
+invocation checks. Zeroed execution fields still fail. Success requires a dead
+original pidfd, MainPID=0, the original ExecMainPID/start timestamp and nonempty
+InvocationID, active/exited state, Result=success, ExecMainCode=1 and status=0.
+Identity and exit results are read together and confirmed in a second bounded
+query before cleanup. Replacement, restart, PID reuse, signal/timeout/nonzero
+exit, missing metadata and an unexpectedly live pidfd cannot become success.
+Even while waiting for systemd to reap an exited pidfd, execution identity must
+remain stable. A rejected cleanup does not turn into a passed test.
+
+Sanitized transition records retain initial/previous/current numeric identity
+fields, invocation IDs, fixed-list state/result names, changed field names, pidfd
+liveness, elapsed time and observation interval; cgroup paths and arbitrary
+values are not logged. Readiness and exit_verified/natural_exit are separate
+results, so later failure no longer erases readiness success.
+
+The installer/session names are v3. Neither v1 nor v2 bundles, reports or session
+markers are modified or used as the v3 result. Repeat invocation retrieves the
+same v3 session without launching another pair of tests. After verification,
+finally/ExecStopPost cleanup stops and removes only the exact v3 owned units and
+inputs, while keeping the v3 report and evidence. Real root/systemd integration
+must still be verified by running this fixed diagnostic on the approved host.

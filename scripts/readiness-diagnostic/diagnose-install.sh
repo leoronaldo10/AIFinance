@@ -5,7 +5,7 @@ set -euo pipefail
 [[ $(id -un) == ecs-user && $(hostname) == iZ2zedybs3fftu1d9vnx39Z ]]
 COMMIT=$1
 MANIFEST_SHA=$2
-DEST=/root/aifinance-readiness-diagnostic-v2
+DEST=/root/aifinance-readiness-diagnostic-v3
 FILES=(diagnose.py diagnose-install.sh diagnostic_core.py process_readiness.py DIAGNOSTIC.SHA256)
 sudo -v
 DOWNLOAD=
@@ -29,7 +29,7 @@ if ! sudo test -e "$DEST"; then
  for f in "${FILES[@]}"; do sudo install -o root -g root -m 0600 "$DOWNLOAD/$f" "$STAGE/$f"; done
  sudo /usr/bin/python3 -I -B -c 'import pathlib,hashlib,sys,os; p=pathlib.Path(sys.argv[1]); assert hashlib.sha256((p/"DIAGNOSTIC.SHA256").read_bytes()).hexdigest()==sys.argv[2]; rows=[line.split() for line in (p/"DIAGNOSTIC.SHA256").read_text().splitlines()]; assert all(hashlib.sha256((p/n).read_bytes()).hexdigest()==h for h,n in rows); target=pathlib.Path(sys.argv[3]); assert not target.exists() and not target.is_symlink(); os.rename(p,target)' "$STAGE" "$MANIFEST_SHA" "$DEST"
 fi
-sudo /bin/sh -c 'set -e; cd /root/aifinance-readiness-diagnostic-v2; printf "%s  DIAGNOSTIC.SHA256\n" "$1" | sha256sum -c -; sha256sum --quiet -c DIAGNOSTIC.SHA256' checked "$MANIFEST_SHA"
+sudo /bin/sh -c 'set -e; cd /root/aifinance-readiness-diagnostic-v3; printf "%s  DIAGNOSTIC.SHA256\n" "$1" | sha256sum -c -; sha256sum --quiet -c DIAGNOSTIC.SHA256' checked "$MANIFEST_SHA"
 sudo /usr/bin/python3 -I -B "$DEST/diagnose.py" launch --manifest-sha "$MANIFEST_SHA"
 for ((i=0; i<75; i++)); do
  set +e
