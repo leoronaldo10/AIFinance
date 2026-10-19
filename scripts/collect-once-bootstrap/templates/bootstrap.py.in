@@ -175,7 +175,7 @@ def require_cgroup_v2(root=Path('/sys/fs/cgroup'),mountinfo=None):
  need(root.resolve()==root and root.is_dir(),'cgroup_root_unsafe')
  need({'memory','pids','cpu'}<=set(cgroup_read(root/'cgroup.controllers').split()),'cgroup_controller_missing')
 
-def verify_cgroup_v2(root,control_group,pid,process_cgroup):
+def verify_cgroup_v2(root,control_group,pid,process_cgroup,observations=None):
  # systemd's actual ControlGroup is the authority; never construct it from a unit name.
  need(bool(re.fullmatch(r'/(?:[A-Za-z0-9_.@:-]+/)*[A-Za-z0-9_.@:-]+',control_group)),'cgroup_path_invalid')
  parts=control_group[1:].split('/');need(all(x not in ('.','..') for x in parts),'cgroup_path_escape')
@@ -187,22 +187,25 @@ def verify_cgroup_v2(root,control_group,pid,process_cgroup):
  need(group.resolve()==group and root in group.parents,'cgroup_path_escape')
  need(process_cgroup.strip()=='0::'+control_group,'process_unit_cgroup_mismatch')
  need(pid in cgroup_read(group/'cgroup.procs').split(),'cgroup_pid_missing')
- need(cgroup_read(group/'memory.max')=='268435456','cgroup_memory_limit_mismatch')
- need(cgroup_read(group/'pids.max')=='32','cgroup_tasks_limit_mismatch')
- cpu=cgroup_read(group/'cpu.max').split()
+ def observed(name,value):
+  if observations is not None:observations[name]=value
+ memory=cgroup_read(group/'memory.max');observed('memory_max',memory if re.fullmatch(r'max|[0-9]{1,20}',memory) else None);need(memory=='268435456','cgroup_memory_limit_mismatch')
+ pids=cgroup_read(group/'pids.max');observed('pids_max',pids if re.fullmatch(r'max|[0-9]{1,20}',pids) else None);need(pids=='32','cgroup_tasks_limit_mismatch')
+ cpu=cgroup_read(group/'cpu.max').split();observed('cpu_max',cpu if len(cpu)==2 and all(re.fullmatch(r'max|[0-9]{1,20}',v) for v in cpu) else None)
  need(len(cpu)==2 and all(re.fullmatch(r'[1-9][0-9]*',x) for x in cpu),'cgroup_cpu_unlimited_or_invalid')
  quota,period=map(int,cpu);need(quota*2==period and 1000<=period<=1000000,'cgroup_cpu_quota_mismatch')
- current=cgroup_read(group/'memory.current');need(current.isdecimal() and int(current)<268435456,'cgroup_memory_limit_hit')
+ current=cgroup_read(group/'memory.current');observed('memory_current',int(current) if re.fullmatch(r'[0-9]{1,20}',current) else None);need(current.isdecimal() and int(current)<268435456,'cgroup_memory_limit_hit')
  events={}
  for line in cgroup_read(group/'memory.events').splitlines():
   pair=line.split();need(len(pair)==2 and pair[1].isdecimal(),'cgroup_memory_events_invalid');events[pair[0]]=int(pair[1])
+ observed('memory_events',{k:events.get(k) for k in ('max','oom','oom_kill')})
  need(all(events.get(k)==0 for k in ('max','oom','oom_kill')),'cgroup_memory_limit_hit')
  return {'cgroup_version':2,'memory_bytes':268435456,'tasks_max':32,'cpu_quota_percent':50}
 
 class Operator:
  def __init__(self,db,artifact=None,digest=None):self.db=db;self.artifact=artifact;self.digest=digest;self.state={}
  def property(self,unit,key):
-  p=cmd(['/usr/bin/systemctl','--no-pager','show',unit,'-p',key,'--value'],ok=False)
+  p=cmd(['/usr/bin/systemctl','--no-pager','show','--all',unit,'-p',key,'--value'],ok=False)
   return p.stdout.decode().strip()
  def save(self):
   p=STATE/'state.json';tmp=STATE/'state.next';write_new(tmp,json.dumps(self.state,sort_keys=True).encode());os.replace(tmp,p)
@@ -297,26 +300,57 @@ class Operator:
   for unit in (UNIT,PROBE):
    need(self.property(unit,'DropInPaths')=='','unexpected_unit_dropins')
    need(self.property(unit,'FragmentPath')=='/etc/systemd/system/'+unit,'wrong_unit_fragment')
-   for k,v in {'User':USER,'Group':USER,'MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','TimeoutStartUSec':'2min','NoNewPrivileges':'yes','KillMode':'control-group','ProtectSystem':'strict'}.items():need(self.property(unit,k)==v,'unit_safety_property_mismatch')
+   for k,v in {'User':USER,'Group':USER,'MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','TimeoutStartUSec':'2min','NoNewPrivileges':'yes','KillMode':'control-group','ProtectSystem':'strict','RemainAfterExit':'yes'}.items():need(self.property(unit,k)==v,'unit_safety_property_mismatch')
    expected='/usr/bin/sleep 30' if unit==PROBE else '/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/run.py'
    actual=self.property(unit,'ExecStart');need('argv[]='+expected+' ;' in actual and actual.count('argv[]=')==1,'unit_exec_mismatch')
+ def properties(self,unit,keys,timeout=2):
+  need(unit in (UNIT,PROBE),'unexpected_evidence_unit')
+  p=cmd(['/usr/bin/systemctl','--no-pager','show','--all',unit]+['--property='+k for k in keys],timeout=timeout)
+  values={}
+  for line in p.stdout.decode().splitlines():
+   if '=' not in line:continue
+   key,value=line.split('=',1);need(key in keys and key not in values,'unit_evidence_fields_invalid');values[key]=value
+  need(set(values)==set(keys),'unit_evidence_fields_missing');return values
+ def evidence_directory(self):
+  return STATE
+ def process_diagnostic(self,stage,values):
+  # Strict producer schema: never dump status, argv, environment or arbitrary errors.
+  allowed={'role','expected_uid','expected_gid','pid','start_ticks','uids','gids','no_new_privileges','capabilities_zero','checks','resolver_bindings_readonly','cgroup_verified','exec_matches','reason','cgroup','resolver_checks','unit_transition'}
+  need(set(values)<=allowed,'process_diagnostic_fields_invalid')
+  emit(stage,**values)
+  directory=self.evidence_directory();trusted(directory)
+  fd=os.open(directory/'process-evidence.jsonl',os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW,0o600)
+  with os.fdopen(fd,'w') as out:
+   st=os.fstat(out.fileno());need(st.st_uid==os.geteuid() and stat.S_IMODE(st.st_mode)==0o600 and st.st_nlink==1,'unsafe_process_evidence_file')
+   out.write(json.dumps(dict(stage=stage,monotonic_ns=time.monotonic_ns(),**values),sort_keys=True)+'\n');out.flush();os.fsync(out.fileno())
  def kernel_evidence(self,unit):
-  pid=self.property(unit,'MainPID');need(re.fullmatch('[1-9][0-9]*',pid),'probe_pid_missing')
-  values=dict(x.split(':',1) for x in Path('/proc/'+pid+'/status').read_text().splitlines() if ':' in x)
-  need(values['Uid'].split()==[str(self.state['uid'])]*4 and values['NoNewPrivs'].strip()=='1' and int(values['CapEff'].strip(),16)==0,'probe_identity_or_capabilities')
-  require_cgroup_v2()
-  control_group=self.property(unit,'ControlGroup')
-  evidence=verify_cgroup_v2(Path('/sys/fs/cgroup'),control_group,pid,cgroup_read(Path('/proc/'+pid+'/cgroup')))
-  need(self.property(unit,'MainPID')==pid and self.property(unit,'ControlGroup')==control_group,'probe_pid_or_cgroup_changed')
-  for name in ('hosts','nsswitch.conf'):
-   need(Path('/proc/'+pid+'/root/etc/'+name).read_bytes()==(CONF/name).read_bytes(),'resolver_binding_mismatch')
-  mounts=Path('/proc/'+pid+'/mountinfo').read_text().splitlines()
-  for target in ('/etc/hosts','/etc/nsswitch.conf'):need(any(len(x.split())>5 and x.split()[4]==target and 'ro' in x.split()[5].split(',') for x in mounts),'resolver_not_readonly')
-  return dict(evidence,uid=self.state['uid'])
+  import runpy
+  expected=Path('/usr/bin/sleep' if unit==PROBE else '/usr/bin/python3');trusted_tool(expected)
+  readiness=runpy.run_path(str(BUNDLE/'process_readiness.py'))
+  return readiness['wait_for_process'](self,unit,expected,CONF,require_cgroup_v2,verify_cgroup_v2,timeout=5)
+ def wait_for_exit(self,unit,sample,deadline):
+  # Same v3 identity checks; both terminal reads precede any stop/unload.
+  keys=('MainPID','ExecMainPID','ExecMainStartTimestampMonotonic','InvocationID','ControlGroup','ActiveState','SubState','Result','ExecMainStatus','ExecMainCode')
+  while True:
+   left=deadline-time.monotonic();need(left>0,'process_exit_timeout')
+   snapshot=self.properties(unit,keys,timeout=min(2,left));sample.observe_running(snapshot)
+   if snapshot['MainPID']=='0' and snapshot['ActiveState'] in ('active','inactive','failed'):
+    sample.verify_exit(snapshot)
+    left=deadline-time.monotonic();need(left>0,'process_exit_timeout')
+    sample.verify_exit(self.properties(unit,keys,timeout=min(2,left)))
+    return
+   time.sleep(min(.05,max(0,deadline-time.monotonic())))
  def probe(self):
-  cmd(['/usr/bin/systemctl','start','--no-block',PROBE]);deadline=time.monotonic()+5
-  while self.property(PROBE,'MainPID')=='0' and time.monotonic()<deadline:time.sleep(.1)
-  evidence=self.kernel_evidence(PROBE);cmd(['/usr/bin/systemctl','stop',PROBE]);need(self.property(PROBE,'MainPID')=='0','probe_not_stopped');emit('resource_probe_passed',**evidence)
+  sample=None
+  try:
+   deadline=time.monotonic()+35
+   cmd(['/usr/bin/systemctl','start','--no-block',PROBE]);sample=self.kernel_evidence(PROBE)
+   self.wait_for_exit(PROBE,sample,deadline)
+  finally:
+   try:cmd(['/usr/bin/systemctl','stop',PROBE]);need(self.property(PROBE,'MainPID')=='0','probe_not_stopped')
+   finally:
+    if sample is not None:sample.close()
+  emit('resource_probe_passed',**sample.evidence)
  def backup(self):
   size=int(self.db.sql('SELECT pg_database_size(current_database())',True));need(shutil.disk_usage(STATE).free>=size*2+268435456,'insufficient_backup_space')
   path=STATE/'before.dump';trusted(STATE);fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -370,15 +404,14 @@ class Operator:
   before_records=self.records()
   need(0<=time.monotonic()-self.resolved_at<=180,'feed_resolution_expired')
   self.state['phase']='starting';self.save();cmd(['/usr/bin/systemctl','start','--no-block',UNIT])
-  deadline=time.monotonic()+130;sample=None
-  while time.monotonic()<deadline:
-   active=self.property(UNIT,'ActiveState');pid=self.property(UNIT,'MainPID')
-   if pid!='0' and sample is None:sample=self.kernel_evidence(UNIT)
-   if active in ('inactive','failed') and (STATE/'consumed').exists():break
-   time.sleep(.1)
-  need(self.property(UNIT,'MainPID')=='0','collector_did_not_stop');need(sample is not None,'live_resource_sample_missing')
-  need(self.property(UNIT,'Result')=='success' and self.property(UNIT,'ExecMainStatus')=='0','collector_failed')
-  raw=cmd(['/usr/bin/journalctl','--no-pager','-u',UNIT,'-o','cat','-n','30']).stdout.decode()
+  deadline=time.monotonic()+130
+  with self.kernel_evidence(UNIT) as sample:
+   self.wait_for_exit(UNIT,sample,deadline)
+   invocation=sample.initial['InvocationID']
+   need((STATE/'consumed').is_file(),'collector_latch_missing')
+  # Execution remains limited to 120s by systemd (runner 105s); 130s is observation only.
+  cmd(['/usr/bin/systemctl','stop',UNIT]);need(self.property(UNIT,'MainPID')=='0','collector_did_not_stop')
+  raw=cmd(['/usr/bin/journalctl','--no-pager','-u',UNIT,'_SYSTEMD_INVOCATION_ID='+invocation,'-o','cat','-n','30']).stdout.decode()
   rows=[]
   for line in raw.splitlines():
    try:x=json.loads(line)
@@ -449,4 +482,4 @@ def main():
   else:op.execute()
 if __name__=='__main__':
  try:main()
- except Exception as e:emit('stopped',reason=str(e) if isinstance(e,Refused) else 'operator_failure_details_suppressed');sys.exit(1)
+ except Exception as e:emit('stopped',reason=str(e) if isinstance(e,Refused) or (type(e).__name__=='Refused' and re.fullmatch('[a-z_]{1,100}',str(e))) else 'operator_failure_details_suppressed');sys.exit(1)

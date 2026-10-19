@@ -212,3 +212,43 @@ Offline resolver/cleanup tests (no external DNS):
 `python3 -I -B tests/test_retry_resolver.py`.
 The same-boot/no-start proof, consumed/retry latches, file integrity, 180-second
 freshness and pending-server-configuration checks remain hard safety gates.
+
+
+### Local-only v3 lifecycle integration — not a retry authorization
+
+The process module is byte-identical to readiness-diagnostic v3 at commit
+c36f4f215fce492bff11250c434d2a5a91829b6f (SHA256
+f5ca1ad6788ca4365118ab06ceac433509837239761c0a8ce1e99ad896a447d6).
+The user supplied successful ECS v3 sleep/Python readiness, natural-exit and
+cleanup evidence. No repeat diagnostic is required by this preparation.
+
+Both production adapters now use the held pidfd and stable execution identity,
+UID/GID/capability/NNP, cgroup and read-only resolver checks. RemainAfterExit=yes
+retains only unit metadata after the child naturally exits. Two bounded terminal
+reads verify the original invocation, execution PID/start stamp, dead pidfd and
+successful natural exit before stopping the unit. Running cgroup mismatch still
+fails; an exited process may have no remaining cgroup. The isolated sleep probe
+runs its existing 30 seconds to natural exit. Collector TimeoutStartSec=120,
+runner deadline=105, memory=256MiB, CPU=50%, TasksMax=32 remain unchanged; the
+130-second observer deadline does not extend execution permission.
+
+Evidence uses an explicit per-operator directory, never directory-existence
+routing into retry-001. Collector journal receipts are restricted to the verified
+invocation. No diagnostic installer/controller, extra command, permission, or
+network policy is imported. The runtime, consume.py and database policy are
+unchanged. The existing retry-001 entry still refuses a used attempt; this patch
+includes a separate fixed retry-002.py install/check/run/cleanup/status entry,
+validated against the pinned legacy bootstrap template. See RETRY-002-PLAN.md for
+installation, independent audit/lock/claim paths, recovery and exact pending
+permissions. No new attempt is authorized merely by installing this package.
+
+Local validation covers adapter sequencing, adverse transitions and real Linux
+pidfd behavior, plus disposable PG17 and resolver regressions. Root/systemd
+integration of the collection adapter and live database/feed reachability have
+not been tested here; the successful inert v3 diagnostic does not establish them.
+
+The approved distribution entry is retry-002-handoff.py: fixed commit and external
+manifest pins, per-file verification before and after privilege elevation, atomic
+helper staging, install/check/run with real exit codes. An existing retry-002
+claim selects cleanup/status only; it never repeats collection. See the plan for
+disconnect handling and durable root handoff-results.jsonl receipts.

@@ -22,3 +22,11 @@ if __name__=='__main__':
  subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_configure_ux.py')],check=True,timeout=30)
 
  subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_upgrade_review.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_process_readiness.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_lifecycle_integration.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_retry_002.py')],check=True,timeout=30)
+
+ subprocess.run([sys.executable,'-I','-B',str(R/'tests/test_retry_002_handoff.py')],check=True,timeout=30)

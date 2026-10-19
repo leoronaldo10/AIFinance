@@ -2,6 +2,7 @@
 Description=Approved single AIFinance RSS batch (maximum three items)
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=aifinance-collect-once
 Group=aifinance-collect-once
 WorkingDirectory=/opt/aifinance-collect-once/releases/d57ba047369e666025347719caee1a4c642abe62

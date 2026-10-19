@@ -68,7 +68,7 @@ class CgroupV2(unittest.TestCase):
     (self.group/name).write_text(self.defaults[name])
  def test_unit_declared_cpu_and_memory_checked(self):
   op=M['Operator'](None)
-  values={'DropInPaths':'','User':'aifinance-collect-once','Group':'aifinance-collect-once','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','TimeoutStartUSec':'2min','NoNewPrivileges':'yes','KillMode':'control-group','ProtectSystem':'strict'}
+  values={'DropInPaths':'','User':'aifinance-collect-once','Group':'aifinance-collect-once','MemoryMax':'268435456','TasksMax':'32','CPUQuotaPerSecUSec':'500ms','TimeoutStartUSec':'2min','NoNewPrivileges':'yes','KillMode':'control-group','ProtectSystem':'strict','RemainAfterExit':'yes'}
   def prop(unit,key):
    if key=='FragmentPath':return '/etc/systemd/system/'+unit
    if key=='ExecStart':return '{ argv[]='+('/usr/bin/sleep 30' if unit.endswith('-probe.service') else '/usr/bin/python3 -I -B /opt/aifinance-collect-once/bin/run.py')+' ; }'
@@ -78,4 +78,9 @@ class CgroupV2(unittest.TestCase):
    old=values[key];values[key]=value
    with self.assertRaisesRegex(Refused,'unit_safety_property_mismatch'):op.verify_units()
    values[key]=old
+ def test_failed_limit_observations_are_sanitized(self):
+  for value,expected in [('536870912','536870912'),('SECRET_VALUE',None)]:
+   (self.group/'memory.max').write_text(value);observations={}
+   with self.assertRaisesRegex(Refused,'cgroup_memory_limit_mismatch'):M['verify_cgroup_v2'](self.root,self.cg,'123','0::'+self.cg,observations=observations)
+   self.assertEqual(observations,{'memory_max':expected})
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -115,6 +115,7 @@ def make_resolver(m,old):
 
 def make_operator(m,db):
  class RetryOperator(m['Operator']):
+  def evidence_directory(self):return AUDIT
   def save(self):
    tmp=AUDIT/'state.next';exclusive(tmp,json.dumps(self.state,sort_keys=True).encode());os.replace(tmp,AUDIT/'state.json');syncdir(AUDIT)
   def backup(self):
