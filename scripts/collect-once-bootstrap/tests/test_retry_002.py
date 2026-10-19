@@ -172,4 +172,11 @@ class Retry002(unittest.TestCase):
  def test_missing_explicit_run_approval_refuses_before_db(self):
   with patch.dict(G,HELPER=R,load=lambda:self.fail('must not load DB'),lock=contextlib.nullcontext),patch.object(sys,'argv',['retry-002.py','run','--manifest-sha256',N['sha'](R/'SHA256SUMS')]),patch.object(os,'geteuid',return_value=0),patch.object(os,'uname',return_value=types.SimpleNamespace(nodename='iZ2zedybs3fftu1d9vnx39Z')),patch.object(sys.stdin,'isatty',return_value=True):
    with self.assertRaisesRegex(N['Refused'],'explicit_retry002_scope_required'):N['main']()
+ def test_cleanup_main_refuses_same_lock_before_loading_or_stopping_services(self):
+  real_fstat=os.fstat
+  def root_fstat(fd):
+   st=real_fstat(fd);return types.SimpleNamespace(st_uid=0,st_mode=st.st_mode,st_nlink=st.st_nlink)
+  with N['lock']():
+   with patch.dict(G,HELPER=R,load=lambda:self.fail('cleanup must not load or stop anything')),patch.object(sys,'argv',['retry-002.py','cleanup','--manifest-sha256',N['sha'](R/'SHA256SUMS')]),patch.object(os,'geteuid',return_value=0),patch.object(os,'fstat',side_effect=root_fstat),patch.object(os,'uname',return_value=types.SimpleNamespace(nodename='iZ2zedybs3fftu1d9vnx39Z')),patch.object(sys.stdin,'isatty',return_value=True):
+    with self.assertRaisesRegex(N['Refused'],'retry002_busy'):N['main']()
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -56,4 +56,16 @@ class Handoff(unittest.TestCase):
  def test_durable_exit_receipts(self):
   self.base.mkdir();M['receipt']('RUN_EXIT',17);M['receipt']('HANDOFF_EXIT',17)
   self.assertIn('"exit_code": 17',(self.base/'handoff-results.jsonl').read_text());self.assertEqual((self.base/'handoff-results.jsonl').stat().st_mode&0o777,0o600)
+ def test_download_uses_only_pinned_contents_api_and_raw_accept(self):
+  launcher=(R/'retry-002-handoff.py').read_bytes();files={'retry-002.py':b'fixture','retry-002-handoff.py':launcher}
+  manifest=''.join(M['digest'](v)+'  '+n+'\n' for n,v in files.items()).encode();files['SHA256SUMS']=manifest;calls=[];commit='b'*40
+  def fetch(request,timeout):
+   url=request.full_url;calls.append(url);self.assertTrue(url.startswith('https://api.github.com/repos/leoronaldo10/AIFinance/contents/scripts/collect-once-bootstrap/'));self.assertTrue(url.endswith('?ref='+commit));self.assertEqual(request.get_header('Accept'),'application/vnd.github.raw+json');self.assertEqual(timeout,30)
+   name=url.split('/collect-once-bootstrap/')[1].split('?')[0];return io.BytesIO(files[name])
+  with patch.object(M['urllib'].request,'urlopen',side_effect=fetch),patch.object(pathlib.Path,'home',return_value=self.root),contextlib.redirect_stdout(io.StringIO()):out=M['download'](commit,M['digest'](manifest))
+  self.assertEqual(len(calls),3);self.assertEqual((out/'retry-002.py').read_bytes(),b'fixture')
+ def test_api_failure_has_no_raw_or_mirror_fallback(self):
+  with patch.object(M['urllib'].request,'urlopen',side_effect=OSError('fixture TLS error')) as fetch,patch.object(pathlib.Path,'home',return_value=self.root):
+   with self.assertRaises(OSError):M['download']('b'*40,'a'*64)
+  self.assertEqual(fetch.call_count,1);self.assertTrue(fetch.call_args.args[0].full_url.startswith('https://api.github.com/'))
 if __name__=='__main__':unittest.main(verbosity=2)

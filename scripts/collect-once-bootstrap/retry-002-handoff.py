@@ -26,8 +26,9 @@ def readfile(p,limit=2097152):
 def download(commit,want):
  root=Path(tempfile.mkdtemp(prefix='aifinance-retry002-download-',dir=Path.home()))
  def fetch(name):
-  url='https://raw.githubusercontent.com/leoronaldo10/AIFinance/'+commit+'/'+PREFIX+name
-  with urllib.request.urlopen(url,timeout=30) as response:data=response.read(2097153)
+  url='https://api.github.com/repos/leoronaldo10/AIFinance/contents/'+PREFIX+name+'?ref='+commit
+  request=urllib.request.Request(url,headers={'Accept':'application/vnd.github.raw+json','User-Agent':'AIFinance-retry-002'})
+  with urllib.request.urlopen(request,timeout=30) as response:data=response.read(2097153)
   need(len(data)<=2097152,'download_too_large');return data
  data=fetch('SHA256SUMS');files=entries(data,want);(root/'SHA256SUMS').write_bytes(data)
  for name,h in files.items():

@@ -159,8 +159,8 @@ f5ca1ad6788ca4365118ab06ceac433509837239761c0a8ce1e99ad896a447d6。
 ## 已批准后的下载交接入口
 
 retry-002-handoff.py 仅接受完整 commit SHA 和外部已审阅 SHA256SUMS 哈希。
-供 ecs-user 在指定 hostname 的 TTY 中运行；先按固定 commit 从公开 raw.githubusercontent.com
-下载全部 helper 文件，各请求30秒超时，验证清单与逐文件哈希。失败立即停止，不切换源站或放宽校验。
+供 ecs-user 在指定 hostname 的 TTY 中运行；先按固定 commit 从官方 GitHub Contents API
+下载全部 helper 文件（Accept: application/vnd.github.raw+json），各请求30秒超时，验证清单与逐文件哈希。失败立即停止，不切换源站或放宽校验。
 再经 sudo 捕获并复核全部下载字节，在固定 helper.staging 中逐文件 fsync、校验并原子安装。
 不直接执行用户目录里的 retry-002.py；root 同时验证 handoff 自身属于指定清单。
 
@@ -171,7 +171,15 @@ retry-002-handoff.py 仅接受完整 commit SHA 和外部已审阅 SHA256SUMS �
 
 若 retry-002 目录已存在，再次运行相同交接命令只能执行 cleanup → status，不再 install/check/run。
 因此断线后重跑同一固定命令不会再采一轮；cleanup 非零立即停止，保留全部现场和历史记录。
+重复调用的 cleanup 与正常 run 使用同一个 retry-002.lock；锁忙时非阻塞拒绝，
+不执行停止单元、DB 或网络清理，也不会杀仍在运行的另一实例。
+
 SIGHUP/SIGINT/SIGTERM 转发给执行子进程；执行入口在已 claim 的副作用阶段捕获这些信号并 finally
 清理。SIGKILL、断电仍须重连后执行相同入口恢复清理，不自动恢复采集。
 重复交接返回0只表示本次清理/查询成功，不将先前失败采集改报成功；查阅此前 RUN_EXIT、completed
 及最新 cleanup 回执判断实际结果。交接本身也不保证真实 feed、DB 或所有前置条件通过。
+
+断线不能被当作进程已停止的证据：若未收到挂断信号，原操作可能继续完成一次有界采集。
+重连后的同一交接命令会尝试持锁恢复；若原操作仍持锁，仅返回 retry002_busy，绝不无锁清理。
+此时保留输出并等待原操作结束；不要手动 kill、删除锁或重置 latch。没有自动轮询或新增轮次。
+GitHub Contents API 下载失败直接停止，不尝试 raw、第三方镜像或关闭 TLS。
