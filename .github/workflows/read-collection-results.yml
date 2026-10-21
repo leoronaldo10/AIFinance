@@ -1,0 +1,18 @@
+name: Read retry-002 public results
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: read-retry002-public-results
+  cancel-in-progress: false
+jobs:
+  read:
+    if: >-
+      github.repository == 'leoronaldo10/AIFinance' &&
+      github.repository_id == '1396876434' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: leoronaldo10/AIFinance/.github/workflows/read-results-reusable.yml@be5b0cfd9861286e9f8862af0804df50173f3d7b

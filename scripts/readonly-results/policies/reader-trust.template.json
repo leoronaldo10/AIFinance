@@ -1,0 +1,19 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "acs:ram::<ACCOUNT_ID>:oidc-provider/github-aifinance-readonly"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "oidc:iss": "https://token.actions.githubusercontent.com",
+          "oidc:aud": "sts.aliyuncs.com",
+          "oidc:sub": "repository_id:1396876434:repository_owner_id:311357003:environment:aifinance-readonly-results:job_workflow_ref:leoronaldo10/AIFinance/.github/workflows/read-results-reusable.yml@be5b0cfd9861286e9f8862af0804df50173f3d7b"
+        }
+      }
+    }
+  ]
+}

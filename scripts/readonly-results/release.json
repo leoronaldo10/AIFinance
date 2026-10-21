@@ -1,0 +1,10 @@
+{
+  "status": "release_ready",
+  "base_commit": "91ad097be0782630de478359ee021956998f30b3",
+  "code_commit": "7184256b66bd729f8e2cf52e1b76a14ed634c53b",
+  "reusable_workflow_commit": "be5b0cfd9861286e9f8862af0804df50173f3d7b",
+  "repository_id": "1396876434",
+  "owner_id": "311357003",
+  "environment": "aifinance-readonly-results",
+  "branch": "main"
+}
