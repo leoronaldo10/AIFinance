@@ -1,6 +1,12 @@
 name: Read retry-002 public results
 on:
   workflow_dispatch:
+    inputs:
+      identity_preflight:
+        description: GitHub identity check only; no Alibaba or ECS access
+        type: boolean
+        required: true
+        default: true
 permissions: {}
 concurrency:
   group: read-retry002-public-results
@@ -15,4 +21,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: leoronaldo10/AIFinance/.github/workflows/read-results-reusable.yml@be5b0cfd9861286e9f8862af0804df50173f3d7b
+    uses: leoronaldo10/AIFinance/.github/workflows/read-results-reusable.yml@d6046e9c7f5181b3995e9f86de20002c3d83d4a6
+    with:
+      identity_preflight: ${{ inputs.identity_preflight }}
+      expected_reusable_sha: d6046e9c7f5181b3995e9f86de20002c3d83d4a6
