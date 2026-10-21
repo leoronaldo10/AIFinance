@@ -29,13 +29,14 @@ def check_claims(token):
     need(isinstance(claims, dict) and all(claims.get(k) == v for k, v in expected.items()), 'oidc_claims_mismatch')
     reusable = claims.get('job_workflow_ref', '')
     need(isinstance(reusable, str) and re.fullmatch(re.escape(WORKFLOW) + '[a-f0-9]{40}', reusable), 'oidc_workflow_mismatch')
-    subject = ('repository_id:' + REPOSITORY_ID + ':repository_owner_id:' + OWNER_ID +
+    subject = ('repo:leoronaldo10@' + OWNER_ID + '/AIFinance@' + REPOSITORY_ID +
+               ':repository_id:' + REPOSITORY_ID + ':repository_owner_id:' + OWNER_ID +
                ':environment:' + ENVIRONMENT + ':job_workflow_ref:' + reusable)
     need(claims.get('sub') == subject, 'oidc_subject_mismatch')
     return claims
 
 
-def oidc_credentials(account):
+def github_token():
     url = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
     u = urllib.parse.urlsplit(url)
     need(u.scheme == 'https' and u.hostname is not None and
@@ -47,7 +48,16 @@ def oidc_credentials(account):
     query.append(('audience', 'sts.aliyuncs.com'))
     url = urllib.parse.urlunsplit(u._replace(query=urllib.parse.urlencode(query)))
     token = loads(request(url, headers={'Authorization': 'Bearer ' + bearer}, limit=32768)).get('value')
-    check_claims(token)
+    claims = check_claims(token)
+    expected_sha = os.environ.get('AIFINANCE_EXPECTED_REUSABLE_SHA', '')
+    need(re.fullmatch('[a-f0-9]{40}', expected_sha), 'expected_workflow_sha_required')
+    need(claims.get('job_workflow_ref') == WORKFLOW + expected_sha and
+         claims.get('job_workflow_sha') == expected_sha, 'pinned_workflow_mismatch')
+    return token
+
+
+def oidc_credentials(account):
+    token = github_token()
     form = {'Action': 'AssumeRoleWithOIDC', 'Version': '2015-04-01', 'Format': 'JSON',
             'RoleArn': 'acs:ram::' + account + ':role/aifinance-results-reader',
             'OIDCProviderArn': 'acs:ram::' + account + ':oidc-provider/github-aifinance-readonly',
@@ -60,10 +70,17 @@ def oidc_credentials(account):
 
 
 def main():
-    need(len(sys.argv) == 1, 'no_arguments_required')
+    need(sys.argv[1:] in ([], ['--identity-preflight']), 'unsupported_operation')
     for key, value in {'GITHUB_REPOSITORY': REPOSITORY, 'GITHUB_REPOSITORY_ID': REPOSITORY_ID,
                        'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}.items():
         need(os.environ.get(key) == value, 'github_context_mismatch')
+    if sys.argv[1:] == ['--identity-preflight']:
+        # Only the GitHub-issued token response is fetched. Never exchange or persist it.
+        github_token()
+        print('AIFINANCE_IDENTITY_PREFLIGHT=' + json.dumps({
+            'passed': True, 'claims_match': True, 'immutable_subject_match': True,
+            'pinned_workflow_match': True, 'alibaba_called': False}))
+        return
     account = os.environ.get('AIFINANCE_ALIBABA_ACCOUNT_ID', '')
     need(re.fullmatch('[0-9]{8,32}', account), 'account_id_required')
     area = region(os.environ.get('AIFINANCE_OSS_REGION', ''))

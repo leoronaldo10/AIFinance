@@ -38,8 +38,8 @@ def claims():
     return {'iss': 'https://token.actions.githubusercontent.com', 'aud': 'sts.aliyuncs.com',
             'repository': common.REPOSITORY, 'repository_id': common.REPOSITORY_ID,
             'repository_owner_id': common.OWNER_ID, 'environment': common.ENVIRONMENT,
-            'ref': 'refs/heads/main', 'event_name': 'workflow_dispatch', 'job_workflow_ref': ref,
-            'sub': 'repository_id:' + common.REPOSITORY_ID + ':repository_owner_id:' + common.OWNER_ID +
+            'ref': 'refs/heads/main', 'event_name': 'workflow_dispatch', 'job_workflow_ref': ref, 'job_workflow_sha': 'a' * 40,
+            'sub': 'repo:leoronaldo10@311357003/AIFinance@1396876434:repository_id:' + common.REPOSITORY_ID + ':repository_owner_id:' + common.OWNER_ID +
                    ':environment:' + common.ENVIRONMENT + ':job_workflow_ref:' + ref}
 
 
@@ -171,6 +171,67 @@ class ReaderTests(unittest.TestCase):
                            'aud': 'other', 'iss': 'https://evil.example'}.items():
             data = claims(); data[key] = value
             with self.assertRaises(common.Refused): reader.check_claims(token(data))
+
+    def test_subject_immutable_identity_and_exact_format(self):
+        original = claims()
+        prefix = 'repo:leoronaldo10@311357003/AIFinance@1396876434:'
+        valid = original['sub']
+        invalid = [valid.removeprefix(prefix),
+                   valid.replace(prefix, 'repo:leoronaldo10/AIFinance:'),
+                   valid.replace('@311357003/', '@999999999/'),
+                   valid.replace('@1396876434:', '@999999999:'),
+                   valid.replace('leoronaldo10@', 'other@'),
+                   valid.replace('/AIFinance@', '/Other@'),
+                   valid.replace(':repository_owner_id:311357003', ''),
+                   valid.replace(':environment:aifinance-readonly-results', ':environment:aifinance-preview'),
+                   valid + ':extra:claim']
+        for subject in invalid:
+            with self.subTest(subject=subject):
+                data = dict(original, sub=subject)
+                with self.assertRaises(common.Refused): reader.check_claims(token(data))
+
+    def test_bad_immutable_subject_never_exchanges_with_alibaba(self):
+        data = claims()
+        data['sub'] = data['sub'].replace('@311357003/', '@999999999/')
+        env = {'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://example.actions.githubusercontent.com/idtoken',
+               'ACTIONS_ID_TOKEN_REQUEST_TOKEN': 'TEST_ONLY_BEARER'}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(reader, 'request', return_value=json.dumps({'value': token(data)}).encode()) as request:
+            with self.assertRaises(common.Refused): reader.oidc_credentials('1234567890123456')
+            self.assertEqual(request.call_count, 1)
+            self.assertTrue(request.call_args.args[0].startswith('https://example.actions.githubusercontent.com/'))
+
+    def test_preflight_only_github_no_cloud_config_or_token_output(self):
+        env = {'GITHUB_REPOSITORY': common.REPOSITORY, 'GITHUB_REPOSITORY_ID': common.REPOSITORY_ID,
+               'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+               'AIFINANCE_EXPECTED_REUSABLE_SHA': 'a' * 40,
+               'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://example.actions.githubusercontent.com/idtoken',
+               'ACTIONS_ID_TOKEN_REQUEST_TOKEN': 'TEST_ONLY_BEARER'}
+        out = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['reader', '--identity-preflight']), \
+             patch.object(reader, 'request', return_value=json.dumps({'value': token(claims())}).encode()) as request, \
+             patch.object(reader, 'oidc_credentials') as sts, patch.object(reader, 'object_request') as oss, \
+             contextlib.redirect_stdout(out):
+            reader.main()
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(request.call_args.args[0].startswith('https://example.actions.githubusercontent.com/'))
+        sts.assert_not_called(); oss.assert_not_called()
+        self.assertNotIn(token(claims()), out.getvalue())
+        self.assertNotIn('TEST_ONLY_BEARER', out.getvalue())
+        self.assertEqual(json.loads(out.getvalue().split('=', 1)[1]), {
+            'passed': True, 'claims_match': True, 'immutable_subject_match': True,
+            'pinned_workflow_match': True, 'alibaba_called': False})
+
+    def test_preflight_requires_exact_expected_reusable_commit(self):
+        env = {'AIFINANCE_EXPECTED_REUSABLE_SHA': 'b' * 40,
+               'ACTIONS_ID_TOKEN_REQUEST_URL': 'https://example.actions.githubusercontent.com/idtoken',
+               'ACTIONS_ID_TOKEN_REQUEST_TOKEN': 'TEST_ONLY_BEARER'}
+        for expected in ('b' * 40, '', 'refs/heads/main'):
+            env['AIFINANCE_EXPECTED_REUSABLE_SHA'] = expected
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(reader, 'request', return_value=json.dumps({'value': token(claims())}).encode()) as request:
+                with self.assertRaises(common.Refused): reader.github_token()
+                self.assertEqual(request.call_count, 1)
 
     def env(self, data):
         return {'GITHUB_REPOSITORY': common.REPOSITORY, 'GITHUB_REPOSITORY_ID': common.REPOSITORY_ID,
