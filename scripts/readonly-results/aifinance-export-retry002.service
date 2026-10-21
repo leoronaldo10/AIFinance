@@ -1,0 +1,27 @@
+[Unit]
+Description=AIFinance fixed retry-002 public result export
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I /opt/aifinance-results-retry002/export_results.py
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
+MemoryMax=128M
+TasksMax=8
+LimitFSIZE=131072
+StandardOutput=journal
+StandardError=journal
+# Deliberately no Install section: no enable, schedule, restart, or collection hook.

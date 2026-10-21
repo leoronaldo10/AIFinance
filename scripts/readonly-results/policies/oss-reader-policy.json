@@ -1,0 +1,10 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "oss:GetObject",
+      "Resource": "acs:oss:*:*:backupforecs20261009/aifinance-public-results/retry-002/result-v1.json"
+    }
+  ]
+}
