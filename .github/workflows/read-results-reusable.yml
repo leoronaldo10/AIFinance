@@ -1,0 +1,31 @@
+name: Read retry-002 result (pinned reusable)
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  read:
+    if: >-
+      github.repository == 'leoronaldo10/AIFinance' &&
+      github.repository_id == '1396876434' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    environment: aifinance-readonly-results
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout immutable reader only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: leoronaldo10/AIFinance
+          ref: 7184256b66bd729f8e2cf52e1b76a14ed634c53b
+          persist-credentials: false
+          sparse-checkout: scripts/readonly-results
+      - name: Read one private object and publish approved public fields
+        env:
+          AIFINANCE_ALIBABA_ACCOUNT_ID: ${{ vars.AIFINANCE_ALIBABA_ACCOUNT_ID }}
+          AIFINANCE_OSS_REGION: ${{ vars.AIFINANCE_OSS_REGION }}
+          AIFINANCE_RESULTS_SHA256: ${{ vars.AIFINANCE_RESULTS_SHA256 }}
+        run: python3 -I scripts/readonly-results/read_results.py
