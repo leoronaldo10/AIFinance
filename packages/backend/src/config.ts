@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { parseEnv } from "node:util";
+import { FEATURES } from "@aihot/industry/features";
 import { SITE } from "@aihot/industry/site";
 
 export const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
@@ -34,6 +35,8 @@ function bool(name: string, fallback: boolean): boolean {
 
 
 export const config = {
+  // Legacy engine fixtures test automatic projection; deployments always follow the industry review policy.
+  get editorialReviewRequired() { return FEATURES.editorialReview && !(env.NODE_ENV === "test" && env.EDITORIAL_AUTOMATIC_FIXTURES === "true"); },
   databaseUrl: str("DATABASE_URL", "postgres://127.0.0.1:5432/aihot"),
   apiPort: int("API_PORT", 3001),
   webPort: int("WEB_PORT", 3000),

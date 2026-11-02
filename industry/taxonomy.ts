@@ -7,13 +7,14 @@
  * section 是日报里的分节标题（几个类别可以共用一节，按这里的顺序排）；guide 告诉模型怎么归类。
  * 没归上类的资料在日报里放进第一个 key 为 industry 的类别所在的节（没有就放最后一节）。
  */
+// Existing URL/API keys stay stable; labels and guides now describe the finance audience.
 export const CATEGORIES = [
-  { key: "ai-models", label: "模型", section: "模型发布/更新", guide: "新模型、模型版本、权重开放、模型能力与价格变化的发布与评测结果" },
-  { key: "ai-products", label: "产品", section: "产品发布/更新", guide: "AI 产品、功能、应用、工具、API 与平台的发布和更新" },
-  { key: "industry", label: "行业", section: "行业动态", guide: "公司经营、融资并购、人事、合作、诉讼、监管与政策、市场与基础设施" },
-  { key: "paper", label: "论文", section: "论文研究", guide: "研究论文、技术报告、基准与数据集" },
-  { key: "tip", label: "教程", section: "技巧与观点", guide: "教程、实践经验、使用技巧、提示词与工具用法、深度技术讲解" },
-  { key: "opinion", label: "观点", section: "技巧与观点", guide: "人物观点、评论、分析、访谈、现象与趋势讨论" },
+  { key: "tip", label: "表格与办公", section: "表格与办公", guide: "Excel、WPS、表格整理、文档处理的 AI 功能与具体用法" },
+  { key: "paper", label: "数据与分析", section: "数据与分析", guide: "AI 辅助数据清洗、跨表分析、预算差异和经营分析；纯技术论文仅在有可信财务影响时收录" },
+  { key: "opinion", label: "报告与表达", section: "报告与表达", guide: "财务报告、经营分析文字、演示文稿和沟通表达中的 AI 能力" },
+  { key: "industry", label: "流程与自动化", section: "流程与自动化", guide: "票据、报销、对账、财务软件及团队流程中的 AI 变化" },
+  { key: "ai-products", label: "工具与使用条件", section: "工具与使用条件", guide: "国内可用的 AI 和办公产品、开放范围、版本、价格、权限与数据使用条件" },
+  { key: "ai-models", label: "AI 能力变化", section: "值得理解的 AI 变化", guide: "有明确工作关联的模型能力进展，用一般财务人员能理解的语言解释" },
 ] as const;
 
 /**
@@ -32,11 +33,12 @@ export const CATEGORY_TAGS = [
 
 /** 可选的主题标签。 */
 export const TOPIC_TAGS = [
+  "表格整理", "预算分析", "经营分析", "报告编制", "票据处理", "对账", "自动化", "国内可用", "权限与数据",
   "Agent", "编码", "推理", "多模态", "语音", "视频", "图像生成", "RAG", "端侧", "数据/训练", "搜索", "部署/工程", "开源生态", "具身智能", "MCP/工具调用",
 ] as const;
 
 /** 可选的实体标签（公司、机构、平台）。 */
-export const ENTITY_TAGS = ["OpenAI", "Anthropic", "DeepSeek", "DeepMind", "Google", "Meta", "Microsoft", "xAI", "Hugging Face", "GitHub", "arXiv"] as const;
+export const ENTITY_TAGS = ["WPS", "飞书", "钉钉", "豆包", "通义千问", "腾讯元宝","OpenAI", "Anthropic", "DeepSeek", "DeepMind", "Google", "Meta", "Microsoft", "xAI", "Hugging Face", "GitHub", "arXiv"] as const;
 
 /** 模型常写的近义词，统一成词表里的写法。 */
 export const TAG_SYNONYMS: Readonly<Record<string, string>> = {

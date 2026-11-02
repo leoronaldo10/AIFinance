@@ -8,4 +8,6 @@
 
 {{> rules-answer-first-summary}}
 
-最终只返回 itemType、authorRole、tags、editorialJudgment、titleZh、summaryZh 六个字段。答案前置只描述 summaryZh 的写法，不要增加 answer 字段。
+{{> finance-insight}}
+
+最终返回 itemType、authorRole、tags、editorialJudgment、titleZh、summaryZh 和 finance 七个字段。不要增加 answer 字段。

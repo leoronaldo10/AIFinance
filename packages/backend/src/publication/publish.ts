@@ -1,6 +1,8 @@
 // Publishing: derive the public projection of one article from its material, the latest judgement,
 // manual overrides and grouping, then record selected-set changes in the sync ledger.
 // Rebuilding only re-reads stored results; it never calls a model.
+import type { FinanceInsight } from "@aihot/contracts/editorial";
+import { reviewedCopy } from "../editorial/review.ts";
 import { SITE } from "@aihot/industry/site";
 import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import { config } from "../config.ts";
@@ -14,6 +16,7 @@ import {
 } from "./rules.ts";
 
 interface ArticleRow {
+  revision: number;
   id: string;
   source_id: string;
   url: string;
@@ -25,11 +28,13 @@ interface ArticleRow {
   backfill: boolean;
   body_status: string;
   body_text: string | null;
+  excerpt: string | null;
   x_post: unknown;
   grouped_at: Date | null;
 }
 
 interface AnalysisRow {
+  output: { finance?: FinanceInsight };
   id: number;
   relevance: string | null;
   category: string | null;
@@ -48,6 +53,8 @@ interface OverrideRow {
 }
 
 interface PublicationRow {
+  finance: FinanceInsight | null;
+  review_version: number | null;
   article_id: string;
   revision: number;
   visibility: string;
@@ -147,8 +154,8 @@ export async function publishArticle(articleId: string, options: PublishOptions 
 
 export async function publishArticleTx(tx: Tx, articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
   const [article] = await tx<ArticleRow[]>`
-    SELECT id, source_id, url, title, language, published_at, discovered_at, timeline_at, backfill, body_status,
-           body_text, x_post, grouped_at
+    SELECT id, revision, source_id, url, title, language, published_at, discovered_at, timeline_at, backfill, body_status,
+           body_text, excerpt, x_post, grouped_at
     FROM articles WHERE id = ${articleId} FOR UPDATE`;
   if (!article) return null;
   // Reports take this lock exclusively while reading candidates. Hold it through commit so a
@@ -159,7 +166,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     SELECT id, name, kind, tier, participation_mode, first_party, site_fulltext, syndicate_fulltext FROM sources WHERE id = ${article.source_id}`;
   if (!source) return null;
   const [analysis] = await tx<AnalysisRow[]>`
-    SELECT id, relevance, category, tags, subjects, title_zh, summary_zh, reason_zh, score, selected
+    SELECT id, output, relevance, category, tags, subjects, title_zh, summary_zh, reason_zh, score, selected
     FROM analyses WHERE article_id = ${articleId} ORDER BY input_revision DESC, id DESC LIMIT 1`;
   const [override] = await tx<OverrideRow[]>`SELECT fields, visibility FROM editorial_overrides WHERE article_id = ${articleId}`;
   const [membership] = await tx<{ fact_id: number; story_id: number | null }[]>`
@@ -174,24 +181,43 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   // An X post carries its Chinese in the summary and translation; without a Chinese title its own
   // text is the title, where an article would still be a half-finished card.
   const zhTitle = analysis?.title_zh?.trim() ? analysis.title_zh : null;
-  const title = pickString(f.title, zhTitle ?? (isChineseTitle || article.x_post ? collapseWhitespace(article.title) : null));
-  const summary = pickString(f.summary, analysis?.summary_zh ?? null);
-  const category = pickString(f.category, analysis?.category ?? null);
-  const tags = Array.isArray(f.tags) ? (f.tags as string[]) : [...new Set([...(analysis?.tags ?? []), ...(analysis?.subjects ?? []).map((s) => `entity:${s}`)])];
-  const score = typeof f.score === "number" ? f.score : analysis?.score ?? null;
+  let title = pickString(f.title, zhTitle ?? (isChineseTitle || article.x_post ? collapseWhitespace(article.title) : null));
+  let summary = pickString(f.summary, analysis?.summary_zh ?? null);
+  let category = pickString(f.category, analysis?.category ?? null);
+  let tags = Array.isArray(f.tags) ? (f.tags as string[]) : [...new Set([...(analysis?.tags ?? []), ...(analysis?.subjects ?? []).map((s) => `entity:${s}`)])];
+  let score = typeof f.score === "number" ? f.score : analysis?.score ?? null;
   const relevance = typeof f.relevance === "string" ? (f.relevance as string) : analysis?.relevance ?? null;
-  const judgedSelected = typeof f.selected === "boolean" ? (f.selected as boolean) : analysis?.selected ?? null;
+  let judgedSelected = typeof f.selected === "boolean" ? (f.selected as boolean) : analysis?.selected ?? null;
   // Material from an isolated source reaches no public surface at all: not even a detail page.
-  const visibility = source.participation_mode === "isolated" ? "withdrawn" : (override?.visibility ?? "public");
+  let visibility = source.participation_mode === "isolated" ? "withdrawn" : (override?.visibility ?? "public");
 
-  const eligible = isPoolEligible({ participationMode: source.participation_mode, relevance, title, summary });
-  const selected = isSelectable(eligible, judgedSelected, source.tier);
-  const reason = selected ? pickString(f.reason, analysis?.reason_zh ?? null) : null;
-  const hasXPost = !!article.x_post;
-  const channel = channelOf(source.kind, hasXPost);
-  const bodyMode = bodyModeOf(source, article.body_status, !!article.body_text && article.body_text.length > 0);
+  let eligible = isPoolEligible({ participationMode: source.participation_mode, relevance, title, summary });
+  let selected = isSelectable(eligible, judgedSelected, source.tier);
+  let reason = selected ? pickString(f.reason, analysis?.reason_zh ?? null) : null;
+  let finance: FinanceInsight | null = null;
+  let reviewVersion: number | null = null;
+  if (config.editorialReviewRequired) {
+    const approved = await reviewedCopy(tx, articleId, {
+      title: title ?? article.title, summary: summary ?? "", reason: reason ?? "", category, tags,
+      score: score === null ? null : Number(score), selected, finance: analysis?.output?.finance ?? null,
+    }, { title: article.title, url: article.url, text: (article.body_text || article.excerpt || "").slice(0, 60000), revision: article.revision, analysisId: analysis?.id ?? null });
+    if (approved) {
+      ({ title, summary, category, tags, score, selected, reason, finance } = approved.copy);
+      reviewVersion = approved.version;
+      tags = [...new Set([...tags, ...(finance?.scenarios ?? [])])];
+      eligible = source.participation_mode === "editorial" && !!title && !!summary;
+      selected = selected && eligible;
+    } else {
+      visibility = "withdrawn";
+      eligible = false;
+      selected = false;
+    }
+  }
+  const hasXPost = !config.editorialReviewRequired && !!article.x_post;
+  const channel = config.editorialReviewRequired ? "news" : channelOf(source.kind, hasXPost);
+  const bodyMode = config.editorialReviewRequired ? "summary" : bodyModeOf(source, article.body_status, !!article.body_text && article.body_text.length > 0);
   const syndicate = mayRedistribute(source, bodyMode);
-  const originalTitle = isChineseTitle && title === collapseWhitespace(article.title) ? null : collapseWhitespace(article.title);
+  const originalTitle = config.editorialReviewRequired ? null : isChineseTitle && title === collapseWhitespace(article.title) ? null : collapseWhitespace(article.title);
 
   // Release gate: first time the item met the selected conditions, released after grouping or 180 s.
   let selectedReadyAt = previous?.selected_ready_at ?? null;
@@ -213,11 +239,16 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     }
   }
 
+  if (config.editorialReviewRequired && selected && reviewVersion !== previous?.review_version) {
+    selectedReadyAt ??= now;
+    visibleAfter = now;
+  }
+
   const indexable = isIndexable({
     visibility, hasSummary: !!summary, selected, seoIndexedAt: previous?.seo_indexed_at ?? null, seoExcludedAt: previous?.seo_excluded_at ?? null,
   });
   const searchText = collapseWhitespace(
-    [title, originalTitle, summary, source.name, ...displayTags(tags), ...(analysis?.subjects ?? [])].filter(Boolean).join(" "),
+    [title, originalTitle, summary, source.name, ...displayTags(tags), ...(config.editorialReviewRequired ? [] : analysis?.subjects ?? [])].filter(Boolean).join(" "),
   ).toLowerCase();
 
   // A selected item sits at its reading group's anchor: the earliest public pool member of its fact.
@@ -231,8 +262,8 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
 
   const next = {
     visibility, eligible, selected, title: title ?? collapseWhitespace(article.title), original_title: originalTitle, summary, reason,
-    category, tags, score: round1(score), body_mode: bodyMode, story_id: membership?.story_id ?? null, fact_id: membership?.fact_id ?? null,
-    indexable,
+    category, tags, score: round1(score), body_mode: bodyMode, story_id: config.editorialReviewRequired ? null : membership?.story_id ?? null, fact_id: config.editorialReviewRequired ? null : membership?.fact_id ?? null,
+    indexable, finance, review_version: reviewVersion,
   };
   const changed =
     !previous ||
@@ -241,7 +272,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
         visibility: previous.visibility, eligible: previous.eligible, selected: previous.selected, title: previous.title,
         original_title: previous.original_title, summary: previous.summary, reason: previous.reason, category: previous.category,
         tags: [...previous.tags].sort(), score: previous.score === null ? null : Number(previous.score), body_mode: previous.body_mode,
-        story_id: previous.story_id, fact_id: previous.fact_id, indexable: previous.indexable,
+        story_id: previous.story_id, fact_id: previous.fact_id, indexable: previous.indexable, finance: previous.finance, review_version: previous.review_version,
       });
   const revision = previous ? previous.revision + (changed ? 1 : 0) : 1;
 
@@ -279,6 +310,9 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
         EXCLUDED.selected_ready_at, EXCLUDED.visible_after, EXCLUDED.body_mode, EXCLUDED.syndicate,
         EXCLUDED.indexable, EXCLUDED.story_id, EXCLUDED.fact_id, EXCLUDED.search_text,
         EXCLUDED.sort_at)`;
+
+  await tx`UPDATE publications SET finance = ${finance ? tx.json(finance as never) : null}, review_version = ${reviewVersion}
+    WHERE article_id = ${articleId} AND (finance, review_version) IS DISTINCT FROM (${finance ? tx.json(finance as never) : null}::jsonb, ${reviewVersion}::integer)`;
 
   // The pool search row follows eligibility; its body part only covers full text the site may show.
   if (eligible) {

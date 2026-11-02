@@ -1,21 +1,20 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img src="docs/assets/banner-light.png" alt="AIHOT：每个行业，都可以有自己的 AIHOT。很多条信源流进中间的精选，再分给法律、人力资源、金融等各个行业" width="100%">
-  </picture>
-</p>
+# 财务 AI 资讯（暂名）
+
+面向一般企业财务人员的 AI 与办公产品资讯通道：核对原文、解释财务关联、人工审核后发布网站，并生成公众号排版稿。
+
+编辑操作、版本与升级说明见 [财务资讯编辑指南](docs/finance-editorial.md)。本仓库基于原行业资讯框架改造，下面保留框架部署与架构资料；财务站当前行为以编辑指南为准。
+
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-176b75?style=flat-square" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Node.js-24-176b75?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js 24">
   <img src="https://img.shields.io/badge/PostgreSQL-17-176b75?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL 17">
   <img src="https://img.shields.io/badge/Docker-Compose-176b75?style=flat-square&logo=docker&logoColor=white" alt="Docker Compose">
-  <a href="https://aihot.news"><img src="https://img.shields.io/badge/demo-aihot.news-202a30?style=flat-square" alt="aihot.news"></a>
 </p>
 
 <p align="center">
-  <b>一个自己找热点、自己写日报的网站框架。</b><br>
-  把信源换成你的，把精选标准换成你的 KnowHow，它就是你的行业热点站。
+  <b>一个以人工审核为发布入口的财务资讯网站。</b><br>
+  资讯说明实际使用条件，网站与公众号稿件保留明确的版本记录。
 </p>
 
 <p align="center">

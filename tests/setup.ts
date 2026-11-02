@@ -1,3 +1,6 @@
+// Existing pipeline suites exercise automatic projection; editorial-review.test.ts exercises the mandatory review mode.
+process.env.NODE_ENV = "test";
+process.env.EDITORIAL_AUTOMATIC_FIXTURES = "true";
 // Shared setup for the invariant tests (node --test tests/). They write rows, so they refuse to run
 // unless DATABASE_URL names a throwaway database ending in _test or _ci (CI: a freshly migrated one).
 // Secrets are test values set here, never real credentials; paid providers are pointed at

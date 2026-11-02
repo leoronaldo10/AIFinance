@@ -21,4 +21,12 @@ for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
   count += 1;
 }
 console.log(count === 0 ? "database is up to date" : `${count} migration(s) applied`);
+// Backfill the review queue after upgrading an existing site; projection never calls a model.
+const { config } = await import("@aihot/backend/config");
+if (config.editorialReviewRequired) {
+  const { publishArticle } = await import("@aihot/backend/publication/publish");
+  const pending = await sql<{ id: string }[]>`SELECT id FROM articles a WHERE NOT EXISTS (SELECT 1 FROM editorial_review_state s WHERE s.article_id=a.id)`;
+  for (const a of pending) await publishArticle(a.id);
+  if (pending.length) console.log(`${pending.length} article(s) prepared for editorial review`);
+}
 await closeDb();

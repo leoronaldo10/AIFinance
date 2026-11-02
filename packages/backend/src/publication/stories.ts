@@ -1,6 +1,7 @@
 // Stories (events) and the hot ranking through the public read layer. The website sees heat values;
 // v1 / MCP / Skill only see ranks and counts.
 import type { HeatPoint, HotResponse, StoryDetail, StoryReportView } from "@aihot/contracts/site";
+import { config } from "../config.ts";
 import { sql } from "../db.ts";
 import { proxiedImage, proxiedImageSet } from "../media/imgproxy.ts";
 import { latestHotRanking, rankingExtras } from "../events/hot-read.ts";
@@ -12,6 +13,7 @@ import { SITE } from "@aihot/industry/site";
 export type StoryLookup = { kind: "found"; storyId: number; publicId: string } | { kind: "merged"; target: string } | { kind: "not_found" };
 
 export async function resolveStory(publicId: string): Promise<StoryLookup> {
+  if (config.editorialReviewRequired) return { kind: "not_found" };
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(publicId)) return { kind: "not_found" };
   const [s] = await sql<{ id: number; merged_into: number | null }[]>`SELECT id, merged_into FROM stories WHERE public_id = ${publicId}`;
   let targetId: number | null = s ? (s.merged_into ?? null) : null;
@@ -113,6 +115,7 @@ async function relatedStories(storyId: number) {
 }
 
 export async function loadStoryDetail(storyId: number, now = new Date()): Promise<StoryDetail | null> {
+  if (config.editorialReviewRequired) return null;
   const content = await storyContent(storyId, now);
   if (!content) return null;
   const { s, reports, developments } = content;
@@ -293,6 +296,7 @@ export async function v1HotTopics() {
 }
 
 export async function v1Story(storyId: number) {
+  if (config.editorialReviewRequired) return null;
   const now = new Date();
   const content = await storyContent(storyId, now);
   if (!content) return null;

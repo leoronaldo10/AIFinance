@@ -1,3 +1,4 @@
+import { reviewedReportCondition } from "./review-scope.ts";
 // /llms.txt — generated from the site's own configuration; only real, available resources are listed.
 import { SITE, withSubject } from "@aihot/industry/site";
 import { FEATURES } from "@aihot/industry/features";
@@ -9,9 +10,9 @@ import { MCP_TOOLS } from "@aihot/contracts/mcp";
 /** Discovery only needs to know whether an entry exists, not count its entire history. */
 export async function loadLlmsAvailability() {
   const [row] = await sql<{ hasDailies: boolean; hasWeekly: boolean; hasMonthly: boolean; hasLeaderboard: boolean }[]>`
-    SELECT EXISTS (SELECT 1 FROM reports WHERE kind = 'daily') AS "hasDailies",
-           EXISTS (SELECT 1 FROM reports WHERE kind = 'weekly') AS "hasWeekly",
-           EXISTS (SELECT 1 FROM reports WHERE kind = 'monthly') AS "hasMonthly",
+    SELECT EXISTS (SELECT 1 FROM reports WHERE ${reviewedReportCondition()} AND kind = 'daily') AS "hasDailies",
+           EXISTS (SELECT 1 FROM reports WHERE ${reviewedReportCondition()} AND kind = 'weekly') AS "hasWeekly",
+           EXISTS (SELECT 1 FROM reports WHERE ${reviewedReportCondition()} AND kind = 'monthly') AS "hasMonthly",
            EXISTS (SELECT 1 FROM lb_runs WHERE status = 'published') AS "hasLeaderboard"`;
   return row!;
 }

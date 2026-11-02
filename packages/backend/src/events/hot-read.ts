@@ -1,5 +1,6 @@
 // Reading the latest published hot ranking. The web shows heat values; machine exits only ranks.
 import type { HotParticipant, HotStripEntry } from "@aihot/contracts/site";
+import { config } from "../config.ts";
 import { sql } from "../db.ts";
 import { proxiedImage, proxiedImageSet } from "../media/imgproxy.ts";
 
@@ -46,6 +47,7 @@ export interface HotRanking {
 let rankingPending: Promise<HotRanking | null> | null = null;
 
 export function latestHotRanking(): Promise<HotRanking | null> {
+  if (config.editorialReviewRequired) return Promise.resolve(null);
   rankingPending ??= queryLatestHotRanking().finally(() => { rankingPending = null; });
   return rankingPending;
 }

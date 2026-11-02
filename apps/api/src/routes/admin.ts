@@ -1,3 +1,4 @@
+import { editorialQueue, reviewDetail, importEditorial, editEditorial, reviewEditorial, createEditorialExport, listEditorialExports, recordEditorialPublication, publishEditorialEdition, currentEditorialEdition } from "@aihot/backend/admin/editorial";
 // /api/admin/*: queries are GET, creation POST, edits PATCH, business commands POST.
 // Every route goes through adminHandler (session + CSRF); manual changes are audited in the modules.
 import { readFile } from "node:fs/promises";
@@ -33,6 +34,19 @@ function decodeImage(dataUrl: unknown): Buffer {
 }
 
 export function registerAdmin(app: FastifyInstance) {
+  app.get("/api/admin/editorial", adminHandler(async req => ({ rows: await editorialQueue(q(req).status, page(req)) })));
+  app.post("/api/admin/editorial/import", adminHandler(async (req, _reply, admin) => importEditorial(body(req), actorOf(admin))));
+  app.get("/api/admin/editorial/exports", adminHandler(async () => ({ rows: await listEditorialExports() })));
+  app.post("/api/admin/editorial/exports", adminHandler(async (req, _reply, admin) => createEditorialExport(body(req), actorOf(admin))));
+  app.get("/api/admin/editorial/exports/:id", adminHandler(async (req, reply) => {
+    const [row] = await sql`SELECT * FROM editorial_exports WHERE id=${Number(param(req, "id"))}`;
+    return orNotFound(req, reply, row ? { ...row, edition: await currentEditorialEdition() } : null);
+  }));
+  app.post("/api/admin/editorial/exports/:id/website", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await publishEditorialEdition(Number(param(req, "id")), actorOf(admin), body(req)))));
+  app.post("/api/admin/editorial/exports/:id/published", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await recordEditorialPublication(Number(param(req, "id")), body(req), actorOf(admin)))));
+  app.get("/api/admin/editorial/:id", adminHandler(async (req, reply) => orNotFound(req, reply, await reviewDetail(param(req, "id")))));
+  app.post("/api/admin/editorial/:id/edit", adminHandler(async (req, _reply, admin) => editEditorial(param(req, "id"), body(req), actorOf(admin))));
+  app.post("/api/admin/editorial/:id/review/:action", adminHandler(async (req, _reply, admin) => reviewEditorial(param(req, "id"), param(req, "action"), body(req), actorOf(admin))));
   // Sources (F18)
   app.get("/api/admin/sources", adminHandler(async (req) => {
     const f = q(req);
