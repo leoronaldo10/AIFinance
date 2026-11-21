@@ -37,6 +37,7 @@ const NAV: Array<{ group: string; items: Array<{ to: string; label: string; coun
     group: "系统",
     items: [
       { to: "/admin/runs", label: "运行", count: "runs", tone: "bad" },
+      { to: "/admin/collection-operations", label: "采集状态（只读）" },
       { to: "/admin/models", label: "模型与评测" },
       { to: "/admin/selectbench", label: "SelectBench" },
       { to: "/admin/settings", label: "设置" },
