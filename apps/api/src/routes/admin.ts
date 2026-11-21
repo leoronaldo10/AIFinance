@@ -17,6 +17,7 @@ import { sql } from "@aihot/backend/db";
 import { loadContact } from "@aihot/backend/site/contact";
 import { sendProblem } from "../http/respond.ts";
 import { adminHandler } from "./admin-auth.ts";
+import { registerCollectionOperations } from "./admin-collection-operations.ts";
 
 type Q = Record<string, string | undefined>;
 const q = (req: FastifyRequest) => req.query as Q;
@@ -33,6 +34,7 @@ function decodeImage(dataUrl: unknown): Buffer {
 }
 
 export function registerAdmin(app: FastifyInstance) {
+  registerCollectionOperations(app);
   // Sources (F18)
   app.get("/api/admin/sources", adminHandler(async (req) => {
     const f = q(req);
